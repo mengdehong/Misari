@@ -50,7 +50,7 @@ use self::spatial_movement_grab::SpatialMovementGrab;
 use crate::dbus::freedesktop_a11y::KbMonBlock;
 use crate::layout::scrolling::ScrollDirection;
 use crate::layout::{ActivateWindow, LayoutElement as _};
-use crate::niri::{CastTarget, PointerVisibility, State};
+use crate::niri::{CastTarget, PointerVisibility, ScreenshotOptions, State};
 use crate::ui::mru::{WindowMru, WindowMruUi};
 use crate::ui::screenshot_ui::ScreenshotUi;
 use crate::utils::spawning::{spawn, spawn_sh};
@@ -900,21 +900,15 @@ impl State {
                 self.open_screenshot_ui(show_cursor, path);
                 self.niri.cancel_mru();
             }
-            Action::ScreenshotWindow(write_to_disk, show_pointer, path) => {
-                let focus = self.niri.layout.focus_with_output();
-                if let Some((mapped, output)) = focus {
-                    self.backend.with_primary_renderer(|renderer| {
-                        if let Err(err) = self.niri.screenshot_window(
-                            renderer,
-                            output,
-                            mapped,
-                            write_to_disk,
-                            show_pointer,
-                            path,
-                        ) {
-                            warn!("error taking screenshot: {err:?}");
-                        }
-                    });
+            Action::ScreenshotWindow(write_to_disk, show_pointer, path, silent) => {
+                let options = ScreenshotOptions {
+                    write_to_disk,
+                    path,
+                    silent,
+                    ..Default::default()
+                };
+                if let Err(err) = self.screenshot_window(None, show_pointer, options) {
+                    warn!("error taking screenshot: {err:?}");
                 }
             }
             Action::ScreenshotWindowById {
@@ -922,23 +916,16 @@ impl State {
                 write_to_disk,
                 show_pointer,
                 path,
+                silent,
             } => {
-                let mut windows = self.niri.layout.windows();
-                let window = windows.find(|(_, m)| m.id().get() == id);
-                if let Some((Some(monitor), mapped)) = window {
-                    let output = monitor.output();
-                    self.backend.with_primary_renderer(|renderer| {
-                        if let Err(err) = self.niri.screenshot_window(
-                            renderer,
-                            output,
-                            mapped,
-                            write_to_disk,
-                            show_pointer,
-                            path,
-                        ) {
-                            warn!("error taking screenshot: {err:?}");
-                        }
-                    });
+                let options = ScreenshotOptions {
+                    write_to_disk,
+                    path,
+                    silent,
+                    ..Default::default()
+                };
+                if let Err(err) = self.screenshot_window(Some(id), show_pointer, options) {
+                    warn!("error taking screenshot: {err:?}");
                 }
             }
             Action::ToggleKeyboardShortcutsInhibit => {

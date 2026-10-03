@@ -167,6 +167,11 @@ pub enum Response {
     OverviewState(Overview),
     /// Information about screencasts.
     Casts(Vec<Cast>),
+    /// A screenshot finished encoding and, if requested, writing to disk.
+    ScreenshotSaved {
+        /// Saved file path, or `None` when writing to disk was disabled.
+        path: Option<String>,
+    },
 }
 
 /// Overview information.
@@ -264,6 +269,15 @@ pub enum Action {
         /// If `None`, uses the focused window.
         #[cfg_attr(feature = "clap", arg(long))]
         id: Option<u64>,
+        /// Do not update the clipboard or show a desktop notification.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        #[cfg_attr(feature = "clap", arg(long))]
+        silent: bool,
+
+        /// Wait for the screenshot to finish and return its saved path or an error.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        #[cfg_attr(feature = "clap", arg(long))]
+        wait: bool,
         /// Write the screenshot to disk in addition to putting it in your clipboard.
         ///
         /// The screenshot is saved according to the `screenshot-path` config setting.
@@ -2159,6 +2173,23 @@ impl OutputAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screenshot_window_options_are_backwards_compatible() {
+        let old = serde_json::json!({"ScreenshotWindow": {
+            "id": 42, "write_to_disk": true, "show_pointer": false, "path": null
+        }});
+        let action: Action = serde_json::from_value(old.clone()).unwrap();
+        assert!(matches!(
+            action,
+            Action::ScreenshotWindow {
+                silent: false,
+                wait: false,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(action).unwrap(), old);
+    }
 
     #[test]
     fn parse_size_change() {

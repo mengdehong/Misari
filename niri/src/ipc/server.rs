@@ -34,7 +34,7 @@ use crate::backend::IpcOutputMap;
 use crate::handlers::image_copy_capture;
 use crate::input::pick_window_grab::PickWindowGrab;
 use crate::layout::workspace::WorkspaceId;
-use crate::niri::State;
+use crate::niri::{ScreenshotOptions, State};
 use crate::utils::{version, with_toplevel_role};
 use crate::window::selector::WindowSelector;
 use crate::window::Mapped;
@@ -402,6 +402,35 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
         }
         Request::Action(action) => {
             validate_action(&action)?;
+
+            if let Action::ScreenshotWindow {
+                id,
+                write_to_disk,
+                show_pointer,
+                path,
+                silent,
+                wait: true,
+            } = action
+            {
+                let (tx, rx) = async_channel::bounded(1);
+                ctx.event_loop.insert_idle(move |state| {
+                    state.niri.advance_animations();
+                    let options = ScreenshotOptions {
+                        write_to_disk,
+                        path,
+                        silent,
+                        completion: Some(tx.clone()),
+                    };
+                    if let Err(err) = state.screenshot_window(id, show_pointer, options) {
+                        let _ = tx.send_blocking(Err(format!("{err:#}")));
+                    }
+                });
+                let path = rx
+                    .recv()
+                    .await
+                    .map_err(|_| String::from("screenshot completion channel closed"))??;
+                return Ok(Response::ScreenshotSaved { path });
+            }
 
             let (tx, rx) = async_channel::bounded(1);
 

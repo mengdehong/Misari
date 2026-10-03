@@ -361,6 +361,18 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
                 println!("No color was picked.");
             }
         }
+        Msg::Action {
+            action: Action::ScreenshotWindow { wait: true, .. },
+        } => {
+            let Response::ScreenshotSaved { path } = response else {
+                bail!("unexpected response: expected ScreenshotSaved, got {response:?}");
+            };
+            if json {
+                println!("{}", json!({ "path": path }));
+            } else if let Some(path) = path {
+                println!("{path}");
+            }
+        }
         Msg::Action { .. } => {
             let Response::Handled = response else {
                 bail!("unexpected response: expected Handled, got {response:?}");

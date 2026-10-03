@@ -218,6 +218,19 @@ pub(crate) struct PendingRecall {
     pub(crate) deadline: Instant,
 }
 
+#[derive(Default)]
+pub struct ScreenshotOptions {
+    pub write_to_disk: bool,
+    pub path: Option<String>,
+    pub silent: bool,
+    pub completion: Option<async_channel::Sender<Result<Option<String>, String>>>,
+}
+
+struct ScreenshotResult {
+    image: Option<Arc<[u8]>>,
+    path: Result<Option<String>, String>,
+}
+
 pub struct Niri {
     pub config: Rc<RefCell<Config>>,
 
@@ -747,6 +760,36 @@ pub struct State {
 }
 
 impl State {
+    pub fn screenshot_window(
+        &mut self,
+        id: Option<u64>,
+        show_pointer: bool,
+        options: ScreenshotOptions,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            !self.niri.is_locked(),
+            "cannot take a screenshot while locked"
+        );
+
+        let id = id
+            .or_else(|| self.niri.layout.focus().map(|window| window.id().get()))
+            .context("no focused window")?;
+        let mut windows = self.niri.layout.windows();
+        let (monitor, mapped) = windows
+            .find(|(_, mapped)| mapped.id().get() == id)
+            .with_context(|| format!("window {id} does not exist"))?;
+        let output = monitor
+            .with_context(|| format!("window {id} has no output"))?
+            .output();
+
+        self.backend
+            .with_primary_renderer(|renderer| {
+                self.niri
+                    .screenshot_window(renderer, output, mapped, show_pointer, options)
+            })
+            .context("no renderer available for screenshot")?
+    }
+
     pub fn new(
         config: Config,
         event_loop: LoopHandle<'static, State>,
@@ -2329,7 +2372,12 @@ impl State {
         self.backend.with_primary_renderer(|renderer| {
             match self.niri.screenshot_ui.capture(renderer) {
                 Ok((size, pixels)) => {
-                    if let Err(err) = self.niri.save_screenshot(size, pixels, write_to_disk, path) {
+                    let options = ScreenshotOptions {
+                        write_to_disk,
+                        path,
+                        ..Default::default()
+                    };
+                    if let Err(err) = self.niri.save_screenshot(size, pixels, options) {
                         warn!("error saving screenshot: {err:?}");
                     }
                 }
@@ -6337,8 +6385,16 @@ impl Niri {
             elements,
         )?;
 
-        self.save_screenshot(size, pixels, write_to_disk, path)
-            .context("error saving screenshot")
+        self.save_screenshot(
+            size,
+            pixels,
+            ScreenshotOptions {
+                write_to_disk,
+                path,
+                ..Default::default()
+            },
+        )
+        .context("error saving screenshot")
     }
 
     pub fn screenshot_window(
@@ -6346,9 +6402,8 @@ impl Niri {
         renderer: &mut GlesRenderer,
         output: &Output,
         mapped: &Mapped,
-        write_to_disk: bool,
         show_pointer: bool,
-        path: Option<String>,
+        options: ScreenshotOptions,
     ) -> anyhow::Result<()> {
         let _span = tracy_client::span!("Niri::screenshot_window");
 
@@ -6405,7 +6460,7 @@ impl Niri {
             elements,
         )?;
 
-        self.save_screenshot(geo.size, pixels, write_to_disk, path)
+        self.save_screenshot(geo.size, pixels, options)
             .context("error saving screenshot")
     }
 
@@ -6413,104 +6468,112 @@ impl Niri {
         &self,
         size: Size<i32, Physical>,
         pixels: Vec<u8>,
-        write_to_disk: bool,
-        path_arg: Option<String>,
+        options: ScreenshotOptions,
     ) -> anyhow::Result<()> {
-        let path = write_to_disk
-            .then(|| {
-                // When given an explicit path, don't try to strftime it or create parents.
-                path_arg.map(|p| (PathBuf::from(p), false)).or_else(|| {
-                    match make_screenshot_path(&self.config.borrow()) {
-                        Ok(path) => path.map(|p| (p, true)),
-                        Err(err) => {
-                            warn!("error making screenshot path: {err:?}");
-                            None
-                        }
+        let ScreenshotOptions {
+            write_to_disk,
+            path,
+            silent,
+            completion,
+        } = options;
+        let path = if write_to_disk {
+            // Explicit paths are not expanded and their parents are not created.
+            if let Some(path) = path {
+                Some((PathBuf::from(path), false))
+            } else {
+                match make_screenshot_path(&self.config.borrow()) {
+                    Ok(path) => path.map(|p| (p, true)),
+                    Err(err) if completion.is_some() => return Err(err),
+                    Err(err) => {
+                        warn!("error making screenshot path: {err:?}");
+                        None
                     }
-                })
-            })
-            .flatten();
+                }
+            }
+        } else {
+            None
+        };
+        if write_to_disk && completion.is_some() {
+            ensure!(path.is_some(), "no screenshot path configured");
+        }
 
-        // Prepare to set the encoded image as our clipboard selection. This must be done from the
-        // main thread.
-        let (tx, rx) = calloop::channel::sync_channel::<Arc<[u8]>>(1);
+        // Update the clipboard and reply on the main thread, after encoding and writing finish.
+        let (tx, rx) = calloop::channel::sync_channel::<ScreenshotResult>(1);
         self.event_loop
             .insert_source(rx, move |event, _, state| match event {
-                calloop::channel::Event::Msg(buf) => {
-                    set_data_device_selection(
-                        &state.niri.display_handle,
-                        &state.niri.seat,
-                        vec![String::from("image/png")],
-                        buf.clone(),
-                    );
-                }
-                calloop::channel::Event::Closed => (),
-            })
-            .unwrap();
-
-        // Prepare to send screenshot completion event back to main thread.
-        let (event_tx, event_rx) = calloop::channel::sync_channel::<Option<String>>(1);
-        self.event_loop
-            .insert_source(event_rx, move |event, _, state| match event {
-                calloop::channel::Event::Msg(path) => {
-                    state.ipc_screenshot_taken(path);
-                }
-                calloop::channel::Event::Closed => (),
-            })
-            .unwrap();
-
-        // Encode and save the image in a thread as it's slow.
-        thread::spawn(move || {
-            let mut buf = vec![];
-
-            let w = std::io::Cursor::new(&mut buf);
-            if let Err(err) = write_png_rgba8(w, size.w as u32, size.h as u32, &pixels) {
-                warn!("error encoding screenshot image: {err:?}");
-                return;
-            }
-
-            let buf: Arc<[u8]> = Arc::from(buf.into_boxed_slice());
-            let _ = tx.send(buf.clone());
-
-            let mut image_path = None;
-
-            if let Some((path, create_parent)) = path {
-                debug!("saving screenshot to {path:?}");
-
-                if create_parent {
-                    if let Some(parent) = path.parent() {
-                        // Relative paths with one component, i.e. "test.png", have Some("") parent.
-                        if !parent.as_os_str().is_empty() {
-                            if let Err(err) = std::fs::create_dir_all(parent) {
-                                if err.kind() != std::io::ErrorKind::AlreadyExists {
-                                    warn!("error creating screenshot directory: {err:?}");
-                                }
-                            }
+                calloop::channel::Event::Msg(result) => {
+                    if let Some(image) = result.image {
+                        if !silent {
+                            set_data_device_selection(
+                                &state.niri.display_handle,
+                                &state.niri.seat,
+                                vec![String::from("image/png")],
+                                image,
+                            );
                         }
+                        state.ipc_screenshot_taken(result.path.as_ref().ok().cloned().flatten());
+                    }
+                    if let Err(err) = &result.path {
+                        warn!("error saving screenshot: {err}");
+                    }
+                    if let Some(completion) = &completion {
+                        let _ = completion.send_blocking(result.path);
                     }
                 }
+                calloop::channel::Event::Closed => (),
+            })
+            .unwrap();
 
-                match std::fs::write(&path, buf) {
-                    Ok(()) => image_path = Some(path),
-                    Err(err) => {
-                        warn!("error saving screenshot image: {err:?}");
+        thread::spawn(move || {
+            let mut image = None;
+            let result = (|| -> anyhow::Result<Option<String>> {
+                let mut buf = vec![];
+                write_png_rgba8(
+                    std::io::Cursor::new(&mut buf),
+                    size.w as u32,
+                    size.h as u32,
+                    &pixels,
+                )
+                .context("error encoding screenshot image")?;
+                let buf: Arc<[u8]> = Arc::from(buf.into_boxed_slice());
+                image = Some(buf.clone());
+
+                let Some((path, create_parent)) = path else {
+                    return Ok(None);
+                };
+                debug!("saving screenshot to {path:?}");
+                if create_parent {
+                    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                        std::fs::create_dir_all(parent)
+                            .context("error creating screenshot directory")?;
                     }
                 }
-            } else {
-                debug!("not saving screenshot to disk");
-            }
+                std::fs::write(&path, buf)
+                    .with_context(|| format!("error writing screenshot to {}", path.display()))?;
+                Ok(path.to_str().map(str::to_owned))
+            })();
 
             #[cfg(feature = "dbus")]
-            if let Err(err) = crate::utils::show_screenshot_notification(image_path.as_deref()) {
-                warn!("error showing screenshot notification: {err:?}");
-            }
-
-            // Send screenshot completion event.
-            let path_string = image_path
+            let notify = !silent && image.is_some();
+            #[cfg(feature = "dbus")]
+            let image_path = result
                 .as_ref()
-                .and_then(|p| p.to_str())
-                .map(|s| s.to_owned());
-            let _ = event_tx.send(path_string);
+                .ok()
+                .and_then(|p| p.as_ref())
+                .map(PathBuf::from);
+            let _ = tx.send(ScreenshotResult {
+                image,
+                path: result.map_err(|err| format!("{err:#}")),
+            });
+
+            // Notification delivery must not delay the clipboard or the completion reply.
+            #[cfg(feature = "dbus")]
+            if notify {
+                if let Err(err) = crate::utils::show_screenshot_notification(image_path.as_deref())
+                {
+                    warn!("error showing screenshot notification: {err:?}");
+                }
+            }
         });
 
         Ok(())
