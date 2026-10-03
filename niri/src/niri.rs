@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::os::unix::net::UnixStream;
@@ -15,6 +16,7 @@ use anyhow::{bail, ensure, Context};
 use calloop::futures::Scheduler;
 use niri_config::debug::PreviewRender;
 use niri_config::output::MaxBpc;
+use niri_config::window_filter::WindowFilter;
 use niri_config::{
     Config, FloatOrInt, Key, Modifiers, OutputName, TrackLayout, WarpMouseToFocusMode,
     WorkspaceReference, Xkb,
@@ -191,6 +193,7 @@ use crate::utils::{
     send_scale_transform, winit_scale, write_png_rgba8, xwayland,
 };
 use crate::window::mapped::MappedId;
+use crate::window::selector::WindowSelector;
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef};
 
 const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
@@ -1084,6 +1087,39 @@ impl State {
 
         self.niri.layout.focus_output(&target);
         self.move_cursor_to_output(&target);
+    }
+
+    /// Focus a match after the config or IPC entry point has validated the conditions.
+    pub(crate) fn focus_window_matching(&mut self, filter: WindowFilter) {
+        let selector = match WindowSelector::new(filter) {
+            Ok(selector) => selector,
+            Err(err) => {
+                warn!("{err}");
+                return;
+            }
+        };
+        let layout = &self.niri.layout;
+        let current_workspace = layout.active_workspace().map(|ws| ws.id());
+        let mut best = None;
+        layout.with_windows(|window, _, workspace, _| {
+            if !selector.matches(window, workspace, current_workspace) {
+                return;
+            }
+            // Keep the focused match, then prefer MRU; ID breaks ties deterministically.
+            let preference = (
+                window.is_focused(),
+                window.get_focus_timestamp(),
+                Reverse(window.id().get()),
+            );
+            if best.as_ref().is_none_or(|(key, _)| preference > *key) {
+                best = Some((preference, window.window.clone()));
+            }
+        });
+        if let Some(((is_focused, _, _), window)) = best {
+            if !is_focused {
+                self.focus_window(&window);
+            }
+        }
     }
 
     /// Focus a specific window, taking care of a potential active output change and cursor

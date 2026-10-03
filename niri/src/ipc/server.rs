@@ -36,6 +36,7 @@ use crate::input::pick_window_grab::PickWindowGrab;
 use crate::layout::workspace::WorkspaceId;
 use crate::niri::State;
 use crate::utils::{version, with_toplevel_role};
+use crate::window::selector::WindowSelector;
 use crate::window::Mapped;
 
 // If an event stream client fails to read events fast enough that we accumulate more than this
@@ -288,6 +289,26 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             let windows = state.windows.windows.values().cloned().collect();
             Response::Windows(windows)
         }
+        Request::WindowsMatching(filter) => {
+            let selector = WindowSelector::new(filter.into())?;
+            let (tx, rx) = async_channel::bounded(1);
+            ctx.event_loop.insert_idle(move |state| {
+                let layout = &state.niri.layout;
+                let current_workspace = layout.active_workspace().map(|ws| ws.id());
+                let mut windows = Vec::new();
+                layout.with_windows(|window, _, workspace, geometry| {
+                    if selector.matches(window, workspace, current_workspace) {
+                        windows.push(make_ipc_window(window, workspace, geometry));
+                    }
+                });
+                let _ = tx.send_blocking(windows);
+            });
+            Response::Windows(
+                rx.recv()
+                    .await
+                    .map_err(|_| String::from("error querying windows"))?,
+            )
+        }
         Request::Layers => {
             let (tx, rx) = async_channel::bounded(1);
             ctx.event_loop.insert_idle(move |state| {
@@ -462,6 +483,9 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
 }
 
 fn validate_action(action: &Action) -> Result<(), String> {
+    if let Action::FocusWindowMatching { filter } = action {
+        niri_config::window_filter::WindowFilter::from(filter.clone()).validate_focus()?;
+    }
     if let Action::Screenshot { path, .. }
     | Action::ScreenshotScreen { path, .. }
     | Action::ScreenshotWindow { path, .. }

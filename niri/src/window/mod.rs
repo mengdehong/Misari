@@ -17,6 +17,7 @@ use smithay::wayland::shell::xdg::{
 use crate::utils::with_toplevel_role;
 
 pub mod mapped;
+pub(crate) mod selector;
 pub use mapped::Mapped;
 
 pub mod unmapped;

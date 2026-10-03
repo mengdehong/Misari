@@ -16,6 +16,7 @@ use smithay::input::keyboard::Keysym;
 
 use crate::recent_windows::{MruDirection, MruFilter, MruScope};
 use crate::utils::{expect_only_children, MergeWith};
+use crate::window_filter::WindowFilter;
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Binds(pub Vec<Bind>);
@@ -171,6 +172,7 @@ pub enum Action {
     ToggleWindowedFullscreenById(u64),
     #[knuffel(skip)]
     FocusWindow(u64),
+    FocusWindowMatching(#[knuffel(flatten(property))] WindowFilter),
     FocusWindowInColumn(#[knuffel(argument)] u8),
     FocusWindowPrevious,
     FocusColumnLeft,
@@ -459,6 +461,9 @@ impl From<niri_ipc::Action> for Action {
                 Self::ToggleWindowedFullscreenById(id)
             }
             niri_ipc::Action::FocusWindow { id } => Self::FocusWindow(id),
+            niri_ipc::Action::FocusWindowMatching { filter } => {
+                Self::FocusWindowMatching(filter.into())
+            }
             niri_ipc::Action::FocusWindowInColumn { index } => Self::FocusWindowInColumn(index),
             niri_ipc::Action::FocusWindowPrevious {} => Self::FocusWindowPrevious,
             niri_ipc::Action::FocusColumnLeft {} => Self::FocusColumnLeft,
@@ -927,6 +932,11 @@ impl Bind {
             }
             match Action::decode_node(child, ctx) {
                 Ok(action) => {
+                    if let Action::FocusWindowMatching(filter) = &action {
+                        if let Err(err) = filter.validate_focus() {
+                            ctx.emit_error(DecodeError::unexpected(child, "action", err));
+                        }
+                    }
                     if !matches!(action, Action::Spawn(_) | Action::SpawnSh(_)) {
                         if let Some(node) = allow_when_locked_node {
                             ctx.emit_error(DecodeError::unexpected(

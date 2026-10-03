@@ -12,6 +12,9 @@ input {
 }
 
 spawn-at-startup "kitty" "--override" "linux_display_server=wayland" "--title" "niri-dev"
+// Fixed titles and a shared app-id make window selection easy to verify.
+spawn-at-startup "kitty" "--config" "NONE" "--override" "linux_display_server=wayland" "--class" "selection-test" "--title" "selection-A"
+spawn-at-startup "kitty" "--config" "NONE" "--override" "linux_display_server=wayland" "--class" "selection-test" "--title" "selection-B"
 
 binds {
     Mod+K hotkey-overlay-title="Niri 快捷键" repeat=false { show-hotkey-overlay; }
@@ -19,6 +22,18 @@ binds {
         spawn "kitty" "--override" "linux_display_server=wayland" "--title" "niri-dev";
     }
     Mod+C hotkey-overlay-title="关闭开发实例窗口" repeat=false { close-window; }
+    F6 hotkey-overlay-title="测试：按标题聚焦 A" repeat=false {
+        focus-window-matching title="^selection-A$";
+    }
+    F7 hotkey-overlay-title="测试：按应用聚焦（不循环）" repeat=false {
+        focus-window-matching app-id="^selection-test$";
+    }
+    F8 hotkey-overlay-title="测试：无匹配时保持焦点" repeat=false {
+        focus-window-matching title="^missing-selection-window$";
+    }
+    F9 hotkey-overlay-title="返回开发终端" repeat=false {
+        focus-window-matching title="^niri-dev$";
+    }
     F10 hotkey-overlay-title="Exit development niri" { quit skip-confirmation=true; }
 }
 

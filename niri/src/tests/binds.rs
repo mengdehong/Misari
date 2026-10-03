@@ -2,15 +2,13 @@ use std::fmt::Write as _;
 
 use insta::assert_snapshot;
 use niri_config::{Action, Config};
-use smithay::backend::input::{ButtonState, InputEvent, InputTime, KeyState, Keycode};
+use smithay::backend::input::{InputEvent, InputTime, KeyState, Keycode};
 use smithay::input::keyboard::xkb::Keymap;
 use wayland_client::protocol::wl_surface::WlSurface;
 
 use crate::tests::client::ClientId;
 use crate::tests::fixture::Fixture;
-use crate::tests::test_input_backend::{
-    TestInputBackend, TestKeyboardKeyEvent, TestPointerButtonEvent,
-};
+use crate::tests::test_input_backend::{TestInputBackend, TestKeyboardKeyEvent};
 
 enum Op {
     Press(Keycode),

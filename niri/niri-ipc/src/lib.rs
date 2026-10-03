@@ -73,6 +73,8 @@ pub enum Request {
     Workspaces,
     /// Request information about open windows.
     Windows,
+    /// List windows matching all of the given conditions.
+    WindowsMatching(WindowFilter),
     /// Request information about layer-shell surfaces.
     Layers,
     /// Request information about the configured keyboard layouts.
@@ -323,6 +325,13 @@ pub enum Action {
         /// Id of the window to focus.
         #[cfg_attr(feature = "clap", arg(long))]
         id: u64,
+    },
+    /// Focus a matching window, keeping the current match or choosing the most recently used.
+    /// At least one condition is required. No match leaves focus unchanged.
+    FocusWindowMatching {
+        /// Conditions combined with AND.
+        #[cfg_attr(feature = "clap", command(flatten))]
+        filter: WindowFilter,
     },
     /// Focus a window in the focused column by index.
     FocusWindowInColumn {
@@ -1323,6 +1332,36 @@ pub enum MaxBpc {
     /// 16-bit.
     #[serde(rename = "16")]
     _16 = 16,
+}
+
+/// Window selection conditions, combined with AND. Missing conditions impose no restriction.
+/// App ID and title use regular expressions; missing window attributes do not match.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+#[cfg_attr(feature = "clap", derive(clap::Args))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct WindowFilter {
+    /// Match this exact window ID.
+    #[cfg_attr(feature = "clap", arg(long))]
+    pub id: Option<u64>,
+    /// Match the application ID against this regular expression.
+    #[cfg_attr(feature = "clap", arg(long))]
+    pub app_id: Option<String>,
+    /// Match the title against this regular expression.
+    #[cfg_attr(feature = "clap", arg(long))]
+    pub title: Option<String>,
+    /// Match this exact workspace ID (not its index).
+    #[cfg_attr(feature = "clap", arg(long))]
+    pub workspace_id: Option<u64>,
+    /// Match only the focused workspace, resolved when the request executes.
+    #[cfg_attr(feature = "clap", arg(long))]
+    pub current_workspace: bool,
+    /// Match floating (true) or tiled (false) windows; omit to match either.
+    #[cfg_attr(feature = "clap", arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true))]
+    pub floating: Option<bool>,
+    /// Match urgent (true) or non-urgent (false) windows; omit to match either.
+    #[cfg_attr(feature = "clap", arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true))]
+    pub urgent: Option<bool>,
 }
 
 /// Toplevel window.

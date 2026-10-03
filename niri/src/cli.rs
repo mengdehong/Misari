@@ -69,7 +69,13 @@ pub enum Msg {
     /// List workspaces.
     Workspaces,
     /// List open windows.
-    Windows,
+    Windows {
+        #[command(flatten)]
+        filter: niri_ipc::WindowFilter,
+        /// Group text output by workspace (not available with --json).
+        #[arg(long, value_enum)]
+        group_by: Option<WindowGroupBy>,
+    },
     /// List open layer-shell surfaces.
     Layers,
     /// Get the configured keyboard layouts.
@@ -114,6 +120,11 @@ pub enum Msg {
     Casts,
     /// Send a raw JSON request to the compositor, reading from stdin.
     RawRequest,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum WindowGroupBy {
+    Workspace,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]

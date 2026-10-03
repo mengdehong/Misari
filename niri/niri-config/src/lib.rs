@@ -41,6 +41,7 @@ pub mod misc;
 pub mod output;
 pub mod recent_windows;
 pub mod utils;
+pub mod window_filter;
 pub mod window_rule;
 pub mod workspace;
 

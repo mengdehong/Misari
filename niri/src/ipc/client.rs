@@ -16,6 +16,17 @@ use crate::cli::Msg;
 use crate::utils::version;
 
 pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Result<()> {
+    if json
+        && matches!(
+            msg,
+            Msg::Windows {
+                group_by: Some(_),
+                ..
+            }
+        )
+    {
+        bail!("--group-by is only available for text output; JSON remains a flat window array");
+    }
     // For actions taking paths, prepend the niri CLI's working directory.
     if let Msg::Action {
         action:
@@ -42,7 +53,13 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
             action: action.clone(),
         },
         Msg::Workspaces => Request::Workspaces,
-        Msg::Windows => Request::Windows,
+        Msg::Windows { filter, .. } => {
+            if *filter == niri_ipc::WindowFilter::default() {
+                Request::Windows
+            } else {
+                Request::WindowsMatching(filter.clone())
+            }
+        }
         Msg::Layers => Request::Layers,
         Msg::KeyboardLayouts => Request::KeyboardLayouts,
         Msg::EventStream => Request::EventStream,
@@ -197,7 +214,7 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
                 println!("No window is focused.");
             }
         }
-        Msg::Windows => {
+        Msg::Windows { group_by, .. } => {
             let Response::Windows(mut windows) = response else {
                 bail!("unexpected response: expected Windows, got {response:?}");
             };
@@ -209,8 +226,19 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
                 return Ok(());
             }
 
-            windows.sort_unstable_by_key(|a| a.id);
+            if group_by.is_some() {
+                let response = socket
+                    .send(Request::Workspaces)
+                    .context("error querying workspace names")?
+                    .map_err(anyhow::Error::msg)?;
+                let Response::Workspaces(workspaces) = response else {
+                    bail!("unexpected response: expected Workspaces, got {response:?}");
+                };
+                print!("{}", format_windows_by_workspace(&windows, workspaces));
+                return Ok(());
+            }
 
+            windows.sort_unstable_by_key(|window| window.id);
             for window in windows {
                 print_window(&window);
                 println!();
@@ -703,6 +731,71 @@ fn print_output(output: Output) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn format_windows_by_workspace(
+    windows: &[Window],
+    mut workspaces: Vec<niri_ipc::Workspace>,
+) -> String {
+    use std::collections::BTreeMap;
+    use std::fmt::Write as _;
+
+    let mut groups = BTreeMap::<Option<u64>, Vec<&Window>>::new();
+    for window in windows {
+        groups.entry(window.workspace_id).or_default().push(window);
+    }
+    workspaces.sort_by(|a, b| (&a.output, a.idx, a.id).cmp(&(&b.output, b.idx, b.id)));
+    let mut text = String::new();
+    let mut write_group = |heading: String, mut windows: Vec<&Window>| {
+        writeln!(text, "{heading}").unwrap();
+        windows.sort_unstable_by_key(|window| window.id);
+        for window in windows {
+            writeln!(
+                text,
+                "  {}  {:?}  {:?}{}{}{}",
+                window.id,
+                window.app_id.as_deref().unwrap_or("(unset)"),
+                window.title.as_deref().unwrap_or("(unset)"),
+                if window.is_focused { " [focused]" } else { "" },
+                if window.is_floating {
+                    " [floating]"
+                } else {
+                    ""
+                },
+                if window.is_urgent { " [urgent]" } else { "" },
+            )
+            .unwrap();
+        }
+        text.push('\n');
+    };
+    for workspace in workspaces {
+        if let Some(windows) = groups.remove(&Some(workspace.id)) {
+            let name = workspace
+                .name
+                .map(|name| format!(" {name:?}"))
+                .unwrap_or_default();
+            write_group(
+                format!(
+                    "{} / Workspace {}{} (ID {})",
+                    workspace.output.as_deref().unwrap_or("No output"),
+                    workspace.idx,
+                    name,
+                    workspace.id
+                ),
+                windows,
+            );
+        }
+    }
+    // Workspace metadata is queried separately and may have changed since the window query.
+    // Keep windows with missing metadata rather than dropping or misclassifying them.
+    for (id, windows) in groups {
+        let heading = match id {
+            Some(id) => format!("Workspace ID {id} (metadata unavailable)"),
+            None => String::from("No workspace"),
+        };
+        write_group(heading, windows);
+    }
+    text
+}
+
 fn print_window(window: &Window) {
     let focused = if window.is_focused { " (focused)" } else { "" };
     let urgent = if window.is_urgent { " (urgent)" } else { "" };
@@ -836,6 +929,52 @@ mod tests {
     use insta::assert_snapshot;
 
     use super::*;
+
+    #[test]
+    fn window_selection_grouping_preserves_unknown_and_unassigned_windows() {
+        let window = |id, workspace_id| {
+            serde_json::from_value(json!({
+                "id": id, "workspace_id": workspace_id, "title": "hello\nworld", "app_id": "test",
+                "pid": null, "is_focused": false, "is_floating": false, "is_urgent": false,
+                "focus_timestamp": null,
+                "layout": {"pos_in_scrolling_layout": null, "tile_size": [100, 100],
+                    "window_size": [100, 100], "tile_pos_in_workspace_view": null,
+                    "window_offset_in_tile": [0, 0]}
+            }))
+            .unwrap()
+        };
+        let workspace = |id, output| {
+            serde_json::from_value(json!({
+                "id": id, "idx": 1, "name": null, "output": output,
+                "is_urgent": false, "is_active": true, "is_focused": false, "active_window_id": null
+            }))
+            .unwrap()
+        };
+        let text = format_windows_by_workspace(
+            &[
+                window(3, Some(20)),
+                window(2, Some(10)),
+                window(1, Some(10)),
+                window(4, Some(99)),
+                window(5, None),
+            ],
+            vec![workspace(20, "DP-2"), workspace(10, "DP-1")],
+        );
+        assert_snapshot!(text, @r#"
+        DP-1 / Workspace 1 (ID 10)
+          1  "test"  "hello\nworld"
+          2  "test"  "hello\nworld"
+
+        DP-2 / Workspace 1 (ID 20)
+          3  "test"  "hello\nworld"
+
+        No workspace
+          5  "test"  "hello\nworld"
+
+        Workspace ID 99 (metadata unavailable)
+          4  "test"  "hello\nworld"
+        "#);
+    }
 
     #[test]
     fn test_fmt_rounded() {
