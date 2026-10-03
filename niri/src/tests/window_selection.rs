@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::time::Duration;
 
 use niri_config::window_filter::WindowFilter;
@@ -20,6 +21,12 @@ fn filter(properties: &str) -> WindowFilter {
 }
 
 fn open(f: &mut Fixture, client: ClientId, app: Option<&str>, title: &str) -> u64 {
+    let existing: HashSet<_> = f
+        .niri()
+        .layout
+        .windows()
+        .map(|(_, w)| w.id().get())
+        .collect();
     let window = f.client(client).create_window();
     if let Some(app) = app {
         window.xdg_toplevel.set_app_id(app.to_owned());
@@ -33,7 +40,14 @@ fn open(f: &mut Fixture, client: ClientId, app: Option<&str>, title: &str) -> u6
     window.set_size(100, 100);
     window.ack_last_and_commit();
     f.double_roundtrip(client);
-    f.niri().layout.focus().unwrap().id().get()
+    f.niri()
+        .layout
+        .windows()
+        .find(|(_, w)| !existing.contains(&w.id().get()))
+        .unwrap()
+        .1
+        .id()
+        .get()
 }
 
 #[test]
@@ -133,4 +147,66 @@ fn window_selection_focus_preserves_current_match_and_uses_mru() {
         f.niri().layout.focus().unwrap().id().get(),
         first.min(second)
     );
+}
+
+fn recall(properties: &str, launch: bool) -> Action {
+    Action::RecallWindow(
+        filter(properties),
+        if launch {
+            vec!["/bin/true".into()]
+        } else {
+            vec![]
+        },
+    )
+}
+
+fn workspace_of(f: &mut Fixture, id: u64) -> crate::layout::workspace::WorkspaceId {
+    f.niri()
+        .layout
+        .workspaces()
+        .find(|(_, _, ws)| ws.windows().any(|w| w.id().get() == id))
+        .unwrap()
+        .2
+        .id()
+}
+
+#[test]
+fn recall_moves_floating_window_to_current_workspace() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1920, 1080));
+    let client = f.add_client();
+    let browser = open(&mut f, client, Some("browser"), "Browser");
+    f.niri().layout.toggle_window_floating(None);
+    f.niri_focus_output(2);
+    let target = f.niri().layout.active_workspace().unwrap().id();
+    let action = recall(r#"app-id="browser""#, false);
+    // Repeating the action while already here must also preserve floating state.
+    for _ in 0..2 {
+        f.niri_state().do_action(action.clone(), false);
+        f.double_roundtrip(client);
+        assert_eq!(workspace_of(&mut f, browser), target);
+        assert_eq!(f.niri().layout.focus().unwrap().id().get(), browser);
+        assert!(f.niri().layout.focus().unwrap().is_floating());
+    }
+}
+
+#[test]
+fn recall_launch_places_window_without_switching_back() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1920, 1080));
+    let client = f.add_client();
+    let home = open(&mut f, client, Some("terminal"), "Home");
+    let target = workspace_of(&mut f, home);
+    let action = recall(r#"app-id="browser""#, true);
+    f.niri_state().do_action(action.clone(), false);
+    f.niri_state().do_action(action, false);
+    assert_eq!(f.niri().pending_recalls.len(), 1);
+    f.niri_focus_output(2);
+    let away = open(&mut f, client, Some("terminal"), "Away");
+    let browser = open(&mut f, client, Some("browser"), "Browser");
+    assert_eq!(workspace_of(&mut f, browser), target);
+    assert_eq!(f.niri().layout.focus().unwrap().id().get(), away);
+    assert!(f.niri().pending_recalls.is_empty());
 }

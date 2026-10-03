@@ -483,6 +483,9 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
 }
 
 fn validate_action(action: &Action) -> Result<(), String> {
+    if let Action::RecallWindow { filter, command } = action {
+        niri_config::window_filter::WindowFilter::from(filter.clone()).validate_recall(command)?;
+    }
     if let Action::FocusWindowMatching { filter } = action {
         niri_config::window_filter::WindowFilter::from(filter.clone()).validate_focus()?;
     }

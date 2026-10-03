@@ -64,23 +64,32 @@ pub fn restore_nofile_rlimit() {
 
 /// Spawns the command to run independently of the compositor.
 pub fn spawn<T: AsRef<OsStr> + Send + 'static>(command: Vec<T>, token: Option<XdgActivationToken>) {
+    if let Err(err) = spawn_with_result(command, token, |_| {}) {
+        warn!("error spawning a thread to spawn the command: {err:?}");
+    }
+}
+
+/// Reports whether exec succeeded, without waiting for the application to exit.
+pub fn spawn_with_result<T: AsRef<OsStr> + Send + 'static>(
+    command: Vec<T>,
+    token: Option<XdgActivationToken>,
+    on_spawn: impl FnOnce(bool) + Send + 'static,
+) -> io::Result<()> {
     let _span = tracy_client::span!();
 
     if command.is_empty() {
-        return;
+        on_spawn(false);
+        return Ok(());
     }
 
     // Spawning and waiting takes some milliseconds, so do it in a thread.
-    let res = thread::Builder::new()
+    thread::Builder::new()
         .name("Command Spawner".to_owned())
         .spawn(move || {
             let (command, args) = command.split_first().unwrap();
-            spawn_sync(command, args, token);
-        });
-
-    if let Err(err) = res {
-        warn!("error spawning a thread to spawn the command: {err:?}");
-    }
+            spawn_sync(command, args, token, on_spawn);
+        })?;
+    Ok(())
 }
 
 /// Spawns the command through the shell.
@@ -97,6 +106,7 @@ fn spawn_sync(
     command: impl AsRef<OsStr>,
     args: impl IntoIterator<Item = impl AsRef<OsStr>>,
     token: Option<XdgActivationToken>,
+    on_spawn: impl FnOnce(bool),
 ) {
     let _span = tracy_client::span!();
 
@@ -156,7 +166,9 @@ fn spawn_sync(
 
     unsafe { process.pre_exec(crate::utils::signals::unblock_all) };
 
-    let Some(mut child) = do_spawn(command, process) else {
+    let child = do_spawn(command, process);
+    on_spawn(child.is_some());
+    let Some(mut child) = child else {
         return;
     };
 
@@ -263,6 +275,9 @@ mod systemd {
             })
             .ok()
             .unzip();
+        if pipe_pid_read.is_none() || pipe_wait_read.is_none() {
+            return None;
+        }
 
         unsafe {
             // The fds will be duplicated after a fork and closed on exec or exit automatically. Get
@@ -293,6 +308,7 @@ mod systemd {
                     grandchild_pid => {
                         // Send back the PID.
                         if let Some(pipe) = pipe_pid_write {
+                            let _ = write_all(&pipe, &libc::getpid().to_ne_bytes());
                             let _ = write_all(pipe, &grandchild_pid.to_ne_bytes());
                         }
 
@@ -328,42 +344,50 @@ mod systemd {
             });
         }
 
-        let child = match process.spawn() {
-            Ok(child) => child,
-            Err(err) => {
-                warn!("error spawning {command:?}: {err:?}");
+        // Command::spawn() waits for the intermediate child when exec fails. Therefore
+        // scope setup and releasing that child must not wait for spawn() to return.
+        thread::scope(|scope| {
+            let setup = thread::Builder::new()
+                .name("Scope Setup".to_owned())
+                .spawn_scoped(scope, move || {
+                    if let Some(pipe) = pipe_pid_read {
+                        let mut buf = [0; 8];
+                        match read_all(pipe, &mut buf) {
+                            Ok(()) => {
+                                let intermediate = i32::from_ne_bytes(buf[..4].try_into().unwrap());
+                                let child = i32::from_ne_bytes(buf[4..].try_into().unwrap());
+                                trace!("spawned PID: {child}");
+                                if let Err(err) =
+                                    start_systemd_scope(command, intermediate as u32, child as u32)
+                                {
+                                    trace!(
+                                        "error starting systemd scope for spawned command: {err:?}"
+                                    );
+                                }
+                            }
+                            Err(err) => warn!("error reading child PID: {err:?}"),
+                        }
+                    }
+                    // The intermediate child can now exit, even if exec failed.
+                    drop(pipe_wait_write);
+                });
+            if let Err(err) = setup {
+                warn!("error spawning scope setup thread: {err:?}");
                 return None;
             }
-        };
 
-        drop(pipe_pid_write);
-        drop(pipe_wait_read);
-
-        // Wait for the grandchild PID.
-        if let Some(pipe) = pipe_pid_read {
-            let mut buf = [0; 4];
-            match read_all(pipe, &mut buf) {
-                Ok(()) => {
-                    let pid = i32::from_ne_bytes(buf);
-                    trace!("spawned PID: {pid}");
-
-                    // Start a systemd scope for the grandchild.
-                    if let Err(err) = start_systemd_scope(command, child.id(), pid as u32) {
-                        trace!("error starting systemd scope for spawned command: {err:?}");
-                    }
-                }
+            let child = process.spawn();
+            // Also unblock the setup thread if spawning failed before reaching pre_exec.
+            drop(pipe_pid_write);
+            drop(pipe_wait_read);
+            match child {
+                Ok(child) => Some(child),
                 Err(err) => {
-                    warn!("error reading child PID: {err:?}");
+                    warn!("error spawning {command:?}: {err:?}");
+                    None
                 }
             }
-        }
-
-        // Signal the intermediate child to exit now that we're done trying to creating a systemd
-        // scope.
-        trace!("signaling child to exit");
-        drop(pipe_wait_write);
-
-        Some(child)
+        })
     }
 
     fn write_all(fd: impl AsFd, buf: &[u8]) -> rustix::io::Result<()> {
@@ -481,5 +505,22 @@ mod systemd {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spawn_with_result;
+
+    #[test]
+    fn spawn_reports_exec_failure() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn_with_result(vec!["/nonexistent/niri-spawn-test"], None, move |success| {
+            tx.send(success).unwrap();
+        })
+        .unwrap();
+        assert!(!rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("spawn result"));
     }
 }

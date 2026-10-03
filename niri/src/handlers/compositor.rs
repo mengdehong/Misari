@@ -150,6 +150,11 @@ impl CompositorHandler for State {
                     let is_floating = rules.compute_open_floating(toplevel);
 
                     // Figure out if we should activate the window.
+                    let recall_token = activation_token_data.as_ref().is_some_and(|data| {
+                        data.user_data
+                            .get::<crate::niri::RecallActivationMarker>()
+                            .is_some()
+                    });
                     let activate = rules.open_focused.map(|focus| {
                         if focus {
                             ActivateWindow::Yes
@@ -200,7 +205,26 @@ impl CompositorHandler for State {
                     };
                     let window = mapped.window.clone();
 
-                    let target = if let Some(p) = &parent {
+                    let recall_target = self.niri.take_pending_recall_target(&mapped);
+                    let activate = if let Some(target) = recall_target {
+                        if self
+                            .niri
+                            .layout
+                            .active_workspace()
+                            .is_some_and(|ws| ws.id() == target)
+                        {
+                            ActivateWindow::Yes
+                        } else {
+                            ActivateWindow::No
+                        }
+                    } else if recall_token {
+                        ActivateWindow::No
+                    } else {
+                        activate
+                    };
+                    let target = if let Some(id) = recall_target {
+                        AddWindowTarget::Workspace(id)
+                    } else if let Some(p) = &parent {
                         // Open dialogs next to their parent window.
                         AddWindowTarget::NextTo(p)
                     } else if let Some(id) = workspace_id {

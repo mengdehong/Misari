@@ -1,5 +1,4 @@
 use std::cell::{Cell, RefCell};
-use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::os::unix::net::UnixStream;
@@ -116,7 +115,7 @@ use smithay::wayland::tablet_manager::TabletManagerState;
 use smithay::wayland::text_input::TextInputManagerState;
 use smithay::wayland::viewporter::ViewporterState;
 use smithay::wayland::virtual_keyboard::VirtualKeyboardManagerState;
-use smithay::wayland::xdg_activation::XdgActivationState;
+use smithay::wayland::xdg_activation::{XdgActivationState, XdgActivationToken};
 use smithay::wayland::xdg_foreign::XdgForeignState;
 use wayland_server::protocol::wl_output::WlOutput;
 
@@ -152,7 +151,8 @@ use crate::layer::MappedLayer;
 use crate::layout::tile::TileRenderElement;
 use crate::layout::workspace::{Workspace, WorkspaceId};
 use crate::layout::{
-    HitType, Layout, LayoutElement as _, LayoutElementRenderElement, MonitorRenderElement,
+    ActivateWindow, HitType, Layout, LayoutElement as _, LayoutElementRenderElement,
+    MonitorRenderElement,
 };
 use crate::niri_render_elements;
 use crate::protocols::ext_workspace::{self, ExtWorkspaceManagerState};
@@ -183,7 +183,7 @@ use crate::ui::mru::{MruCloseRequest, WindowMruUi, WindowMruUiRenderElement};
 use crate::ui::screen_transition::{self, ScreenTransition};
 use crate::ui::screenshot_ui::{OutputScreenshot, ScreenshotUi, ScreenshotUiRenderElement};
 use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
-use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
+use crate::utils::spawning::{spawn_with_result, CHILD_DISPLAY, CHILD_ENV};
 use crate::utils::vblank_throttle::VBlankThrottle;
 use crate::utils::watcher::Watcher;
 use crate::utils::xwayland::satellite::Satellite;
@@ -202,6 +202,21 @@ const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
 // second, so with the worst timing the maximum interval between two frame callbacks for a surface
 // should be ~1.995 seconds.
 const FRAME_CALLBACK_THROTTLE: Option<Duration> = Some(Duration::from_millis(995));
+
+const RECALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Also suppresses ordinary activation after a recall has completed or expired.
+pub(crate) struct RecallActivationMarker;
+
+pub(crate) struct PendingRecall {
+    selector: WindowSelector,
+    command: Vec<String>,
+    pub(crate) target: WorkspaceId,
+    pub(crate) token: XdgActivationToken,
+    surface: Option<WlSurface>,
+    existing_surfaces: Vec<WlSurface>,
+    pub(crate) deadline: Instant,
+}
 
 pub struct Niri {
     pub config: Rc<RefCell<Config>>,
@@ -249,6 +264,9 @@ pub struct Niri {
 
     // Windows which don't have a buffer attached yet.
     pub unmapped_windows: HashMap<WlSurface, Unmapped>,
+
+    pub(crate) pending_recalls: Vec<PendingRecall>,
+    recall_spawn_failures: calloop::channel::Sender<XdgActivationToken>,
 
     /// Layer surfaces which don't have a buffer attached yet.
     pub unmapped_layer_surfaces: HashSet<WlSurface>,
@@ -838,6 +856,7 @@ impl State {
 
         // Needs to be called after updating the keyboard focus.
         self.niri.refresh_layout();
+        self.niri.prune_pending_recalls();
 
         self.niri.cursor_manager.check_cursor_image_surface_alive();
         self.niri.refresh_pointer_outputs();
@@ -1098,32 +1117,140 @@ impl State {
                 return;
             }
         };
-        let layout = &self.niri.layout;
-        let current_workspace = layout.active_workspace().map(|ws| ws.id());
-        let mut best = None;
-        layout.with_windows(|window, _, workspace, _| {
-            if !selector.matches(window, workspace, current_workspace) {
-                return;
-            }
-            // Keep the focused match, then prefer MRU; ID breaks ties deterministically.
-            let preference = (
-                window.is_focused(),
-                window.get_focus_timestamp(),
-                Reverse(window.id().get()),
-            );
-            if best.as_ref().is_none_or(|(key, _)| preference > *key) {
-                best = Some((preference, window.window.clone()));
-            }
-        });
-        if let Some(((is_focused, _, _), window)) = best {
-            if !is_focused {
-                self.focus_window(&window);
-            }
+        if let Some((false, window)) = selector.select(&self.niri.layout) {
+            self.focus_window(&window);
         }
     }
 
-    /// Focus a specific window, taking care of a potential active output change and cursor
-    /// warp.
+    pub(crate) fn recall_window(&mut self, filter: WindowFilter, command: Vec<String>) {
+        let Some(target) = self.niri.layout.active_workspace().map(|ws| ws.id()) else {
+            return;
+        };
+        let selector = match WindowSelector::new(filter) {
+            Ok(selector) => selector,
+            Err(err) => {
+                warn!("{err}");
+                return;
+            }
+        };
+        self.niri.prune_pending_recalls();
+        if let Some((_, window)) = selector.select(&self.niri.layout) {
+            // An immediate match also satisfies an earlier launch request for this action.
+            self.niri
+                .pending_recalls
+                .retain(|r| r.selector.filter != selector.filter || r.command != command);
+            self.recall_to_workspace(&window, target);
+            return;
+        }
+        if command.is_empty() {
+            return;
+        }
+        if let Some(request) = self
+            .niri
+            .pending_recalls
+            .iter_mut()
+            .find(|r| r.selector.filter == selector.filter && r.command == command)
+        {
+            request.target = target;
+            return;
+        }
+
+        let (token, data) = self.niri.activation_state.create_external_token(None);
+        data.user_data.insert_if_missing(|| RecallActivationMarker);
+        let token = token.clone();
+        let mut existing_surfaces: Vec<_> = self.niri.unmapped_windows.keys().cloned().collect();
+        self.niri.layout.with_windows(|window, _, _, _| {
+            existing_surfaces.push(window.toplevel().wl_surface().clone());
+        });
+        let deadline = Instant::now() + RECALL_TIMEOUT;
+        self.niri.pending_recalls.push(PendingRecall {
+            selector,
+            command: command.clone(),
+            target,
+            token: token.clone(),
+            surface: None,
+            existing_surfaces,
+            deadline,
+        });
+        self.niri
+            .event_loop
+            .insert_source(Timer::from_deadline(deadline), |_, _, state| {
+                state.niri.prune_pending_recalls();
+                TimeoutAction::Drop
+            })
+            .unwrap();
+
+        let failures = self.niri.recall_spawn_failures.clone();
+        let failed_token = token.clone();
+        if let Err(err) = spawn_with_result(command, Some(token.clone()), move |success| {
+            if !success {
+                let _ = failures.send(failed_token);
+            }
+        }) {
+            warn!("error starting recall command: {err:?}");
+            self.niri.pending_recalls.retain(|r| r.token != token);
+        }
+    }
+
+    fn recall_to_workspace(&mut self, window: &Window, target: WorkspaceId) {
+        let Some((_, workspace)) = self.niri.layout.find_workspace_by_id(target) else {
+            return;
+        };
+        let already_here = workspace.has_window(window);
+        let focus = self
+            .niri
+            .layout
+            .active_workspace()
+            .is_some_and(|ws| ws.id() == target);
+        if !already_here {
+            self.niri
+                .layout
+                .move_to_workspace_by_id(window, target, ActivateWindow::No);
+        }
+        // Interactive moves may prevent relocation. Never switch to the source workspace.
+        if focus
+            && self
+                .niri
+                .layout
+                .find_workspace_by_id(target)
+                .is_some_and(|(_, ws)| ws.has_window(window))
+        {
+            self.focus_window(window);
+        }
+        self.niri.queue_redraw_all();
+    }
+
+    pub(crate) fn complete_pending_recall(&mut self, surface: &WlSurface) {
+        self.niri.prune_pending_recalls();
+        let Some((mapped, _)) = self.niri.layout.find_window_and_output(surface) else {
+            return;
+        };
+        let Some(index) = self.niri.pending_recall_index(mapped) else {
+            return;
+        };
+        let window = mapped.window.clone();
+        let request = self.niri.pending_recalls.remove(index);
+        self.recall_to_workspace(&window, request.target);
+    }
+
+    pub(crate) fn associate_recall_token(
+        &mut self,
+        token: &XdgActivationToken,
+        surface: &WlSurface,
+    ) {
+        self.niri.prune_pending_recalls();
+        if let Some(request) = self
+            .niri
+            .pending_recalls
+            .iter_mut()
+            .find(|r| &r.token == token)
+        {
+            request.surface = Some(surface.clone());
+        }
+        self.complete_pending_recall(surface);
+    }
+
+    /// Focus a specific window, taking care of a potential active output change and cursor warp.
     pub fn focus_window(&mut self, window: &Window) {
         let active_output = self.niri.layout.active_output().cloned();
 
@@ -2537,6 +2664,14 @@ impl Niri {
             GammaControlManagerState::new::<State, _>(&display_handle, move |client| {
                 is_tty && !client.get_data::<ClientState>().unwrap().restricted
             });
+        let (recall_spawn_failures, failures) = calloop::channel::channel();
+        event_loop
+            .insert_source(failures, |event, _, state| {
+                if let calloop::channel::Event::Msg(token) = event {
+                    state.niri.pending_recalls.retain(|r| r.token != token);
+                }
+            })
+            .unwrap();
         let activation_state = XdgActivationState::new::<State>(&display_handle);
         event_loop
             .insert_source(
@@ -2690,6 +2825,8 @@ impl Niri {
             sorted_outputs: Vec::default(),
             output_state: HashMap::new(),
             unmapped_windows: HashMap::new(),
+            pending_recalls: Vec::new(),
+            recall_spawn_failures,
             unmapped_layer_surfaces: HashSet::new(),
             mapped_layer_surfaces: HashMap::new(),
             root_surface: HashMap::new(),
@@ -3778,6 +3915,39 @@ impl Niri {
     pub fn output_next(&self) -> Option<Output> {
         let active = self.layout.active_output()?;
         self.output_next_of(active)
+    }
+
+    pub(crate) fn prune_pending_recalls(&mut self) {
+        if self.pending_recalls.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        self.pending_recalls
+            .retain(|r| now < r.deadline && self.layout.find_workspace_by_id(r.target).is_some());
+    }
+
+    fn pending_recall_index(&self, mapped: &Mapped) -> Option<usize> {
+        let surface = mapped.toplevel().wl_surface();
+        let matches = |request: &PendingRecall| request.selector.matches(mapped, None, None);
+        // A returned token takes precedence over the new-window fallback, even if the
+        // app has not set matching attributes yet.
+        if let Some(index) = self
+            .pending_recalls
+            .iter()
+            .position(|r| r.surface.as_ref() == Some(surface))
+        {
+            return matches(&self.pending_recalls[index]).then_some(index);
+        }
+        self.pending_recalls.iter().position(|r| {
+            r.surface.is_none() && !r.existing_surfaces.contains(surface) && matches(r)
+        })
+    }
+
+    /// Resolve before adding the window, so normal placement cannot steal focus first.
+    pub(crate) fn take_pending_recall_target(&mut self, mapped: &Mapped) -> Option<WorkspaceId> {
+        self.prune_pending_recalls();
+        let index = self.pending_recall_index(mapped)?;
+        Some(self.pending_recalls.remove(index).target)
     }
 
     pub fn find_output_and_workspace_index(

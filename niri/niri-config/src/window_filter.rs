@@ -52,6 +52,28 @@ impl WindowFilter {
     }
 
     pub fn validate_focus(&self) -> Result<(), String> {
+        self.validate_conditions("focus-window-matching")
+    }
+
+    pub fn validate_recall(&self, command: &[String]) -> Result<(), String> {
+        self.validate_conditions("recall-window")?;
+        if let Some(program) = command.first() {
+            if program.is_empty() || command.iter().any(|arg| arg.contains('\0')) {
+                return Err("recall-window requires a nonempty program and no NUL bytes".into());
+            }
+            if self.id.is_some()
+                || self.workspace_id.is_some()
+                || self.current_workspace.is_some()
+                || self.floating.is_some()
+                || self.urgent.is_some()
+            {
+                return Err("recall-window with a command only supports app-id and title".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_conditions(&self, action: &str) -> Result<(), String> {
         if self.id.is_none()
             && self.app_id.is_none()
             && self.title.is_none()
@@ -60,7 +82,7 @@ impl WindowFilter {
             && self.floating.is_none()
             && self.urgent.is_none()
         {
-            return Err("focus-window-matching requires at least one condition".into());
+            return Err(format!("{action} requires at least one condition"));
         }
         self.compile_regexes().map(|_| ())
     }

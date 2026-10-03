@@ -1007,6 +1007,7 @@ impl State {
                 }
             }
             Action::FocusWindowMatching(filter) => self.focus_window_matching(filter),
+            Action::RecallWindow(filter, command) => self.recall_window(filter, command),
             Action::FocusWindowInColumn(index) => {
                 self.niri.layout.focus_window_in_column(index);
                 self.maybe_warp_cursor_to_focus();

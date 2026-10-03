@@ -2166,6 +2166,39 @@ impl<W: LayoutElement> Layout<W> {
         monitor.move_to_workspace_down(activate);
     }
 
+    /// Move a window using a stable workspace ID, including while all outputs are disconnected.
+    pub fn move_to_workspace_by_id(
+        &mut self,
+        window: &W::Id,
+        target: WorkspaceId,
+        activate: ActivateWindow,
+    ) {
+        let Some((index, workspace)) = self.find_workspace_by_id(target) else {
+            return;
+        };
+        if workspace.has_window(window) {
+            return;
+        }
+        if let Some(output) = workspace.current_output().cloned() {
+            self.move_to_output(Some(window), &output, Some(index), activate);
+            return;
+        }
+
+        let Some(removed) = self.remove_window(window, Transaction::new()) else {
+            return;
+        };
+        let workspace = self.workspaces_mut().find(|ws| ws.id() == target).unwrap();
+        workspace.add_tile(
+            removed.tile,
+            WorkspaceAddWindowTarget::Auto,
+            activate,
+            removed.width,
+            removed.is_full_width,
+            removed.is_floating,
+            None,
+        );
+    }
+
     pub fn move_to_workspace(
         &mut self,
         window: Option<&W::Id>,

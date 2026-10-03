@@ -952,10 +952,12 @@ impl XdgShellHandler for State {
 
     fn app_id_changed(&mut self, toplevel: ToplevelSurface) {
         self.update_window_rules(&toplevel);
+        self.complete_pending_recall(toplevel.wl_surface());
     }
 
     fn title_changed(&mut self, toplevel: ToplevelSurface) {
         self.update_window_rules(&toplevel);
+        self.complete_pending_recall(toplevel.wl_surface());
     }
 
     fn parent_changed(&mut self, toplevel: ToplevelSurface) {

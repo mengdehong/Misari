@@ -173,6 +173,10 @@ pub enum Action {
     #[knuffel(skip)]
     FocusWindow(u64),
     FocusWindowMatching(#[knuffel(flatten(property))] WindowFilter),
+    RecallWindow(
+        #[knuffel(flatten(property))] WindowFilter,
+        #[knuffel(arguments)] Vec<String>,
+    ),
     FocusWindowInColumn(#[knuffel(argument)] u8),
     FocusWindowPrevious,
     FocusColumnLeft,
@@ -463,6 +467,9 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::FocusWindow { id } => Self::FocusWindow(id),
             niri_ipc::Action::FocusWindowMatching { filter } => {
                 Self::FocusWindowMatching(filter.into())
+            }
+            niri_ipc::Action::RecallWindow { filter, command } => {
+                Self::RecallWindow(filter.into(), command)
             }
             niri_ipc::Action::FocusWindowInColumn { index } => Self::FocusWindowInColumn(index),
             niri_ipc::Action::FocusWindowPrevious {} => Self::FocusWindowPrevious,
@@ -934,6 +941,11 @@ impl Bind {
                 Ok(action) => {
                     if let Action::FocusWindowMatching(filter) = &action {
                         if let Err(err) = filter.validate_focus() {
+                            ctx.emit_error(DecodeError::unexpected(child, "action", err));
+                        }
+                    }
+                    if let Action::RecallWindow(filter, command) = &action {
+                        if let Err(err) = filter.validate_recall(command) {
                             ctx.emit_error(DecodeError::unexpected(child, "action", err));
                         }
                     }

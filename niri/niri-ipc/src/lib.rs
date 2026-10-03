@@ -333,6 +333,17 @@ pub enum Action {
         #[cfg_attr(feature = "clap", command(flatten))]
         filter: WindowFilter,
     },
+    /// Bring a matching window to the focused workspace, or launch a command and recall it.
+    /// Requires conditions; with a command, only app-id and title are allowed.
+    RecallWindow {
+        /// Conditions combined with AND.
+        #[cfg_attr(feature = "clap", command(flatten))]
+        filter: WindowFilter,
+        /// Program and arguments to launch without a shell when no window matches.
+        #[serde(default)]
+        #[cfg_attr(feature = "clap", arg(last = true))]
+        command: Vec<String>,
+    },
     /// Focus a window in the focused column by index.
     FocusWindowInColumn {
         /// Index of the window in the column.
