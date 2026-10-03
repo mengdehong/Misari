@@ -617,6 +617,7 @@ impl Tty {
         match event {
             SessionEvent::PauseSession => {
                 debug!("pausing session");
+                niri.modifier_press = None;
 
                 self.libinput.suspend();
 

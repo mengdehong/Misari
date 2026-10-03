@@ -88,6 +88,7 @@ pub struct Config {
     pub window_rules: Vec<WindowRule>,
     pub layer_rules: Vec<LayerRule>,
     pub binds: Binds,
+    pub modifier_binds: ModifierBinds,
     pub switch_events: SwitchBinds,
     pub debug: Debug,
     pub workspaces: Vec<Workspace>,
@@ -231,6 +232,13 @@ where
                     // Remove existing binds matching any new bind.
                     binds.retain(|bind| !part.0.iter().any(|new| new.key == bind.key));
                     // Add all new binds.
+                    binds.extend(part.0);
+                }
+                "modifier-binds" => {
+                    let part = ModifierBinds::decode_node(node, ctx)?;
+                    let mut config = config.borrow_mut();
+                    let binds = &mut config.modifier_binds.0;
+                    binds.retain(|bind| !part.0.iter().any(|new| new.key == bind.key));
                     binds.extend(part.0);
                 }
                 "environment" => {
@@ -2256,6 +2264,9 @@ mod tests {
                         hotkey_overlay_title: None,
                     },
                 ],
+            ),
+            modifier_binds: ModifierBinds(
+                [],
             ),
             switch_events: SwitchBinds {
                 lid_open: None,

@@ -343,6 +343,7 @@ pub struct Niri {
     pub seat: Seat<State>,
     /// Scancodes of the keys to suppress.
     pub suppressed_keys: HashSet<Keycode>,
+    pub modifier_press: Option<crate::input::ModifierPress>,
     /// Button codes of the mouse buttons to suppress.
     pub suppressed_buttons: HashSet<u32>,
     pub bind_cooldown_timers: HashMap<Key, RegistrationToken>,
@@ -1488,6 +1489,7 @@ impl State {
             }
 
             self.niri.keyboard_focus.clone_from(&focus);
+            self.niri.modifier_press = None;
             keyboard.set_focus(self, focus.into_surface(), SERIAL_COUNTER.next_serial());
 
             // FIXME: can be more granular.
@@ -1497,6 +1499,7 @@ impl State {
 
     /// Loads the xkb keymap from a file config setting.
     fn set_xkb_file(&mut self, xkb_file: String) -> anyhow::Result<()> {
+        self.niri.modifier_press = None;
         let xkb_file = PathBuf::from(xkb_file);
         let xkb_file = expand_home(&xkb_file)
             .context("failed to expand ~")?
@@ -1531,6 +1534,7 @@ impl State {
     }
 
     pub fn set_xkb_config(&mut self, xkb: XkbConfig) {
+        self.niri.modifier_press = None;
         let keyboard = self.niri.seat.get_keyboard().unwrap();
         let num_lock = keyboard.modifier_state().num_lock;
         if let Err(err) = keyboard.set_xkb_config(self, xkb) {
@@ -1563,6 +1567,7 @@ impl State {
         };
 
         self.niri.config_error_notification.hide();
+        self.niri.modifier_press = None;
 
         // Find & orphan removed named workspaces.
         let mut removed_workspaces: Vec<String> = vec![];
@@ -2703,6 +2708,7 @@ impl Niri {
             popups: PopupManager::default(),
             popup_grab: None,
             suppressed_keys: HashSet::new(),
+            modifier_press: None,
             suppressed_buttons: HashSet::new(),
             bind_cooldown_timers: HashMap::new(),
             bind_repeat_timer: Option::default(),
@@ -6438,6 +6444,7 @@ impl Niri {
     }
 
     pub fn lock(&mut self, confirmation: SessionLocker) {
+        self.modifier_press = None;
         // Check if another client is in the process of locking.
         if matches!(
             self.lock_state,
@@ -6554,6 +6561,7 @@ impl Niri {
     }
 
     pub fn unlock(&mut self) {
+        self.modifier_press = None;
         info!("unlocking session");
 
         let prev = mem::take(&mut self.lock_state);

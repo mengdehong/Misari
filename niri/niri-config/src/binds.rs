@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use bitflags::bitflags;
 use knuffel::errors::DecodeError;
+use knuffel::Decode as _;
 use miette::miette;
 use niri_ipc::{
     ColumnDisplay, LayoutSwitchTarget, PositionChange, SizeChange, WorkspaceReferenceArg,
@@ -28,6 +29,17 @@ pub struct Bind {
     pub allow_when_locked: bool,
     pub allow_inhibiting: bool,
     pub hotkey_overlay_title: Option<Option<String>>,
+}
+
+#[derive(Debug, Default, PartialEq)]
+pub struct ModifierBinds(pub Vec<ModifierBind>);
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModifierBind {
+    pub key: Key,
+    pub long_press: Duration,
+    pub short: Option<Bind>,
+    pub long: Option<Bind>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
@@ -824,6 +836,20 @@ where
         node: &knuffel::ast::SpannedNode<S>,
         ctx: &mut knuffel::decode::Context<S>,
     ) -> Result<Self, DecodeError<S>> {
+        let key = node
+            .node_name
+            .parse::<Key>()
+            .map_err(|e| DecodeError::conversion(&node.node_name, e.wrap_err("invalid keybind")))?;
+        Self::decode_with_key(node, ctx, key)
+    }
+}
+
+impl Bind {
+    fn decode_with_key<S: knuffel::traits::ErrorSpan>(
+        node: &knuffel::ast::SpannedNode<S>,
+        ctx: &mut knuffel::decode::Context<S>,
+        key: Key,
+    ) -> Result<Self, DecodeError<S>> {
         if let Some(type_name) = &node.type_name {
             ctx.emit_error(DecodeError::unexpected(
                 type_name,
@@ -839,11 +865,6 @@ where
                 "no arguments expected for this node",
             ));
         }
-
-        let key = node
-            .node_name
-            .parse::<Key>()
-            .map_err(|e| DecodeError::conversion(&node.node_name, e.wrap_err("invalid keybind")))?;
 
         let mut repeat = true;
         let mut cooldown = None;
@@ -944,6 +965,109 @@ where
             ));
             Ok(dummy)
         }
+    }
+}
+
+impl<S: knuffel::traits::ErrorSpan> knuffel::Decode<S> for ModifierBinds {
+    fn decode_node(
+        node: &knuffel::ast::SpannedNode<S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        expect_only_children(node, ctx);
+        let mut binds: Vec<ModifierBind> = Vec::new();
+        for child in node.children() {
+            let key = child
+                .node_name
+                .parse::<Key>()
+                .map_err(|err| DecodeError::conversion(&child.node_name, err))?;
+            if !key.modifiers.is_empty()
+                || !matches!(key.trigger, Trigger::Keysym(keysym) if keysym.is_modifier_key())
+            {
+                return Err(DecodeError::unexpected(
+                    child,
+                    "key",
+                    "expected a single modifier keysym, e.g. Super_L or ISO_Level5_Shift",
+                ));
+            }
+            if binds.iter().any(|bind| bind.key == key) {
+                return Err(DecodeError::unexpected(
+                    child,
+                    "key",
+                    "duplicate modifier bind",
+                ));
+            }
+            if child.type_name.is_some() || !child.arguments.is_empty() {
+                return Err(DecodeError::unexpected(
+                    child,
+                    "node",
+                    "modifier binds take no type or arguments",
+                ));
+            }
+            let mut threshold = 400;
+            for (name, val) in &child.properties {
+                if &***name != "long-press-ms" {
+                    return Err(DecodeError::unexpected(
+                        name,
+                        "property",
+                        "expected long-press-ms",
+                    ));
+                }
+                threshold = knuffel::traits::DecodeScalar::decode(val, ctx)?;
+                if threshold == 0 {
+                    return Err(DecodeError::unexpected(
+                        &val.literal,
+                        "threshold",
+                        "long-press-ms must be positive",
+                    ));
+                }
+            }
+            let mut bind = ModifierBind {
+                key,
+                long_press: Duration::from_millis(threshold),
+                short: None,
+                long: None,
+            };
+            for branch in child.children() {
+                let slot = match &**branch.node_name {
+                    "short" => &mut bind.short,
+                    "long" => &mut bind.long,
+                    _ => {
+                        return Err(DecodeError::unexpected(
+                            branch,
+                            "branch",
+                            "expected short or long",
+                        ))
+                    }
+                };
+                if slot.is_some() {
+                    return Err(DecodeError::unexpected(
+                        branch,
+                        "branch",
+                        "duplicate short or long branch",
+                    ));
+                }
+                for name in branch.properties.keys() {
+                    if !matches!(&***name, "allow-when-locked" | "allow-inhibiting") {
+                        return Err(DecodeError::unexpected(
+                            name,
+                            "property",
+                            "expected allow-when-locked or allow-inhibiting",
+                        ));
+                    }
+                }
+                let mut action = Bind::decode_with_key(branch, ctx, key)?;
+                action.repeat = false;
+                *slot = Some(action);
+            }
+            if bind.short.is_none() && bind.long.is_none() {
+                return Err(DecodeError::missing(
+                    child,
+                    "expected a short or long branch",
+                ));
+            }
+            binds.push(bind);
+        }
+        Ok(Self(binds))
     }
 }
 
@@ -1112,5 +1236,48 @@ mod tests {
                 modifiers: Modifiers::ISO_LEVEL5_SHIFT
             },
         );
+    }
+
+    #[test]
+    fn modifier_bind_config() {
+        let config = crate::Config::parse_mem(
+            r#"
+            modifier-binds {
+                Super_L long-press-ms=300 {
+                    short { toggle-overview; }
+                    long allow-inhibiting=false { show-hotkey-overlay; }
+                }
+                Hyper_L { short allow-when-locked=true { spawn "example"; }; }
+            }
+        "#,
+        )
+        .unwrap();
+        let binds = config.modifier_binds.0;
+        assert_eq!(binds[0].long_press, Duration::from_millis(300));
+        assert_eq!(
+            binds[0].short.as_ref().unwrap().action,
+            Action::ToggleOverview
+        );
+        assert!(!binds[0].long.as_ref().unwrap().allow_inhibiting);
+        assert_eq!(binds[1].long_press, Duration::from_millis(400));
+        assert!(binds[1].long.is_none());
+        assert!(binds[1].short.as_ref().unwrap().allow_when_locked);
+        for body in [
+            "A { short { toggle-overview; }; }",
+            "Super+A { short { toggle-overview; }; }",
+            "Super_L long-press-ms=0 { short { toggle-overview; }; }",
+            "Super_L { short {}; }",
+            "Super_L { short { toggle-overview; show-hotkey-overlay; }; }",
+            "Super_L { short { toggle-overview; }; short { toggle-overview; }; }",
+            "Super_L { short { toggle-overview; }; }; Super_L { long { toggle-overview; }; }",
+            "Super_L { double { toggle-overview; }; }",
+            "Super_L { short allow-when-locked=true { toggle-overview; }; }",
+            "Super_L { short repeat=true { toggle-overview; }; }",
+        ] {
+            assert!(
+                crate::Config::parse_mem(&format!("modifier-binds {{ {body} }}")).is_err(),
+                "{body}"
+            );
+        }
     }
 }

@@ -147,7 +147,8 @@ impl Winit {
                     state.niri.output_resized(&output);
                 }
                 WinitEvent::Input(event) => state.process_input_event(event),
-                WinitEvent::Focus(_) => (),
+                WinitEvent::Focus(false) => state.niri.modifier_press = None,
+                WinitEvent::Focus(true) => (),
                 WinitEvent::Redraw => state.niri.queue_redraw(&state.backend.winit().output),
                 WinitEvent::CloseRequested => state.niri.stop_signal.stop(),
             })

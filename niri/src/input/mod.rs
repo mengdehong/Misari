@@ -6,7 +6,8 @@ use std::time::Duration;
 use calloop::timer::{TimeoutAction, Timer};
 use input::event::gesture::GestureEventCoordinates as _;
 use niri_config::{
-    Action, Bind, Binds, Config, Key, ModKey, Modifiers, MruDirection, SwitchBinds, Trigger,
+    Action, Bind, Binds, Config, Key, ModKey, ModifierBind, Modifiers, MruDirection, SwitchBinds,
+    Trigger,
 };
 use niri_ipc::LayoutSwitchTarget;
 use smithay::backend::input::{
@@ -70,6 +71,13 @@ pub mod touch_overview_grab;
 use backend_ext::{NiriInputBackend as InputBackend, NiriInputDevice as _};
 
 pub const DOUBLE_CLICK_TIME: Duration = Duration::from_millis(400);
+
+pub struct ModifierPress {
+    device: String,
+    key: Keycode,
+    started: Duration,
+    bind: ModifierBind,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TabletData {
@@ -169,6 +177,25 @@ impl State {
 
         let mut consumed_by_a11y = false;
         use InputEvent::*;
+        match &event {
+            PointerButton { .. }
+            | PointerAxis { .. }
+            | GestureSwipeBegin { .. }
+            | GestureSwipeUpdate { .. }
+            | GestureSwipeEnd { .. }
+            | GesturePinchBegin { .. }
+            | GesturePinchUpdate { .. }
+            | GesturePinchEnd { .. }
+            | GestureHoldBegin { .. }
+            | GestureHoldEnd { .. }
+            | TouchDown { .. }
+            | TouchMotion { .. }
+            | TouchUp { .. }
+            | TouchCancel { .. }
+            | TabletToolTip { .. }
+            | TabletToolButton { .. } => self.niri.modifier_press = None,
+            _ => (),
+        }
         match event {
             DeviceAdded { device } => self.on_device_added(device),
             DeviceRemoved { device } => self.on_device_removed(device),
@@ -273,6 +300,7 @@ impl State {
     }
 
     fn on_device_removed(&mut self, device: impl Device) {
+        self.niri.modifier_press = None;
         if device.has_capability(DeviceCapability::TabletTool) {
             let tablet_seat = self.niri.seat.tablet_seat();
 
@@ -419,6 +447,40 @@ impl State {
         let serial = SERIAL_COUNTER.next_serial();
         let time = Event::time(&event);
         let pressed = event.state() == KeyState::Pressed;
+        let keyboard = self.niri.seat.get_keyboard().unwrap();
+        let device = event.device().id();
+        let key_code = event.key_code();
+        let press_time = Duration::from_micros(time.micros());
+        let can_use_modifier_bind = !keyboard.is_grabbed()
+            && !self.niri.exit_confirm_dialog.is_open()
+            && !self.niri.screenshot_ui.is_open()
+            && !self.niri.window_mru_ui.is_open()
+            && self.niri.touch.is_empty()
+            && self.niri.suppressed_buttons.is_empty()
+            && !self.niri.seat.get_pointer().unwrap().is_grabbed();
+        if !can_use_modifier_bind
+            || self
+                .niri
+                .modifier_press
+                .as_ref()
+                .is_some_and(|p| p.device != device || p.key != key_code)
+        {
+            self.niri.modifier_press = None;
+        }
+        let can_start_modifier_press =
+            pressed && can_use_modifier_bind && keyboard.pressed_keys().is_empty();
+        let mut release_bind = if pressed {
+            None
+        } else {
+            self.niri.modifier_press.take().and_then(|p| {
+                let elapsed = press_time.checked_sub(p.started)?;
+                if elapsed < p.bind.long_press {
+                    p.bind.short
+                } else {
+                    p.bind.long
+                }
+            })
+        };
 
         // Stop bind key repeat on any release. This won't work 100% correctly in cases like:
         // 1. Press Mod
@@ -457,6 +519,7 @@ impl State {
             // The accessibility modifier first press must not change XKB state, so we return
             // early here.
             if block == KbMonBlock::ModifierFirstPress {
+                self.niri.modifier_press = None;
                 return;
             }
             block
@@ -464,7 +527,8 @@ impl State {
         #[cfg(not(feature = "dbus"))]
         let _ = consumed_by_a11y;
 
-        let Some(Some(bind)) = self.niri.seat.get_keyboard().unwrap().input(
+        let mut release_forwarded = false;
+        let bind = keyboard.input(
             self,
             event.key_code(),
             event.state(),
@@ -480,6 +544,8 @@ impl State {
                 // don't handle them.
                 #[cfg(feature = "dbus")]
                 if block != KbMonBlock::Pass {
+                    this.niri.modifier_press = None;
+                    release_bind = None;
                     // HACK: there's a slight problem with this code. Here we filter out keys
                     // consumed by accessibility from getting sent to the Wayland client. However,
                     // the Wayland client can still receive these keys from the wl_keyboard
@@ -587,11 +653,55 @@ impl State {
                     // Interaction with the active window, immediately update the active window's
                     // focus timestamp without waiting for a possible pending MRU lock-in delay.
                     this.niri.mru_apply_keyboard_commit();
+
+                    if can_start_modifier_press {
+                        let config = this.niri.config.borrow();
+                        if let Some(bind) = config.modifier_binds.0.iter().find(|bind| {
+                            raw.is_some_and(|raw| bind.key.trigger == Trigger::Keysym(raw))
+                        }) {
+                            let mut bind = bind.clone();
+                            for branch in [&mut bind.short, &mut bind.long] {
+                                if branch.as_ref().is_some_and(|action| {
+                                    !modifier_bind_allowed(
+                                        action,
+                                        this.niri.is_locked(),
+                                        is_inhibiting_shortcuts,
+                                    )
+                                }) {
+                                    *branch = None;
+                                }
+                            }
+                            this.niri.modifier_press = Some(ModifierPress {
+                                device: device.clone(),
+                                key: key_code,
+                                started: press_time,
+                                bind,
+                            });
+                        }
+                    }
+                } else {
+                    this.niri.modifier_press = None;
+                    release_bind = None;
                 }
 
+                release_forwarded = !pressed && matches!(res, FilterResult::Forward);
                 res
             },
-        ) else {
+        );
+
+        // keyboard.input() has now forwarded the release and updated the client's modifiers.
+        // Executing here avoids transferring focus while the modifier is still held.
+        if let Some(action) = release_bind.filter(|_| release_forwarded) {
+            if modifier_bind_allowed(
+                &action,
+                self.niri.is_locked(),
+                self.is_inhibiting_shortcuts(),
+            ) {
+                self.handle_bind(action);
+            }
+        }
+
+        let Some(Some(bind)) = bind else {
             return;
         };
 
@@ -4722,6 +4832,11 @@ fn find_configured_switch_action(
     switch_action
         .as_ref()
         .map(|switch_action| Action::Spawn(switch_action.spawn.clone()))
+}
+
+fn modifier_bind_allowed(action: &Bind, locked: bool, inhibiting: bool) -> bool {
+    (!locked || action.allow_when_locked || allowed_when_locked(&action.action))
+        && (!inhibiting || !action.allow_inhibiting)
 }
 
 fn modifiers_from_state(mods: ModifiersState) -> Modifiers {

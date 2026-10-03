@@ -2,13 +2,15 @@ use std::fmt::Write as _;
 
 use insta::assert_snapshot;
 use niri_config::{Action, Config};
-use smithay::backend::input::{InputEvent, InputTime, KeyState, Keycode};
+use smithay::backend::input::{ButtonState, InputEvent, InputTime, KeyState, Keycode};
 use smithay::input::keyboard::xkb::Keymap;
 use wayland_client::protocol::wl_surface::WlSurface;
 
 use crate::tests::client::ClientId;
 use crate::tests::fixture::Fixture;
-use crate::tests::test_input_backend::{TestInputBackend, TestKeyboardKeyEvent};
+use crate::tests::test_input_backend::{
+    TestInputBackend, TestKeyboardKeyEvent, TestPointerButtonEvent,
+};
 
 enum Op {
     Press(Keycode),
@@ -42,6 +44,12 @@ fn set_up(config: &str) -> (Fixture, ClientId, WlSurface) {
         bind.action = Action::TestAction;
     }
 
+    for bind in &mut config.modifier_binds.0 {
+        for branch in [&mut bind.short, &mut bind.long].into_iter().flatten() {
+            branch.action = Action::TestAction;
+        }
+    }
+
     let mut f = Fixture::with_config(config);
     f.add_output(1, (1920, 1080));
 
@@ -62,6 +70,16 @@ fn set_up(config: &str) -> (Fixture, ClientId, WlSurface) {
 }
 
 fn run_f(f: &mut Fixture, id: ClientId, surface: &WlSurface, input: &str) -> String {
+    run_f_timed(f, id, surface, input, 0)
+}
+
+fn run_f_timed(
+    f: &mut Fixture,
+    id: ClientId,
+    surface: &WlSurface,
+    input: &str,
+    step_ms: u64,
+) -> String {
     let state = f.niri_state();
     let keyboard = state.niri.seat.get_keyboard().unwrap();
     let ops = keyboard.with_xkb_state(state, |xkb| {
@@ -72,7 +90,7 @@ fn run_f(f: &mut Fixture, id: ClientId, surface: &WlSurface, input: &str) -> Str
 
     let mut rv = String::new();
 
-    for op in ops {
+    for (index, op) in ops.into_iter().enumerate() {
         let (code, key_state) = match op {
             Op::Press(code) => (code, KeyState::Pressed),
             Op::Release(code) => (code, KeyState::Released),
@@ -100,7 +118,7 @@ fn run_f(f: &mut Fixture, id: ClientId, surface: &WlSurface, input: &str) -> Str
 
         state.process_input_event(InputEvent::<TestInputBackend>::Keyboard {
             event: TestKeyboardKeyEvent {
-                time: InputTime::from_micros(0),
+                time: InputTime::from_micros(index as u64 * step_ms * 1000),
                 code,
                 state: key_state,
                 count: 1, // niri doesn't use this
@@ -501,4 +519,96 @@ fn layouts() {
         surface key released: 42
     "
     );
+}
+
+const MODIFIER_BINDS: &str = r#"
+    modifier-binds {
+        Super_L {
+            short { toggle-overview; }
+            long { show-hotkey-overlay; }
+        }
+        Super_R { short { toggle-overview; }; }
+    }
+"#;
+
+#[test]
+fn modifier_bind_release() {
+    for (branch, ms, expected) in [
+        ("short", 399, 1),
+        ("short", 400, 0),
+        ("long", 399, 0),
+        ("long", 400, 1),
+    ] {
+        let config =
+            format!("modifier-binds {{ Super_L {{ {branch} {{ toggle-overview; }}; }}; }}");
+        let (mut f, id, surface) = set_up(&config);
+        let output = run_f_timed(&mut f, id, &surface, "+LWIN -LWIN", ms);
+        assert_eq!(
+            f.niri().test_action_count,
+            expected,
+            "{branch}, {ms}: {output}"
+        );
+        assert!(!output
+            .split("-LWIN")
+            .next()
+            .unwrap()
+            .contains("niri test-action"));
+        assert!(output.contains("surface key pressed: 125"));
+        assert!(output.contains("surface key released: 125"));
+        assert!(output.contains("surface modifiers: depressed=0, latched=0, locked=0, group=0"));
+    }
+}
+
+#[test]
+fn modifier_bind_chords() {
+    for input in [
+        "+LWIN +LatA -LatA -LWIN",
+        "+LWIN +LatA -LWIN -LatA",
+        "+LatA +LWIN -LWIN -LatA",
+        "+LWIN +RWIN -LWIN -RWIN",
+        "+LWIN +LCTL -LCTL -LWIN",
+    ] {
+        let (mut f, id, surface) = set_up(MODIFIER_BINDS);
+        let output = run_f_timed(&mut f, id, &surface, input, 500);
+        assert_eq!(f.niri().test_action_count, 0, "{input}: {output}");
+        run_f(&mut f, id, &surface, "+LWIN -LWIN");
+        assert_eq!(f.niri().test_action_count, 1);
+    }
+}
+
+#[test]
+fn modifier_bind_mod3() {
+    let (mut f, id, surface) = set_up(
+        r#"
+        input { keyboard { xkb { options "lv5:caps_switch"; }; }; }
+        modifier-binds { ISO_Level5_Shift { short { toggle-overview; }; }; }
+        binds { Mod3+A { close-window; }; }
+    "#,
+    );
+    run_f(&mut f, id, &surface, "+CAPS -CAPS");
+    assert_eq!(f.niri().test_action_count, 1);
+    run_f(&mut f, id, &surface, "+CAPS +LatA -LatA -CAPS");
+    assert_eq!(f.niri().test_action_count, 2);
+}
+
+#[test]
+fn modifier_bind_inhibition() {
+    let (mut f, id, surface) = set_up(MODIFIER_BINDS);
+    let inhibitor = f.client(id).state.inhibit_shortcuts(&surface);
+    f.roundtrip(id);
+    run_f(&mut f, id, &surface, "+LWIN -LWIN");
+    assert_eq!(f.niri().test_action_count, 0);
+    run_f(&mut f, id, &surface, "+LWIN");
+    inhibitor.destroy();
+    f.roundtrip(id);
+    run_f(&mut f, id, &surface, "-LWIN");
+    assert_eq!(f.niri().test_action_count, 0);
+    run_f(&mut f, id, &surface, "+LWIN -LWIN");
+    assert_eq!(f.niri().test_action_count, 1);
+
+    run_f(&mut f, id, &surface, "+LWIN");
+    let _inhibitor = f.client(id).state.inhibit_shortcuts(&surface);
+    f.roundtrip(id);
+    run_f(&mut f, id, &surface, "-LWIN");
+    assert_eq!(f.niri().test_action_count, 1);
 }
