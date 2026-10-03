@@ -1,0 +1,18 @@
+/3rd/
+/docs/Notes.md
+
+# Build outputs and local tooling
+target/
+/result
+.direnv/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Local environment; keep shareable examples
+.env
+.env.*
+!.env.example
