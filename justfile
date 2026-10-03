@@ -26,3 +26,13 @@ test:
 build:
     cargo build --locked --release --manifest-path niri/Cargo.toml
     cargo build --locked --release --manifest-path nirius/Cargo.toml
+
+dev-check:
+    cargo build --locked --manifest-path niri/Cargo.toml --bin niri
+    ./niri/target/debug/niri validate --config configs/dev.kdl
+
+dev: dev-check
+    ./niri/target/debug/niri --config configs/dev.kdl
+
+dev-tty: dev-check
+    env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u DISPLAY ./niri/target/debug/niri --config configs/dev.kdl

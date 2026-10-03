@@ -1,0 +1,47 @@
+include "~/.config/niri/binds.kdl"
+
+input {
+    mod-key "Super"
+    mod-key-nested "Super"
+    keyboard {
+        xkb {
+            layout "us"
+            options "lv5:caps_switch"
+        }
+    }
+}
+
+spawn-at-startup "kitty" "--override" "linux_display_server=wayland" "--title" "niri-dev"
+
+binds {
+    Mod+K hotkey-overlay-title="Niri 快捷键" repeat=false { show-hotkey-overlay; }
+    Mod+T hotkey-overlay-title="终端 Terminal" {
+        spawn "kitty" "--override" "linux_display_server=wayland" "--title" "niri-dev";
+    }
+    Mod+C hotkey-overlay-title="关闭开发实例窗口" repeat=false { close-window; }
+    F10 hotkey-overlay-title="Exit development niri" { quit skip-confirmation=true; }
+}
+
+recent-windows {
+    binds {
+        Alt+Tab { next-window scope="workspace"; }
+        Alt+grave { next-window filter="app-id"; }
+    }
+}
+
+modifier-binds {
+    Super_L long-press-ms=400 {
+        short { toggle-overview; }
+        long { show-hotkey-overlay; }
+    }
+    // Caps is mapped to ISO_Level5_Shift (the current Mod3 alias).
+    ISO_Level5_Shift long-press-ms=400 {
+        short { toggle-overview; }
+        long { show-hotkey-overlay; }
+    }
+    // Fallback when the host desktop consumes Super in nested mode.
+    Shift_R long-press-ms=400 {
+        short { toggle-overview; }
+        long { show-hotkey-overlay; }
+    }
+}
