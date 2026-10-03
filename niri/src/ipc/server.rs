@@ -33,6 +33,7 @@ use smithay::wayland::shell::wlr_layer::{KeyboardInteractivity, Layer};
 use crate::backend::IpcOutputMap;
 use crate::handlers::image_copy_capture;
 use crate::input::pick_window_grab::PickWindowGrab;
+use crate::layout::tile::Tile;
 use crate::layout::workspace::WorkspaceId;
 use crate::niri::{ScreenshotOptions, State};
 use crate::utils::{version, with_toplevel_role};
@@ -296,9 +297,9 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
                 let layout = &state.niri.layout;
                 let current_workspace = layout.active_workspace().map(|ws| ws.id());
                 let mut windows = Vec::new();
-                layout.with_windows(|window, _, workspace, geometry| {
-                    if selector.matches(window, workspace, current_workspace) {
-                        windows.push(make_ipc_window(window, workspace, geometry));
+                layout.with_tiles(|tile, _, workspace, geometry| {
+                    if selector.matches(tile.window(), workspace, current_workspace) {
+                        windows.push(make_ipc_window(tile, workspace, geometry));
                     }
                 });
                 let _ = tx.send_blocking(windows);
@@ -570,10 +571,11 @@ async fn handle_event_stream_client(client: EventStreamClient) -> anyhow::Result
 }
 
 fn make_ipc_window(
-    mapped: &Mapped,
+    tile: &Tile<Mapped>,
     workspace_id: Option<WorkspaceId>,
     layout: WindowLayout,
 ) -> niri_ipc::Window {
+    let mapped = tile.window();
     with_toplevel_role(mapped.toplevel(), |role| niri_ipc::Window {
         id: mapped.id().get(),
         title: role.title.clone(),
@@ -582,6 +584,7 @@ fn make_ipc_window(
         workspace_id: workspace_id.map(|id| id.get()),
         is_focused: mapped.is_focused(),
         is_floating: mapped.is_floating(),
+        follow_mode: tile.follow_mode(),
         is_urgent: mapped.is_urgent(),
         layout,
         focus_timestamp: mapped.get_focus_timestamp().map(Timestamp::from),
@@ -760,7 +763,8 @@ impl State {
         // Check for window changes.
         let mut seen = HashSet::new();
         let mut focused_id = None;
-        layout.with_windows(|mapped, _, ws_id, window_layout| {
+        layout.with_tiles(|tile, _, ws_id, window_layout| {
+            let mapped = tile.window();
             let id = mapped.id().get();
             seen.insert(id);
 
@@ -769,21 +773,22 @@ impl State {
             }
 
             let Some(ipc_win) = state.windows.get(&id) else {
-                let window = make_ipc_window(mapped, ws_id, window_layout);
+                let window = make_ipc_window(tile, ws_id, window_layout);
                 events.push(Event::WindowOpenedOrChanged { window });
                 return;
             };
 
             let workspace_id = ws_id.map(|id| id.get());
-            let mut changed =
-                ipc_win.workspace_id != workspace_id || ipc_win.is_floating != mapped.is_floating();
+            let mut changed = ipc_win.workspace_id != workspace_id
+                || ipc_win.is_floating != mapped.is_floating()
+                || ipc_win.follow_mode != tile.follow_mode();
 
             changed |= with_toplevel_role(mapped.toplevel(), |role| {
                 ipc_win.title != role.title || ipc_win.app_id != role.app_id
             });
 
             if changed {
-                let window = make_ipc_window(mapped, ws_id, window_layout);
+                let window = make_ipc_window(tile, ws_id, window_layout);
                 events.push(Event::WindowOpenedOrChanged { window });
                 return;
             }

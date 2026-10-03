@@ -890,6 +890,9 @@ impl State {
 
         // These should be called periodically, before flushing the clients.
         self.niri.popups.cleanup();
+        if self.niri.layout.refresh_follow_windows() {
+            self.niri.queue_redraw_all();
+        }
         self.refresh_popup_grab();
         self.update_keyboard_focus();
 

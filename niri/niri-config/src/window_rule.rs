@@ -1,4 +1,4 @@
-use niri_ipc::ColumnDisplay;
+use niri_ipc::{ColumnDisplay, WindowFollowMode};
 
 use crate::appearance::{
     BackgroundEffect, BackgroundEffectRule, BlockOutFrom, BorderRule, CornerRadius, ShadowRule,
@@ -32,6 +32,8 @@ pub struct WindowRule {
     pub open_fullscreen: Option<bool>,
     #[knuffel(child, unwrap(argument))]
     pub open_floating: Option<bool>,
+    #[knuffel(child, unwrap(argument, str))]
+    pub open_follow_mode: Option<WindowFollowMode>,
     #[knuffel(child, unwrap(argument))]
     pub open_focused: Option<bool>,
     #[knuffel(child, unwrap(argument))]

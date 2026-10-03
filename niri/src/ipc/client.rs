@@ -829,6 +829,7 @@ fn print_window(window: &Window) {
         "  Is floating: {}",
         if window.is_floating { "yes" } else { "no" }
     );
+    println!("  Follow mode: {}", window.follow_mode);
 
     if let Some(pid) = window.pid {
         println!("  PID: {pid}");

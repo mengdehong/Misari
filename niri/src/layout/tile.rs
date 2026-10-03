@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use niri_config::utils::MergeWith as _;
 use niri_config::{Color, CornerRadius, GradientInterpolation};
-use niri_ipc::WindowLayout;
+use niri_ipc::{WindowFollowMode, WindowLayout};
 use smithay::backend::renderer::element::{Element, Kind};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
@@ -40,6 +40,9 @@ use crate::utils::{
 pub struct Tile<W: LayoutElement> {
     /// The toplevel window itself.
     window: W,
+
+    /// When this tile follows the focused workspace. Kept across layout moves.
+    pub(super) follow_mode: WindowFollowMode,
 
     /// The border around the window.
     border: FocusRing,
@@ -191,9 +194,11 @@ impl<W: LayoutElement> Tile<W> {
         let focus_ring_config = options.layout.focus_ring.merged_with(&rules.focus_ring);
         let shadow_config = options.layout.shadow.merged_with(&rules.shadow);
         let sizing_mode = window.sizing_mode();
+        let follow_mode = rules.open_follow_mode.unwrap_or_default();
 
         Self {
             window,
+            follow_mode,
             border: FocusRing::new(border_config.into()),
             focus_ring: FocusRing::new(focus_ring_config),
             shadow: Shadow::new(shadow_config),
@@ -708,6 +713,10 @@ impl<W: LayoutElement> Tile<W> {
 
     pub fn window_mut(&mut self) -> &mut W {
         &mut self.window
+    }
+
+    pub fn follow_mode(&self) -> WindowFollowMode {
+        self.follow_mode
     }
 
     pub fn sizing_mode(&self) -> SizingMode {

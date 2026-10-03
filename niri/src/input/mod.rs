@@ -995,6 +995,22 @@ impl State {
             }
             Action::FocusWindowMatching(filter) => self.focus_window_matching(filter),
             Action::RecallWindow(filter, command) => self.recall_window(filter, command),
+            Action::SetWindowFollow(mode) => self.niri.layout.set_window_follow(None, mode),
+            Action::SetWindowFollowById(id, mode) => {
+                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = window.map(|(_, m)| m.window.clone());
+                if let Some(window) = window {
+                    self.niri.layout.set_window_follow(Some(&window), mode);
+                }
+            }
+            Action::ToggleWindowFollow => self.niri.layout.toggle_window_follow(None),
+            Action::ToggleWindowFollowById(id) => {
+                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = window.map(|(_, m)| m.window.clone());
+                if let Some(window) = window {
+                    self.niri.layout.toggle_window_follow(Some(&window));
+                }
+            }
             Action::FocusWindowInColumn(index) => {
                 self.niri.layout.focus_window_in_column(index);
                 self.maybe_warp_cursor_to_focus();

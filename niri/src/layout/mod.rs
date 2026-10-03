@@ -78,6 +78,7 @@ use crate::window::ResolvedWindowRules;
 pub mod closing_window;
 pub mod floating;
 pub mod focus_ring;
+mod follow;
 pub mod insert_hint_element;
 pub mod monitor;
 pub mod opening_window;
@@ -356,6 +357,8 @@ pub struct Layout<W: LayoutElement> {
     /// The workspace id does not necessarily point to a valid workspace. If it doesn't, then it is
     /// simply ignored.
     last_active_workspace_id: HashMap<String, WorkspaceId>,
+    /// Last workspace activation state processed by window following.
+    follow_context: follow::FollowContext,
     /// Ongoing interactive move.
     interactive_move: Option<InteractiveMoveState<W>>,
     /// Ongoing drag-and-drop operation.
@@ -722,6 +725,7 @@ impl<W: LayoutElement> Layout<W> {
             monitor_set: MonitorSet::NoOutputs { workspaces: vec![] },
             is_active: true,
             last_active_workspace_id: HashMap::new(),
+            follow_context: Default::default(),
             interactive_move: None,
             dnd: None,
             clock,
@@ -747,6 +751,7 @@ impl<W: LayoutElement> Layout<W> {
             monitor_set: MonitorSet::NoOutputs { workspaces },
             is_active: true,
             last_active_workspace_id: HashMap::new(),
+            follow_context: Default::default(),
             interactive_move: None,
             dnd: None,
             clock,
@@ -1708,10 +1713,19 @@ impl<W: LayoutElement> Layout<W> {
         &self,
         mut f: impl FnMut(&W, Option<&Output>, Option<WorkspaceId>, WindowLayout),
     ) {
+        self.with_tiles(|tile, output, workspace, layout| {
+            f(tile.window(), output, workspace, layout);
+        });
+    }
+
+    pub(crate) fn with_tiles(
+        &self,
+        mut f: impl FnMut(&Tile<W>, Option<&Output>, Option<WorkspaceId>, WindowLayout),
+    ) {
         if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
             // We don't fill any positions for interactively moved windows.
             let layout = move_.tile.ipc_layout_template();
-            f(move_.tile.window(), Some(&move_.output), None, layout);
+            f(&move_.tile, Some(&move_.output), None, layout);
         }
 
         match &self.monitor_set {
@@ -1719,7 +1733,7 @@ impl<W: LayoutElement> Layout<W> {
                 for mon in monitors {
                     for ws in &mon.workspaces {
                         for (tile, layout) in ws.tiles_with_ipc_layouts() {
-                            f(tile.window(), Some(&mon.output), Some(ws.id()), layout);
+                            f(tile, Some(&mon.output), Some(ws.id()), layout);
                         }
                     }
                 }
@@ -1727,7 +1741,7 @@ impl<W: LayoutElement> Layout<W> {
             MonitorSet::NoOutputs { workspaces } => {
                 for ws in workspaces {
                     for (tile, layout) in ws.tiles_with_ipc_layouts() {
-                        f(tile.window(), None, Some(ws.id()), layout);
+                        f(tile, None, Some(ws.id()), layout);
                     }
                 }
             }

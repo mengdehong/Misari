@@ -358,6 +358,21 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg(last = true))]
         command: Vec<String>,
     },
+    /// Set when a window follows the focused workspace, without changing its floating state.
+    SetWindowFollow {
+        /// Id of the window. If omitted, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+        /// Follow mode: off, always, or if-invisible.
+        #[cfg_attr(feature = "clap", arg())]
+        mode: WindowFollowMode,
+    },
+    /// Disable window following, or enable always-follow when it is off.
+    ToggleWindowFollow {
+        /// Id of the window. If omitted, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+    },
     /// Focus a window in the focused column by index.
     FocusWindowInColumn {
         /// Index of the window in the column.
@@ -1041,6 +1056,20 @@ pub enum ColumnDisplay {
     Tabbed,
 }
 
+/// When a window moves to the focused workspace.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum WindowFollowMode {
+    /// Do not move automatically.
+    #[default]
+    Off,
+    /// Move whenever another workspace becomes focused.
+    Always,
+    /// Move only when the window's workspace is no longer active on its output.
+    /// This does not account for occlusion or the scrolling view position.
+    IfInvisible,
+}
+
 /// Output actions that niri can perform.
 // Variants in this enum should match the spelling of the ones in niri-config. Most thigs from
 // niri-config should be present here.
@@ -1420,6 +1449,9 @@ pub struct Window {
     ///
     /// If the window isn't floating then it is in the tiling layout.
     pub is_floating: bool,
+    /// When this window follows the focused workspace.
+    #[serde(default)]
+    pub follow_mode: WindowFollowMode,
     /// Whether this window requests your attention.
     pub is_urgent: bool,
     /// Position- and size-related properties of the window.
@@ -1949,6 +1981,29 @@ impl FromStr for ColumnDisplay {
             "tabbed" => Ok(Self::Tabbed),
             _ => Err(r#"invalid column display, can be "normal" or "tabbed""#),
         }
+    }
+}
+
+impl FromStr for WindowFollowMode {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "off" => Ok(Self::Off),
+            "always" => Ok(Self::Always),
+            "if-invisible" => Ok(Self::IfInvisible),
+            _ => Err(r#"invalid follow mode, can be "off", "always" or "if-invisible""#),
+        }
+    }
+}
+
+impl std::fmt::Display for WindowFollowMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Off => "off",
+            Self::Always => "always",
+            Self::IfInvisible => "if-invisible",
+        })
     }
 }
 

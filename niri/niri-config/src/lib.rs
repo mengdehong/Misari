@@ -1832,6 +1832,7 @@ mod tests {
                     open_floating: Some(
                         false,
                     ),
+                    open_follow_mode: None,
                     open_focused: Some(
                         true,
                     ),

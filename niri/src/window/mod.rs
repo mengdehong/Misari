@@ -6,7 +6,7 @@ use niri_config::{
     BackgroundEffect, BlockOutFrom, BorderRule, CornerRadius, FloatingPosition, PresetSize,
     ResolvedPopupsRules, ShadowRule, TabIndicatorRule,
 };
-use niri_ipc::ColumnDisplay;
+use niri_ipc::{ColumnDisplay, WindowFollowMode};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::utils::{Logical, Size};
 use smithay::wayland::compositor::with_states;
@@ -70,6 +70,9 @@ pub struct ResolvedWindowRules {
 
     /// Whether the window should open floating.
     pub open_floating: Option<bool>,
+
+    /// Follow mode to use when the window opens.
+    pub open_follow_mode: Option<WindowFollowMode>,
 
     /// Whether the window should open focused.
     pub open_focused: Option<bool>,
@@ -258,6 +261,10 @@ impl ResolvedWindowRules {
 
                 if let Some(x) = rule.open_floating {
                     resolved.open_floating = Some(x);
+                }
+
+                if let Some(x) = rule.open_follow_mode {
+                    resolved.open_follow_mode = Some(x);
                 }
 
                 if let Some(x) = rule.open_focused {

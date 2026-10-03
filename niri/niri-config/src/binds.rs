@@ -8,7 +8,8 @@ use knuffel::errors::DecodeError;
 use knuffel::Decode as _;
 use miette::miette;
 use niri_ipc::{
-    ColumnDisplay, LayoutSwitchTarget, PositionChange, SizeChange, WorkspaceReferenceArg,
+    ColumnDisplay, LayoutSwitchTarget, PositionChange, SizeChange, WindowFollowMode,
+    WorkspaceReferenceArg,
 };
 use smithay::input::keyboard::keysyms::KEY_NoSymbol;
 use smithay::input::keyboard::xkb::{keysym_from_name, KEYSYM_CASE_INSENSITIVE, KEYSYM_NO_FLAGS};
@@ -179,6 +180,12 @@ pub enum Action {
         #[knuffel(flatten(property))] WindowFilter,
         #[knuffel(arguments)] Vec<String>,
     ),
+    SetWindowFollow(#[knuffel(argument, str)] WindowFollowMode),
+    #[knuffel(skip)]
+    SetWindowFollowById(u64, WindowFollowMode),
+    ToggleWindowFollow,
+    #[knuffel(skip)]
+    ToggleWindowFollowById(u64),
     FocusWindowInColumn(#[knuffel(argument)] u8),
     FocusWindowPrevious,
     FocusColumnLeft,
@@ -477,6 +484,14 @@ impl From<niri_ipc::Action> for Action {
             }
             niri_ipc::Action::RecallWindow { filter, command } => {
                 Self::RecallWindow(filter.into(), command)
+            }
+            niri_ipc::Action::SetWindowFollow { id: None, mode } => Self::SetWindowFollow(mode),
+            niri_ipc::Action::SetWindowFollow { id: Some(id), mode } => {
+                Self::SetWindowFollowById(id, mode)
+            }
+            niri_ipc::Action::ToggleWindowFollow { id: None } => Self::ToggleWindowFollow,
+            niri_ipc::Action::ToggleWindowFollow { id: Some(id) } => {
+                Self::ToggleWindowFollowById(id)
             }
             niri_ipc::Action::FocusWindowInColumn { index } => Self::FocusWindowInColumn(index),
             niri_ipc::Action::FocusWindowPrevious {} => Self::FocusWindowPrevious,
