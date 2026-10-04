@@ -176,6 +176,10 @@ pub enum Action {
     #[knuffel(skip)]
     FocusWindow(u64),
     FocusWindowMatching(#[knuffel(flatten(property))] WindowFilter),
+    FocusOrSpawn(
+        #[knuffel(flatten(property))] WindowFilter,
+        #[knuffel(arguments)] Vec<String>,
+    ),
     RecallWindow(
         #[knuffel(flatten(property))] WindowFilter,
         #[knuffel(arguments)] Vec<String>,
@@ -426,6 +430,17 @@ pub enum Action {
     TestAction,
 }
 
+impl Action {
+    pub fn validate_window_filter(&self) -> Result<(), String> {
+        match self {
+            Self::FocusWindowMatching(filter) => filter.validate_focus(),
+            Self::FocusOrSpawn(filter, command) => filter.validate_focus_or_spawn(command),
+            Self::RecallWindow(filter, command) => filter.validate_recall(command),
+            _ => Ok(()),
+        }
+    }
+}
+
 impl From<niri_ipc::Action> for Action {
     fn from(value: niri_ipc::Action) -> Self {
         match value {
@@ -481,6 +496,9 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::FocusWindow { id } => Self::FocusWindow(id),
             niri_ipc::Action::FocusWindowMatching { filter } => {
                 Self::FocusWindowMatching(filter.into())
+            }
+            niri_ipc::Action::FocusOrSpawn { filter, command } => {
+                Self::FocusOrSpawn(filter.into(), command)
             }
             niri_ipc::Action::RecallWindow { filter, command } => {
                 Self::RecallWindow(filter.into(), command)
@@ -961,15 +979,8 @@ impl Bind {
             }
             match Action::decode_node(child, ctx) {
                 Ok(action) => {
-                    if let Action::FocusWindowMatching(filter) = &action {
-                        if let Err(err) = filter.validate_focus() {
-                            ctx.emit_error(DecodeError::unexpected(child, "action", err));
-                        }
-                    }
-                    if let Action::RecallWindow(filter, command) = &action {
-                        if let Err(err) = filter.validate_recall(command) {
-                            ctx.emit_error(DecodeError::unexpected(child, "action", err));
-                        }
+                    if let Err(err) = action.validate_window_filter() {
+                        ctx.emit_error(DecodeError::unexpected(child, "action", err));
                     }
                     if !matches!(action, Action::Spawn(_) | Action::SpawnSh(_)) {
                         if let Some(node) = allow_when_locked_node {

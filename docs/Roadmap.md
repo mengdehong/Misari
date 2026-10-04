@@ -4,6 +4,7 @@
 
 - [x] **修饰键独按**：Super／Hyper 等支持短按、长按独立绑定，同时保留组合键使用。
 - [x] **[窗口查询与聚焦](feat/window-selection.md)**：通过 CLI／IPC 列出、筛选窗口，通过 CLI／KDL／IPC 按条件聚焦；文本列表支持按工作区分组。
+- [x] **[focus-or-spawn](feat/window-focus-or-spawn.md)**：有窗口时切到它所在的工作区，没有时启动应用；启动中的重复请求由动作内部合并。
 - [x] **[窗口暂存与召回](feat/window-stash-recall.md)**：通过命名工作区暂存窗口，按条件召回到当前工作区；无匹配窗口时可启动应用并在窗口出现后召回。
 - [x] **[窗口跟随](feat/window-follow.md)**：通过窗口规则自动开启始终跟随或按需跟随，也支持 CLI／KDL／IPC 临时调整，切换工作区或显示器时保持窗口可用。
 - [x] **[Agent 指定窗口截图](feat/window-screenshot.md)**：复用窗口查询选择目标，支持静默截图、等待完成并返回保存路径或错误。

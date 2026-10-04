@@ -58,6 +58,8 @@ niri msg action focus-window-matching --title 'GitHub' --current-workspace
 
 目标在其他工作区或输出时，焦点转到目标所在地，窗口本身不移动。没有匹配窗口时不改变焦点，也不启动应用；重复执行不会在匹配窗口间循环。
 
+没有匹配窗口时需要启动应用，使用 [focus-or-spawn](window-focus-or-spawn.md)。
+
 在 `config.kdl` 中可直接绑定同一动作：
 
 ```kdl

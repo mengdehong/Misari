@@ -347,6 +347,16 @@ pub enum Action {
         #[cfg_attr(feature = "clap", command(flatten))]
         filter: WindowFilter,
     },
+    /// Focus a matching window, or launch a command if none matches.
+    /// Identical launches in progress are coalesced. Only app-id and title are allowed.
+    FocusOrSpawn {
+        /// Conditions combined with AND. At least one is required.
+        #[cfg_attr(feature = "clap", command(flatten))]
+        filter: WindowFilter,
+        /// Program and arguments to launch without a shell when no window matches.
+        #[cfg_attr(feature = "clap", arg(last = true, required = true, num_args = 1..))]
+        command: Vec<String>,
+    },
     /// Bring a matching window to the focused workspace, or launch a command and recall it.
     /// Requires conditions; with a command, only app-id and title are allowed.
     RecallWindow {

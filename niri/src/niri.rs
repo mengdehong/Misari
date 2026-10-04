@@ -203,19 +203,44 @@ const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
 // should be ~1.995 seconds.
 const FRAME_CALLBACK_THROTTLE: Option<Duration> = Some(Duration::from_millis(995));
 
-const RECALL_TIMEOUT: Duration = Duration::from_secs(10);
+const WINDOW_LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Also suppresses ordinary activation after a recall has completed or expired.
 pub(crate) struct RecallActivationMarker;
 
-pub(crate) struct PendingRecall {
+pub(crate) struct PendingWindowLaunch {
     selector: WindowSelector,
     command: Vec<String>,
-    pub(crate) target: WorkspaceId,
+    /// None preserves ordinary spawn placement and activation; Some requests a recall.
+    pub(crate) recall_target: Option<WorkspaceId>,
     pub(crate) token: XdgActivationToken,
     surface: Option<WlSurface>,
     existing_surfaces: Vec<WlSurface>,
     pub(crate) deadline: Instant,
+}
+
+fn take_pending_window_launch_target(
+    pending: &mut Vec<PendingWindowLaunch>,
+    mapped: &Mapped,
+) -> Option<WorkspaceId> {
+    // Focus-or-spawn completes without overriding normal placement or activation.
+    pending.retain(|r| r.recall_target.is_some() || !r.selector.matches(mapped, None, None));
+    let surface = mapped.toplevel().wl_surface();
+    let matches = |r: &PendingWindowLaunch| {
+        r.recall_target.is_some() && r.selector.matches(mapped, None, None)
+    };
+    // A returned token takes precedence, even before matching attributes are set.
+    let index = if let Some(index) = pending
+        .iter()
+        .position(|r| r.surface.as_ref() == Some(surface))
+    {
+        matches(&pending[index]).then_some(index)
+    } else {
+        pending.iter().position(|r| {
+            r.surface.is_none() && !r.existing_surfaces.contains(surface) && matches(r)
+        })
+    }?;
+    pending.remove(index).recall_target
 }
 
 #[derive(Default)]
@@ -278,8 +303,8 @@ pub struct Niri {
     // Windows which don't have a buffer attached yet.
     pub unmapped_windows: HashMap<WlSurface, Unmapped>,
 
-    pub(crate) pending_recalls: Vec<PendingRecall>,
-    recall_spawn_failures: calloop::channel::Sender<XdgActivationToken>,
+    pub(crate) pending_window_launches: Vec<PendingWindowLaunch>,
+    window_spawn_failures: calloop::channel::Sender<XdgActivationToken>,
 
     /// Layer surfaces which don't have a buffer attached yet.
     pub unmapped_layer_surfaces: HashSet<WlSurface>,
@@ -902,7 +927,7 @@ impl State {
 
         // Needs to be called after updating the keyboard focus.
         self.niri.refresh_layout();
-        self.niri.prune_pending_recalls();
+        self.niri.prune_pending_window_launches();
 
         self.niri.cursor_manager.check_cursor_image_surface_alive();
         self.niri.refresh_pointer_outputs();
@@ -1154,24 +1179,20 @@ impl State {
         self.move_cursor_to_output(&target);
     }
 
-    /// Focus a match after the config or IPC entry point has validated the conditions.
-    pub(crate) fn focus_window_matching(&mut self, filter: WindowFilter) {
-        let selector = match WindowSelector::new(filter) {
-            Ok(selector) => selector,
-            Err(err) => {
-                warn!("{err}");
-                return;
-            }
-        };
-        if let Some((false, window)) = selector.select(&self.niri.layout) {
-            self.focus_window(&window);
-        }
-    }
-
     pub(crate) fn recall_window(&mut self, filter: WindowFilter, command: Vec<String>) {
         let Some(target) = self.niri.layout.active_workspace().map(|ws| ws.id()) else {
             return;
         };
+        self.select_or_launch_window(filter, command, Some(target));
+    }
+
+    /// Select and act on a match, or launch after config or IPC has validated the conditions.
+    pub(crate) fn select_or_launch_window(
+        &mut self,
+        filter: WindowFilter,
+        command: Vec<String>,
+        recall_target: Option<WorkspaceId>,
+    ) {
         let selector = match WindowSelector::new(filter) {
             Ok(selector) => selector,
             Err(err) => {
@@ -1179,40 +1200,45 @@ impl State {
                 return;
             }
         };
-        self.niri.prune_pending_recalls();
-        if let Some((_, window)) = selector.select(&self.niri.layout) {
+        self.niri.prune_pending_window_launches();
+        let pending = &mut self.niri.pending_window_launches;
+        let same_request = |r: &PendingWindowLaunch| {
+            r.selector.filter == selector.filter
+                && r.command == command
+                && r.recall_target.is_some() == recall_target.is_some()
+        };
+        if let Some((focused, window)) = selector.select(&self.niri.layout) {
             // An immediate match also satisfies an earlier launch request for this action.
-            self.niri
-                .pending_recalls
-                .retain(|r| r.selector.filter != selector.filter || r.command != command);
-            self.recall_to_workspace(&window, target);
+            pending.retain(|r| !same_request(r));
+            if let Some(target) = recall_target {
+                self.recall_to_workspace(&window, target);
+            } else if !focused {
+                self.focus_window(&window);
+            }
             return;
         }
         if command.is_empty() {
             return;
         }
-        if let Some(request) = self
-            .niri
-            .pending_recalls
-            .iter_mut()
-            .find(|r| r.selector.filter == selector.filter && r.command == command)
-        {
-            request.target = target;
+        if let Some(request) = pending.iter_mut().find(|r| same_request(r)) {
+            request.recall_target = recall_target;
             return;
         }
 
         let (token, data) = self.niri.activation_state.create_external_token(None);
-        data.user_data.insert_if_missing(|| RecallActivationMarker);
+        if recall_target.is_some() {
+            data.user_data.insert_if_missing(|| RecallActivationMarker);
+        }
         let token = token.clone();
         let mut existing_surfaces: Vec<_> = self.niri.unmapped_windows.keys().cloned().collect();
         self.niri.layout.with_windows(|window, _, _, _| {
             existing_surfaces.push(window.toplevel().wl_surface().clone());
         });
-        let deadline = Instant::now() + RECALL_TIMEOUT;
-        self.niri.pending_recalls.push(PendingRecall {
+        let deadline = Instant::now() + WINDOW_LAUNCH_TIMEOUT;
+        pending.push(PendingWindowLaunch {
             selector,
             command: command.clone(),
-            target,
+            recall_target,
             token: token.clone(),
             surface: None,
             existing_surfaces,
@@ -1221,20 +1247,20 @@ impl State {
         self.niri
             .event_loop
             .insert_source(Timer::from_deadline(deadline), |_, _, state| {
-                state.niri.prune_pending_recalls();
+                state.niri.prune_pending_window_launches();
                 TimeoutAction::Drop
             })
             .unwrap();
 
-        let failures = self.niri.recall_spawn_failures.clone();
+        let failures = self.niri.window_spawn_failures.clone();
         let failed_token = token.clone();
         if let Err(err) = spawn_with_result(command, Some(token.clone()), move |success| {
             if !success {
                 let _ = failures.send(failed_token);
             }
         }) {
-            warn!("error starting recall command: {err:?}");
-            self.niri.pending_recalls.retain(|r| r.token != token);
+            warn!("error starting window command: {err:?}");
+            pending.retain(|r| r.token != token);
         }
     }
 
@@ -1266,17 +1292,17 @@ impl State {
         self.niri.queue_redraw_all();
     }
 
-    pub(crate) fn complete_pending_recall(&mut self, surface: &WlSurface) {
-        self.niri.prune_pending_recalls();
+    pub(crate) fn complete_pending_window_launches(&mut self, surface: &WlSurface) {
+        self.niri.prune_pending_window_launches();
         let Some((mapped, _)) = self.niri.layout.find_window_and_output(surface) else {
             return;
         };
-        let Some(index) = self.niri.pending_recall_index(mapped) else {
-            return;
-        };
         let window = mapped.window.clone();
-        let request = self.niri.pending_recalls.remove(index);
-        self.recall_to_workspace(&window, request.target);
+        if let Some(target) =
+            take_pending_window_launch_target(&mut self.niri.pending_window_launches, mapped)
+        {
+            self.recall_to_workspace(&window, target);
+        }
     }
 
     pub(crate) fn associate_recall_token(
@@ -1284,16 +1310,16 @@ impl State {
         token: &XdgActivationToken,
         surface: &WlSurface,
     ) {
-        self.niri.prune_pending_recalls();
+        self.niri.prune_pending_window_launches();
         if let Some(request) = self
             .niri
-            .pending_recalls
+            .pending_window_launches
             .iter_mut()
             .find(|r| &r.token == token)
         {
             request.surface = Some(surface.clone());
         }
-        self.complete_pending_recall(surface);
+        self.complete_pending_window_launches(surface);
     }
 
     /// Focus a specific window, taking care of a potential active output change and cursor warp.
@@ -2715,11 +2741,14 @@ impl Niri {
             GammaControlManagerState::new::<State, _>(&display_handle, move |client| {
                 is_tty && !client.get_data::<ClientState>().unwrap().restricted
             });
-        let (recall_spawn_failures, failures) = calloop::channel::channel();
+        let (window_spawn_failures, failures) = calloop::channel::channel();
         event_loop
             .insert_source(failures, |event, _, state| {
                 if let calloop::channel::Event::Msg(token) = event {
-                    state.niri.pending_recalls.retain(|r| r.token != token);
+                    state
+                        .niri
+                        .pending_window_launches
+                        .retain(|r| r.token != token);
                 }
             })
             .unwrap();
@@ -2876,8 +2905,8 @@ impl Niri {
             sorted_outputs: Vec::default(),
             output_state: HashMap::new(),
             unmapped_windows: HashMap::new(),
-            pending_recalls: Vec::new(),
-            recall_spawn_failures,
+            pending_window_launches: Vec::new(),
+            window_spawn_failures,
             unmapped_layer_surfaces: HashSet::new(),
             mapped_layer_surfaces: HashMap::new(),
             root_surface: HashMap::new(),
@@ -3968,37 +3997,25 @@ impl Niri {
         self.output_next_of(active)
     }
 
-    pub(crate) fn prune_pending_recalls(&mut self) {
-        if self.pending_recalls.is_empty() {
+    pub(crate) fn prune_pending_window_launches(&mut self) {
+        if self.pending_window_launches.is_empty() {
             return;
         }
         let now = Instant::now();
-        self.pending_recalls
-            .retain(|r| now < r.deadline && self.layout.find_workspace_by_id(r.target).is_some());
+        self.pending_window_launches.retain(|r| {
+            now < r.deadline
+                && r.recall_target
+                    .is_none_or(|target| self.layout.find_workspace_by_id(target).is_some())
+        });
     }
 
-    fn pending_recall_index(&self, mapped: &Mapped) -> Option<usize> {
-        let surface = mapped.toplevel().wl_surface();
-        let matches = |request: &PendingRecall| request.selector.matches(mapped, None, None);
-        // A returned token takes precedence over the new-window fallback, even if the
-        // app has not set matching attributes yet.
-        if let Some(index) = self
-            .pending_recalls
-            .iter()
-            .position(|r| r.surface.as_ref() == Some(surface))
-        {
-            return matches(&self.pending_recalls[index]).then_some(index);
-        }
-        self.pending_recalls.iter().position(|r| {
-            r.surface.is_none() && !r.existing_surfaces.contains(surface) && matches(r)
-        })
-    }
-
-    /// Resolve before adding the window, so normal placement cannot steal focus first.
-    pub(crate) fn take_pending_recall_target(&mut self, mapped: &Mapped) -> Option<WorkspaceId> {
-        self.prune_pending_recalls();
-        let index = self.pending_recall_index(mapped)?;
-        Some(self.pending_recalls.remove(index).target)
+    /// Complete launches before adding the window, overriding placement only for recalls.
+    pub(crate) fn take_pending_window_launch_target(
+        &mut self,
+        mapped: &Mapped,
+    ) -> Option<WorkspaceId> {
+        self.prune_pending_window_launches();
+        take_pending_window_launch_target(&mut self.pending_window_launches, mapped)
     }
 
     pub fn find_output_and_workspace_index(

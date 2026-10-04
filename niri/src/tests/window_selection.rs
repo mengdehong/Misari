@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use niri_config::window_filter::WindowFilter;
 use niri_config::{Action, Config};
@@ -106,47 +106,50 @@ fn set_history(f: &mut Fixture, recent: Option<u64>) {
 
 #[test]
 fn window_selection_focus_preserves_current_match_and_uses_mru() {
-    let mut f = Fixture::new();
-    f.add_output(1, (1920, 1080));
-    f.add_output(2, (1920, 1080));
-    let client = f.add_client();
-    let first = open(&mut f, client, Some("firefox"), "First");
-    let second = open(&mut f, client, Some("firefox"), "Second");
-    let source_workspace = f.niri().layout.active_workspace().unwrap().id();
-    f.niri_focus_output(2);
-    let other = open(&mut f, client, Some("terminal"), "Other");
-    set_history(&mut f, Some(first));
-    let action = Action::FocusWindowMatching(filter(r#"app-id="^firefox$""#));
-    f.niri_state().do_action(action.clone(), false);
-    f.double_roundtrip(client);
-    assert_eq!(f.niri().layout.focus().unwrap().id().get(), first);
-    assert_eq!(
-        f.niri().layout.active_workspace().unwrap().id(),
-        source_workspace
-    );
-
-    // An explicit choice remains focused, even if another match was used more recently.
-    f.niri_state().do_action(Action::FocusWindow(second), false);
-    f.double_roundtrip(client);
-    set_history(&mut f, Some(first));
     for action in [
-        action.clone(),
-        Action::FocusWindowMatching(filter(r#"title="missing""#)),
+        Action::FocusWindowMatching(filter(r#"app-id="^firefox$""#)),
+        focus_or_spawn(r#"app-id="^firefox$""#),
     ] {
+        let mut f = Fixture::new();
+        f.add_output(1, (1920, 1080));
+        f.add_output(2, (1920, 1080));
+        let client = f.add_client();
+        let first = open(&mut f, client, Some("firefox"), "First");
+        let second = open(&mut f, client, Some("firefox"), "Second");
+        let source = workspace_of(&mut f, first);
+        f.niri_focus_output(2);
+        let other = open(&mut f, client, Some("terminal"), "Other");
+        set_history(&mut f, Some(first));
+        f.niri_state().do_action(action.clone(), false);
+        f.double_roundtrip(client);
+        assert_eq!(f.niri().layout.focus().unwrap().id().get(), first);
+        assert_eq!(f.niri().layout.active_workspace().unwrap().id(), source);
+        assert_eq!(workspace_of(&mut f, second), source);
+
+        // An explicit choice remains focused, even if another match is more recent.
+        f.niri_state().do_action(Action::FocusWindow(second), false);
+        f.double_roundtrip(client);
+        set_history(&mut f, Some(first));
+        for action in [
+            action.clone(),
+            Action::FocusWindowMatching(filter(r#"title="missing""#)),
+        ] {
+            f.niri_state().do_action(action, false);
+            f.double_roundtrip(client);
+            assert_eq!(f.niri().layout.focus().unwrap().id().get(), second);
+        }
+        assert!(f.niri().pending_window_launches.is_empty());
+
+        f.niri_state().do_action(Action::FocusWindow(other), false);
+        f.double_roundtrip(client);
+        set_history(&mut f, None);
         f.niri_state().do_action(action, false);
         f.double_roundtrip(client);
-        assert_eq!(f.niri().layout.focus().unwrap().id().get(), second);
+        assert_eq!(
+            f.niri().layout.focus().unwrap().id().get(),
+            first.min(second)
+        );
     }
-
-    f.niri_state().do_action(Action::FocusWindow(other), false);
-    f.double_roundtrip(client);
-    set_history(&mut f, None);
-    f.niri_state().do_action(action, false);
-    f.double_roundtrip(client);
-    assert_eq!(
-        f.niri().layout.focus().unwrap().id().get(),
-        first.min(second)
-    );
 }
 
 fn recall(properties: &str, launch: bool) -> Action {
@@ -168,6 +171,96 @@ fn workspace_of(f: &mut Fixture, id: u64) -> crate::layout::workspace::Workspace
         .unwrap()
         .2
         .id()
+}
+
+fn focus_or_spawn(properties: &str) -> Action {
+    Action::FocusOrSpawn(filter(properties), vec!["/bin/true".into()])
+}
+
+#[test]
+fn focus_or_spawn_launch_lifecycle() {
+    let config = Config::parse_mem(
+        r#"
+        binds { Mod+B { focus-or-spawn "/bin/true" app-id="^browser$" title="^Ready$"; }; }
+        workspace "apps"
+        window-rule {
+            match app-id="^browser$"
+            open-on-workspace "apps"
+            open-focused false
+        }
+        "#,
+    )
+    .unwrap();
+    let bind = config.binds.0[0].clone();
+    assert!(bind.repeat);
+    let mut f = Fixture::with_config(config);
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1920, 1080));
+    let client = f.add_client();
+    let home = open(&mut f, client, Some("terminal"), "Home");
+    let apps = workspace_of(&mut f, home);
+    f.niri_focus_output(2);
+    let away = open(&mut f, client, Some("terminal"), "Away");
+    let action: niri_ipc::Action = serde_json::from_str(
+        r#"{"FocusOrSpawn":{"filter":{"app_id":"^browser$","title":"^Ready$"},"command":["/bin/true"]}}"#,
+    )
+    .unwrap();
+    for command in [vec![], vec!["/bin/true".into(), "bad\0arg".into()]] {
+        let mut invalid = action.clone();
+        if let niri_ipc::Action::FocusOrSpawn { command: argv, .. } = &mut invalid {
+            *argv = command;
+        }
+        assert!(f.ipc_action(invalid).is_err());
+    }
+    f.niri_state().handle_bind(bind.clone());
+    let deadline = f.niri().pending_window_launches[0].deadline;
+    f.ipc_action(action.clone()).unwrap();
+    f.niri_state().handle_bind(bind);
+    assert_eq!(f.niri().pending_window_launches.len(), 1);
+    assert_eq!(f.niri().pending_window_launches[0].deadline, deadline);
+
+    let browser = open(&mut f, client, Some("browser"), "Loading");
+    assert_eq!(f.niri().pending_window_launches.len(), 1);
+    f.client(client)
+        .state
+        .windows
+        .last()
+        .unwrap()
+        .set_title("Ready");
+    f.double_roundtrip(client);
+    assert!(f.niri().pending_window_launches.is_empty());
+    assert_eq!(workspace_of(&mut f, browser), apps);
+    assert_eq!(f.niri().layout.focus().unwrap().id().get(), away);
+
+    f.ipc_action(action).unwrap();
+    f.double_roundtrip(client);
+    assert_eq!(f.niri().layout.focus().unwrap().id().get(), browser);
+}
+
+#[test]
+fn focus_or_spawn_failure_and_timeout_allow_retry() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let failed = Action::FocusOrSpawn(
+        filter(r#"app-id="^browser$""#),
+        vec!["/nonexistent/niri-focus-or-spawn-test".into()],
+    );
+    f.niri_state().do_action(failed, false);
+    assert_eq!(f.niri().pending_window_launches.len(), 1);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !f.niri().pending_window_launches.is_empty() {
+        assert!(Instant::now() < deadline, "spawn failure was not cleared");
+        f.dispatch();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let action = focus_or_spawn(r#"app-id="^browser$""#);
+    f.niri_state().do_action(action.clone(), false);
+    let token = f.niri().pending_window_launches[0].token.clone();
+    f.niri().pending_window_launches[0].deadline = Instant::now();
+    f.niri_state().do_action(action, false);
+    assert_eq!(f.niri().pending_window_launches.len(), 1);
+    assert_ne!(f.niri().pending_window_launches[0].token, token);
 }
 
 #[test]
@@ -193,6 +286,8 @@ fn recall_moves_floating_window_to_current_workspace() {
 
 #[test]
 fn recall_launch_places_window_without_switching_back() {
+    use crate::niri::RecallActivationMarker;
+
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
     f.add_output(2, (1920, 1080));
@@ -202,11 +297,25 @@ fn recall_launch_places_window_without_switching_back() {
     let action = recall(r#"app-id="browser""#, true);
     f.niri_state().do_action(action.clone(), false);
     f.niri_state().do_action(action, false);
-    assert_eq!(f.niri().pending_recalls.len(), 1);
+    assert_eq!(f.niri().pending_window_launches.len(), 1);
     f.niri_focus_output(2);
     let away = open(&mut f, client, Some("terminal"), "Away");
+    f.niri_state()
+        .do_action(focus_or_spawn(r#"app-id="browser""#), false);
+    let niri = f.niri();
+    assert_eq!(niri.pending_window_launches.len(), 2);
+    for request in &niri.pending_window_launches {
+        let data = niri
+            .activation_state
+            .data_for_token(&request.token)
+            .unwrap();
+        assert_eq!(
+            data.user_data.get::<RecallActivationMarker>().is_some(),
+            request.recall_target.is_some()
+        );
+    }
     let browser = open(&mut f, client, Some("browser"), "Browser");
     assert_eq!(workspace_of(&mut f, browser), target);
     assert_eq!(f.niri().layout.focus().unwrap().id().get(), away);
-    assert!(f.niri().pending_recalls.is_empty());
+    assert!(f.niri().pending_window_launches.is_empty());
 }

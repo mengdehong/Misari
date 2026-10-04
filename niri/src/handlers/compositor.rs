@@ -205,7 +205,7 @@ impl CompositorHandler for State {
                     };
                     let window = mapped.window.clone();
 
-                    let recall_target = self.niri.take_pending_recall_target(&mapped);
+                    let recall_target = self.niri.take_pending_window_launch_target(&mapped);
                     let activate = if let Some(target) = recall_target {
                         if self
                             .niri

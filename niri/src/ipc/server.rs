@@ -436,6 +436,7 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             let (tx, rx) = async_channel::bounded(1);
 
             let action = niri_config::Action::from(action);
+            action.validate_window_filter()?;
             ctx.event_loop.insert_idle(move |state| {
                 // Make sure some logic like workspace clean-up has a chance to run before doing
                 // actions.
@@ -513,12 +514,6 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
 }
 
 fn validate_action(action: &Action) -> Result<(), String> {
-    if let Action::RecallWindow { filter, command } = action {
-        niri_config::window_filter::WindowFilter::from(filter.clone()).validate_recall(command)?;
-    }
-    if let Action::FocusWindowMatching { filter } = action {
-        niri_config::window_filter::WindowFilter::from(filter.clone()).validate_focus()?;
-    }
     if let Action::Screenshot { path, .. }
     | Action::ScreenshotScreen { path, .. }
     | Action::ScreenshotWindow { path, .. }

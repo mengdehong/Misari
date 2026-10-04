@@ -57,9 +57,23 @@ impl WindowFilter {
 
     pub fn validate_recall(&self, command: &[String]) -> Result<(), String> {
         self.validate_conditions("recall-window")?;
+        self.validate_launch("recall-window", command)
+    }
+
+    pub fn validate_focus_or_spawn(&self, command: &[String]) -> Result<(), String> {
+        self.validate_conditions("focus-or-spawn")?;
+        if command.is_empty() {
+            return Err("focus-or-spawn requires a command".into());
+        }
+        self.validate_launch("focus-or-spawn", command)
+    }
+
+    fn validate_launch(&self, action: &str, command: &[String]) -> Result<(), String> {
         if let Some(program) = command.first() {
             if program.is_empty() || command.iter().any(|arg| arg.contains('\0')) {
-                return Err("recall-window requires a nonempty program and no NUL bytes".into());
+                return Err(format!(
+                    "{action} requires a nonempty program and no NUL bytes"
+                ));
             }
             if self.id.is_some()
                 || self.workspace_id.is_some()
@@ -67,7 +81,9 @@ impl WindowFilter {
                 || self.floating.is_some()
                 || self.urgent.is_some()
             {
-                return Err("recall-window with a command only supports app-id and title".into());
+                return Err(format!(
+                    "{action} with a command only supports app-id and title"
+                ));
             }
         }
         Ok(())
@@ -94,18 +110,32 @@ mod tests {
 
     #[test]
     fn window_selection_config_validation() {
-        let config = Config::parse_mem(r#"binds { Mod+B { focus-window-matching app-id="^firefox$" title="GitHub" current-workspace=true floating=false; }; }"#).unwrap();
+        let config = Config::parse_mem(
+            r#"binds {
+                Mod+B { focus-window-matching app-id="^firefox$" current-workspace=true floating=false; }
+                Mod+F { focus-or-spawn "firefox" "--new-window" "" app-id="^firefox$"; }
+            }"#,
+        )
+        .unwrap();
         let Action::FocusWindowMatching(filter) = &config.binds.0[0].action else {
             panic!("wrong action")
         };
         assert_eq!(filter.app_id.as_deref(), Some("^firefox$"));
         assert_eq!(filter.current_workspace, Some(true));
         assert_eq!(filter.floating, Some(false));
+        let Action::FocusOrSpawn(_, command) = &config.binds.0[1].action else {
+            panic!("wrong action")
+        };
+        assert_eq!(command, &["firefox", "--new-window", ""]);
         for action in [
             "focus-window-matching",
             "focus-window-matching current-workspace=false",
-            "focus-window-matching app-id=\"[\"",
-            "focus-window-matching title=\"(\"",
+            r#"focus-window-matching app-id="[""#,
+            r#"focus-window-matching title="(""#,
+            r#"focus-or-spawn app-id="firefox""#,
+            r#"focus-or-spawn "" app-id="firefox""#,
+            r#"focus-or-spawn "firefox""#,
+            r#"focus-or-spawn "firefox" app-id="firefox" id=42"#,
         ] {
             assert!(
                 Config::parse_mem(&format!("binds {{ Mod+B {{ {action}; }}; }}")).is_err(),

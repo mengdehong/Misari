@@ -1,15 +1,19 @@
+use std::ffi::OsStr;
 use std::os::fd::AsFd as _;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use calloop::generic::Generic;
 use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction};
 use niri_config::Config;
+use niri_ipc::socket::Socket;
+use niri_ipc::{Action, Reply, Request};
 use smithay::output::Output;
 
 use super::client::{Client, ClientId};
 use super::server::Server;
+use crate::ipc::server::IpcServer;
 use crate::niri::{NewClient, Niri};
 
 pub struct Fixture {
@@ -58,6 +62,34 @@ impl Fixture {
         self.event_loop
             .dispatch(Duration::ZERO, &mut self.state)
             .unwrap();
+    }
+
+    pub fn ipc_action(&mut self, action: Action) -> Reply {
+        let socket = self
+            .niri()
+            .ipc_server
+            .as_ref()
+            .and_then(|s| s.socket_path.clone());
+        let socket = socket.unwrap_or_else(|| {
+            let name = format!("niri-test-{:016x}", fastrand::u64(..));
+            let server =
+                IpcServer::start(&self.niri().event_loop, Some(OsStr::new(&name))).unwrap();
+            let socket = server.socket_path.clone().unwrap();
+            self.niri().ipc_server = Some(server);
+            self.niri_state().ipc_keyboard_layouts_changed();
+            socket
+        });
+        let thread = std::thread::spawn(move || {
+            let mut socket = Socket::connect_to(socket).unwrap();
+            socket.send(Request::Action(action)).unwrap()
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !thread.is_finished() {
+            assert!(Instant::now() < deadline, "IPC request did not complete");
+            self.dispatch();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        thread.join().unwrap()
     }
 
     pub fn niri_state(&mut self) -> &mut crate::niri::State {

@@ -22,6 +22,9 @@ binds {
         spawn "kitty" "--override" "linux_display_server=wayland" "--title" "niri-dev";
     }
     Mod+C hotkey-overlay-title="关闭开发实例窗口" repeat=false { close-window; }
+    F5 hotkey-overlay-title="测试：聚焦或启动终端" {
+        focus-or-spawn "kitty" "--config" "NONE" "--override" "linux_display_server=wayland" "--class" "focus-spawn-test" "--title" "focus-spawn-test" app-id="^focus-spawn-test$";
+    }
     F6 hotkey-overlay-title="测试：按标题聚焦 A" repeat=false {
         focus-window-matching title="^selection-A$";
     }
