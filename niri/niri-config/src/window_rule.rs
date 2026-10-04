@@ -41,6 +41,8 @@ pub struct WindowRule {
 
     // Rules applied dynamically.
     #[knuffel(child, unwrap(argument))]
+    pub pinned: Option<bool>,
+    #[knuffel(child, unwrap(argument))]
     pub min_width: Option<u16>,
     #[knuffel(child, unwrap(argument))]
     pub min_height: Option<u16>,

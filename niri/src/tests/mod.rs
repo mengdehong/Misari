@@ -10,6 +10,7 @@ mod binds;
 mod floating;
 mod fullscreen;
 mod layer_shell;
+mod pinned;
 mod remove_output;
 mod screenshot;
 mod transactions;

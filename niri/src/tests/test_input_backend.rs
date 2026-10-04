@@ -19,6 +19,7 @@ pub struct TestKeyboardKeyEvent {
 }
 
 pub struct TestPointerButtonEvent {
+    pub code: u32,
     pub state: ButtonState,
 }
 
@@ -33,7 +34,7 @@ impl Event<TestInputBackend> for TestPointerButtonEvent {
 
 impl PointerButtonEvent<TestInputBackend> for TestPointerButtonEvent {
     fn button_code(&self) -> u32 {
-        0x110
+        self.code
     }
     fn state(&self) -> ButtonState {
         self.state

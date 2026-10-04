@@ -1016,6 +1016,46 @@ impl State {
                     self.niri.layout.toggle_window_follow(Some(&window));
                 }
             }
+            Action::ToggleWindowPinned(when_tiled) => {
+                if self.niri.keyboard_focus.is_layout()
+                    && self.niri.layout.toggle_window_pinned(None, when_tiled)
+                {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::ToggleWindowPinnedById(id, when_tiled) => {
+                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = window.map(|(_, m)| m.window.clone());
+                if let Some(window) = window {
+                    if self
+                        .niri
+                        .layout
+                        .toggle_window_pinned(Some(&window), when_tiled)
+                    {
+                        self.niri.queue_redraw_all();
+                    }
+                }
+            }
+            Action::SetWindowPinned(mode, when_tiled) => {
+                if self.niri.keyboard_focus.is_layout()
+                    && self.niri.layout.set_window_pinned(None, mode, when_tiled)
+                {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::SetWindowPinnedById(id, mode, when_tiled) => {
+                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = window.map(|(_, m)| m.window.clone());
+                if let Some(window) = window {
+                    if self
+                        .niri
+                        .layout
+                        .set_window_pinned(Some(&window), mode, when_tiled)
+                    {
+                        self.niri.queue_redraw_all();
+                    }
+                }
+            }
             Action::FocusWindowInColumn(index) => {
                 self.niri.layout.focus_window_in_column(index);
                 self.maybe_warp_cursor_to_focus();

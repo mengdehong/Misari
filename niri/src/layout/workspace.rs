@@ -1617,9 +1617,9 @@ impl<W: LayoutElement> Workspace<W> {
     ) -> impl Iterator<Item = (&Tile<W>, Point<f64, Logical>, bool)> {
         let scrolling = self.scrolling.tiles_with_render_positions();
 
-        let floating = self.floating.tiles_with_render_positions();
+        let floating = self.floating.tiles_with_stacking_order();
         let visible = self.is_floating_visible();
-        let floating = floating.map(move |(tile, pos)| (tile, pos, visible));
+        let floating = floating.map(move |(tile, pos, pinned)| (tile, pos, pinned || visible));
 
         floating.chain(scrolling)
     }
@@ -1676,9 +1676,10 @@ impl<W: LayoutElement> Workspace<W> {
         xray_pos: XrayPos,
         focus_ring: bool,
         layer: RenderLayer,
+        pinned: bool,
         push: &mut dyn FnMut(WorkspaceRenderElement<R>),
     ) {
-        if !self.is_floating_visible() && layer.is_normal() {
+        if !pinned && !self.is_floating_visible() && layer.is_normal() {
             return;
         }
 
@@ -1690,6 +1691,7 @@ impl<W: LayoutElement> Workspace<W> {
             view_rect,
             floating_focus_ring,
             layer,
+            pinned,
             &mut |elem| push(elem.into()),
         );
     }
@@ -1780,9 +1782,11 @@ impl<W: LayoutElement> Workspace<W> {
         tile_size: Size<f64, Logical>,
         tile_pos: Point<f64, Logical>,
         blocker: TransactionBlocker,
+        pinned: bool,
     ) {
-        self.floating
-            .start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
+        self.floating.start_close_animation_for_tile(
+            renderer, snapshot, tile_size, tile_pos, blocker, pinned,
+        );
     }
 
     pub fn start_open_animation(&mut self, id: &W::Id) -> bool {
@@ -1791,14 +1795,14 @@ impl<W: LayoutElement> Workspace<W> {
 
     pub fn window_under(&self, pos: Point<f64, Logical>) -> Option<(&W, HitType)> {
         // This logic is consistent with tiles_with_render_positions().
-        if self.is_floating_visible() {
-            if let Some(rv) = self
-                .floating
-                .tiles_with_render_positions()
-                .find_map(|(tile, tile_pos)| HitType::hit_tile(tile, tile_pos, pos))
-            {
-                return Some(rv);
-            }
+        let visible = self.is_floating_visible();
+        if let Some(rv) = self
+            .floating
+            .tiles_with_stacking_order()
+            .filter(|(_, _, pinned)| *pinned || visible)
+            .find_map(|(tile, tile_pos, _)| HitType::hit_tile(tile, tile_pos, pos))
+        {
+            return Some(rv);
         }
 
         self.scrolling.window_under(pos)

@@ -383,6 +383,31 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg(long))]
         id: Option<u64>,
     },
+    /// Toggle the pin preference of the focused window, or a window selected by id.
+    ///
+    /// With float, toggling off a pinned floating window also moves it to tiling.
+    ToggleWindowPinned {
+        /// Id of the window. If omitted, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+        /// Behavior for tiled windows: ignore, remember, or float.
+        #[serde(default)]
+        #[cfg_attr(feature = "clap", arg(long, default_value = "ignore"))]
+        when_tiled: PinWhenTiled,
+    },
+    /// Set the pin preference, or clear the manual override with auto.
+    SetWindowPinned {
+        /// Id of the window. If omitted, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+        /// Pin preference: on, off, or auto (follow window rules).
+        #[cfg_attr(feature = "clap", arg())]
+        mode: PinMode,
+        /// Behavior for tiled windows: ignore, remember, or float.
+        #[serde(default)]
+        #[cfg_attr(feature = "clap", arg(long, default_value = "ignore"))]
+        when_tiled: PinWhenTiled,
+    },
     /// Focus a window in the focused column by index.
     FocusWindowInColumn {
         /// Index of the window in the column.
@@ -1080,6 +1105,31 @@ pub enum WindowFollowMode {
     IfInvisible,
 }
 
+/// How pin actions interact with the tiling layout.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum PinWhenTiled {
+    /// Do nothing to a tiled window.
+    #[default]
+    Ignore,
+    /// Store the preference without changing the layout.
+    Remember,
+    /// Enabling pinning moves the window to floating; toggling it off also moves it to tiling.
+    Float,
+}
+
+/// A manual pin preference, or a request to follow window rules again.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum PinMode {
+    /// Manually enable pinning.
+    On,
+    /// Manually disable pinning.
+    Off,
+    /// Clear the manual preference and follow current window rules.
+    Auto,
+}
+
 /// Output actions that niri can perform.
 // Variants in this enum should match the spelling of the ones in niri-config. Most thigs from
 // niri-config should be present here.
@@ -1459,6 +1509,10 @@ pub struct Window {
     ///
     /// If the window isn't floating then it is in the tiling layout.
     pub is_floating: bool,
+    /// The window's own pin preference, before floating-state and parent inheritance.
+    /// None means the compositor predates this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<bool>,
     /// When this window follows the focused workspace.
     #[serde(default)]
     pub follow_mode: WindowFollowMode,
@@ -2007,6 +2061,52 @@ impl FromStr for WindowFollowMode {
     }
 }
 
+impl FromStr for PinWhenTiled {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "ignore" => Ok(Self::Ignore),
+            "remember" => Ok(Self::Remember),
+            "float" => Ok(Self::Float),
+            _ => Err(r#"invalid when-tiled value, can be "ignore", "remember" or "float""#),
+        }
+    }
+}
+
+impl std::fmt::Display for PinWhenTiled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Ignore => "ignore",
+            Self::Remember => "remember",
+            Self::Float => "float",
+        })
+    }
+}
+
+impl FromStr for PinMode {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "on" => Ok(Self::On),
+            "off" => Ok(Self::Off),
+            "auto" => Ok(Self::Auto),
+            _ => Err(r#"invalid pin mode, can be "on", "off" or "auto""#),
+        }
+    }
+}
+
+impl std::fmt::Display for PinMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::On => "on",
+            Self::Off => "off",
+            Self::Auto => "auto",
+        })
+    }
+}
+
 impl std::fmt::Display for WindowFollowMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -2238,6 +2338,62 @@ impl OutputAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_actions_and_window_compatibility() {
+        let action: Action = serde_json::from_str(r#"{"ToggleWindowPinned":{"id":42}}"#).unwrap();
+        assert!(matches!(
+            action,
+            Action::ToggleWindowPinned {
+                id: Some(42),
+                when_tiled: PinWhenTiled::Ignore
+            }
+        ));
+        let action = Action::SetWindowPinned {
+            id: Some(42),
+            mode: PinMode::Auto,
+            when_tiled: PinWhenTiled::Remember,
+        };
+        let json = serde_json::to_value(action).unwrap();
+        assert_eq!(json["SetWindowPinned"]["mode"], "Auto");
+        assert_eq!(json["SetWindowPinned"]["when_tiled"], "Remember");
+        let old = r#"{"id":1,"title":null,"app_id":null,"pid":null,"workspace_id":null,
+            "is_focused":false,"is_floating":false,"is_urgent":false,"layout":{
+                "pos_in_scrolling_layout":null,"tile_size":[100,100],"window_size":[100,100],
+                "tile_pos_in_workspace_view":null,"window_offset_in_tile":[0,0]},"focus_timestamp":null}"#;
+        let window: Window = serde_json::from_str(old).unwrap();
+        assert_eq!(window.pinned, None);
+
+        #[cfg(feature = "clap")]
+        {
+            use clap::Parser;
+            let action = Action::try_parse_from([
+                "action",
+                "toggle-window-pinned",
+                "--id",
+                "42",
+                "--when-tiled",
+                "float",
+            ])
+            .unwrap();
+            assert!(matches!(
+                action,
+                Action::ToggleWindowPinned {
+                    id: Some(42),
+                    when_tiled: PinWhenTiled::Float
+                }
+            ));
+            let action = Action::try_parse_from(["action", "set-window-pinned", "auto"]).unwrap();
+            assert!(matches!(
+                action,
+                Action::SetWindowPinned {
+                    id: None,
+                    mode: PinMode::Auto,
+                    when_tiled: PinWhenTiled::Ignore
+                }
+            ));
+        }
+    }
 
     #[test]
     fn screenshot_window_options_are_backwards_compatible() {

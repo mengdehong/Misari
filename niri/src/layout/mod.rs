@@ -78,7 +78,6 @@ use crate::window::ResolvedWindowRules;
 pub mod closing_window;
 pub mod floating;
 pub mod focus_ring;
-mod follow;
 pub mod insert_hint_element;
 pub mod monitor;
 pub mod opening_window;
@@ -86,6 +85,7 @@ pub mod scrolling;
 pub mod shadow;
 pub mod tab_indicator;
 pub mod tile;
+mod window_behavior;
 pub mod workspace;
 
 #[cfg(test)]
@@ -358,7 +358,7 @@ pub struct Layout<W: LayoutElement> {
     /// simply ignored.
     last_active_workspace_id: HashMap<String, WorkspaceId>,
     /// Last workspace activation state processed by window following.
-    follow_context: follow::FollowContext,
+    follow_context: window_behavior::FollowContext,
     /// Ongoing interactive move.
     interactive_move: Option<InteractiveMoveState<W>>,
     /// Ongoing drag-and-drop operation.
@@ -4841,6 +4841,8 @@ impl<W: LayoutElement> Layout<W> {
                 let tile_pos = move_.tile_render_location(zoom);
                 let tile_size = move_.tile.tile_size();
 
+                let pinned = move_.is_floating && move_.tile.is_pinned();
+
                 let output = move_.output.clone();
                 let pointer_pos_within_output = move_.pointer_pos_within_output;
                 let Some(mon) = self.monitor_for_output_mut(&output) else {
@@ -4853,7 +4855,9 @@ impl<W: LayoutElement> Layout<W> {
                 let ws = &mut mon.workspaces[idx];
 
                 let tile_pos = tile_pos - ws_geo.loc;
-                ws.start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
+                ws.start_close_animation_for_tile(
+                    renderer, snapshot, tile_size, tile_pos, blocker, pinned,
+                );
                 return;
             }
         }

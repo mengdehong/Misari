@@ -8,8 +8,8 @@ use knuffel::errors::DecodeError;
 use knuffel::Decode as _;
 use miette::miette;
 use niri_ipc::{
-    ColumnDisplay, LayoutSwitchTarget, PositionChange, SizeChange, WindowFollowMode,
-    WorkspaceReferenceArg,
+    ColumnDisplay, LayoutSwitchTarget, PinMode, PinWhenTiled, PositionChange, SizeChange,
+    WindowFollowMode, WorkspaceReferenceArg,
 };
 use smithay::input::keyboard::keysyms::KEY_NoSymbol;
 use smithay::input::keyboard::xkb::{keysym_from_name, KEYSYM_CASE_INSENSITIVE, KEYSYM_NO_FLAGS};
@@ -190,6 +190,15 @@ pub enum Action {
     ToggleWindowFollow,
     #[knuffel(skip)]
     ToggleWindowFollowById(u64),
+    ToggleWindowPinned(#[knuffel(property(name = "when-tiled"), str, default)] PinWhenTiled),
+    #[knuffel(skip)]
+    ToggleWindowPinnedById(u64, PinWhenTiled),
+    SetWindowPinned(
+        #[knuffel(argument, str)] PinMode,
+        #[knuffel(property(name = "when-tiled"), str, default)] PinWhenTiled,
+    ),
+    #[knuffel(skip)]
+    SetWindowPinnedById(u64, PinMode, PinWhenTiled),
     FocusWindowInColumn(#[knuffel(argument)] u8),
     FocusWindowPrevious,
     FocusColumnLeft,
@@ -511,6 +520,24 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::ToggleWindowFollow { id: Some(id) } => {
                 Self::ToggleWindowFollowById(id)
             }
+            niri_ipc::Action::ToggleWindowPinned {
+                id: None,
+                when_tiled,
+            } => Self::ToggleWindowPinned(when_tiled),
+            niri_ipc::Action::ToggleWindowPinned {
+                id: Some(id),
+                when_tiled,
+            } => Self::ToggleWindowPinnedById(id, when_tiled),
+            niri_ipc::Action::SetWindowPinned {
+                id: None,
+                mode,
+                when_tiled,
+            } => Self::SetWindowPinned(mode, when_tiled),
+            niri_ipc::Action::SetWindowPinned {
+                id: Some(id),
+                mode,
+                when_tiled,
+            } => Self::SetWindowPinnedById(id, mode, when_tiled),
             niri_ipc::Action::FocusWindowInColumn { index } => Self::FocusWindowInColumn(index),
             niri_ipc::Action::FocusWindowPrevious {} => Self::FocusWindowPrevious,
             niri_ipc::Action::FocusColumnLeft {} => Self::FocusColumnLeft,

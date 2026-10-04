@@ -638,6 +638,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pinned_rules_and_actions() {
+        use niri_ipc::{PinMode, PinWhenTiled};
+
+        let config = Config::parse_mem(
+            r#"
+            window-rule { match app-id="^mpv$"; pinned true; }
+            binds {
+                Mod+MouseMiddle { toggle-window-pinned; }
+                Mod+P { toggle-window-pinned when-tiled="remember"; }
+                Mod+Shift+P { toggle-window-pinned when-tiled="float"; }
+                Mod+O { set-window-pinned "on" when-tiled="float"; }
+                Mod+A { set-window-pinned "auto"; }
+            }
+        "#,
+        )
+        .unwrap();
+        assert_eq!(config.window_rules[0].pinned, Some(true));
+        let actions: Vec<_> = config.binds.0.into_iter().map(|bind| bind.action).collect();
+        assert_eq!(
+            actions,
+            [
+                Action::ToggleWindowPinned(PinWhenTiled::Ignore),
+                Action::ToggleWindowPinned(PinWhenTiled::Remember),
+                Action::ToggleWindowPinned(PinWhenTiled::Float),
+                Action::SetWindowPinned(PinMode::On, PinWhenTiled::Float),
+                Action::SetWindowPinned(PinMode::Auto, PinWhenTiled::Ignore),
+            ]
+        );
+        for invalid in [
+            r#"binds { Mod+P { toggle-window-pinned when-tiled="invalid"; } }"#,
+            r#"binds { Mod+P { set-window-pinned "invalid"; } }"#,
+            r#"window-rule { pinned "true"; }"#,
+        ] {
+            assert!(Config::parse_mem(invalid).is_err());
+        }
+    }
+
+    #[test]
     fn can_create_default_config() {
         let _ = Config::load_default();
     }
@@ -1839,6 +1877,7 @@ mod tests {
                     on_xdg_activate: Some(
                         Ignore,
                     ),
+                    pinned: None,
                     min_width: None,
                     min_height: None,
                     max_width: None,

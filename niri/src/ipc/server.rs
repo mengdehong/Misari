@@ -579,6 +579,7 @@ fn make_ipc_window(
         workspace_id: workspace_id.map(|id| id.get()),
         is_focused: mapped.is_focused(),
         is_floating: mapped.is_floating(),
+        pinned: Some(tile.is_pinned()),
         follow_mode: tile.follow_mode(),
         is_urgent: mapped.is_urgent(),
         layout,
@@ -777,6 +778,7 @@ impl State {
             let mut changed = ipc_win.workspace_id != workspace_id
                 || ipc_win.is_floating != mapped.is_floating()
                 || ipc_win.follow_mode != tile.follow_mode();
+            changed |= ipc_win.pinned != Some(tile.is_pinned());
 
             changed |= with_toplevel_role(mapped.toplevel(), |role| {
                 ipc_win.title != role.title || ipc_win.app_id != role.app_id

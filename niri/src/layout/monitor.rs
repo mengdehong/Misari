@@ -1707,14 +1707,16 @@ impl<W: LayoutElement> Monitor<W> {
         };
 
         // Draw in passes for correct Z ordering during window movement between workspaces:
-        // - floating windows moving between workspaces
-        // - normal floating windows
+        // - pinned floating windows moving between workspaces
+        // - stationary pinned floating windows
+        // - unpinned floating windows moving between workspaces
+        // - stationary unpinned floating windows
         // - scrolling windows moving between workspaces
         // - normal scrolling windows
-        for pass in 0..4 {
+        for pass in 0..6 {
             // Don't cull when drawing windows moving between workspaces so that windows moving to
             // workspaces off-screen will still render.
-            let cull = matches!(pass, 1 | 3);
+            let cull = matches!(pass, 1 | 3 | 5);
 
             // Crop the elements to prevent them overflowing, currently visible during a workspace
             // switch.
@@ -1762,25 +1764,27 @@ impl<W: LayoutElement> Monitor<W> {
                 let xray_pos = XrayPos::new(geo.loc, zoom);
 
                 match pass {
-                    0 => {
+                    0 | 2 => {
                         ws.render_floating(
                             ctx.r(),
                             xray_pos,
                             focus_ring,
                             RenderLayer::MovingBetweenWorkspaces,
+                            pass == 0,
                             push!(),
                         );
                     }
-                    1 => {
+                    1 | 3 => {
                         ws.render_floating(
                             ctx.r(),
                             xray_pos,
                             focus_ring,
                             RenderLayer::Normal,
+                            pass == 1,
                             push!(),
                         );
 
-                        if let Some(loc) = insert_hint_render_loc {
+                        if let Some(loc) = insert_hint_render_loc.filter(|_| pass == 3) {
                             if loc.workspace == InsertWorkspace::Existing(ws.id()) {
                                 self.insert_hint_element.render(
                                     ctx.renderer,
@@ -1790,7 +1794,7 @@ impl<W: LayoutElement> Monitor<W> {
                             }
                         }
                     }
-                    2 => {
+                    4 => {
                         ws.render_scrolling(
                             ctx.r(),
                             xray_pos,

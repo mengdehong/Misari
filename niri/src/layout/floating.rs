@@ -51,8 +51,8 @@ pub struct FloatingSpace<W: LayoutElement> {
     /// Ongoing interactive resize.
     interactive_resize: Option<InteractiveResize<W>>,
 
-    /// Windows in the closing animation.
-    closing_windows: Vec<ClosingWindow>,
+    /// Closing windows and their effective pin group frozen before unmapping.
+    closing_windows: Vec<(ClosingWindow, bool)>,
 
     /// View size for this space.
     view_size: Size<f64, Logical>,
@@ -252,7 +252,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
             tile.advance_animations();
         }
 
-        self.closing_windows.retain_mut(|closing| {
+        self.closing_windows.retain_mut(|(closing, _)| {
             closing.advance_animations();
             closing.are_animations_ongoing()
         });
@@ -311,13 +311,45 @@ impl<W: LayoutElement> FloatingSpace<W> {
     pub fn tiles_with_render_positions(
         &self,
     ) -> impl Iterator<Item = (&Tile<W>, Point<f64, Logical>)> {
+        self.tiles_with_stacking_order()
+            .map(|(tile, pos, _)| (tile, pos))
+    }
+
+    /// Effective pin preferences including floating transient descendants.
+    fn effective_pinned_states(&self) -> Vec<bool> {
+        let mut pinned: Vec<_> = self.tiles.iter().map(Tile::is_pinned).collect();
+        // Parent-before-child in reverse order follows the existing stacking invariant.
+        for parent in (0..self.tiles.len()).rev() {
+            if !pinned[parent] {
+                continue;
+            }
+            for (child, tile) in self.tiles.iter().enumerate().take(parent) {
+                if tile.window().is_child_of(self.tiles[parent].window()) {
+                    pinned[child] = true;
+                }
+            }
+        }
+        pinned
+    }
+
+    /// Front-to-back order shared by rendering, visibility and input hit testing.
+    pub fn tiles_with_stacking_order(
+        &self,
+    ) -> impl Iterator<Item = (&Tile<W>, Point<f64, Logical>, bool)> {
         let scale = self.scale;
-        self.tiles_with_offsets().map(move |(tile, offset)| {
-            let pos = offset + tile.render_offset();
-            // Round to physical pixels.
-            let pos = pos.to_physical_precise_round(scale).to_logical(scale);
-            (tile, pos)
-        })
+        let mut tiles: Vec<_> = self
+            .tiles_with_offsets()
+            .zip(self.effective_pinned_states())
+            .map(move |((tile, offset), pinned)| {
+                let pos = offset + tile.render_offset();
+                // Round to physical pixels.
+                let pos = pos.to_physical_precise_round(scale).to_logical(scale);
+                (tile, pos, pinned)
+            })
+            .collect();
+        // Stable sorting preserves the existing order within each pin group.
+        tiles.sort_by_key(|(_, _, pinned)| !*pinned);
+        tiles.into_iter()
     }
 
     pub fn tiles_with_render_positions_mut(
@@ -557,6 +589,8 @@ impl<W: LayoutElement> FloatingSpace<W> {
         id: &W::Id,
         blocker: TransactionBlocker,
     ) {
+        let idx = self.idx_of(id).unwrap();
+        let pinned = self.effective_pinned_states()[idx];
         let (tile, tile_pos) = self
             .tiles_with_render_positions_mut(false)
             .find(|(tile, _)| tile.window().id() == id)
@@ -568,7 +602,9 @@ impl<W: LayoutElement> FloatingSpace<W> {
 
         let tile_size = tile.tile_size();
 
-        self.start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
+        self.start_close_animation_for_tile(
+            renderer, snapshot, tile_size, tile_pos, blocker, pinned,
+        );
     }
 
     pub fn activate_window_without_raising(&mut self, id: &W::Id) -> bool {
@@ -608,6 +644,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         tile_size: Size<f64, Logical>,
         tile_pos: Point<f64, Logical>,
         blocker: TransactionBlocker,
+        pinned: bool,
     ) {
         let anim = Animation::new(
             self.clock.clone(),
@@ -629,7 +666,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         );
         match res {
             Ok(closing) => {
-                self.closing_windows.push(closing);
+                self.closing_windows.push((closing, pinned));
             }
             Err(err) => {
                 warn!("error creating a closing window animation: {err:?}");
@@ -1065,6 +1102,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         true
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn render<R: NiriRenderer>(
         &self,
         mut ctx: RenderCtx<R>,
@@ -1072,6 +1110,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         view_rect: Rectangle<f64, Logical>,
         focus_ring: bool,
         layer: RenderLayer,
+        pinned: bool,
         push: &mut dyn FnMut(FloatingSpaceRenderElement<R>),
     ) {
         let scale = Scale::from(self.scale);
@@ -1080,14 +1119,20 @@ impl<W: LayoutElement> FloatingSpace<W> {
         //
         // FIXME: I guess this should rather preserve the stacking order when the window is closed.
         if layer.is_normal() {
-            for closing in self.closing_windows.iter().rev() {
+            for (closing, closing_pinned) in self.closing_windows.iter().rev() {
+                if *closing_pinned != pinned {
+                    continue;
+                }
                 let elem = closing.render(ctx.as_gles(), view_rect, scale);
                 push(elem.into());
             }
         }
 
         let active = self.active_window_id.clone();
-        for (tile, tile_pos) in self.tiles_with_render_positions() {
+        for (tile, tile_pos, tile_pinned) in self.tiles_with_stacking_order() {
+            if tile_pinned != pinned {
+                continue;
+            }
             // Skip tiles belonging to a different render layer.
             if layer.is_normal() == tile.is_moving_between_workspaces() {
                 continue;

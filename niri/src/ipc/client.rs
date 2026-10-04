@@ -830,6 +830,9 @@ fn print_window(window: &Window) {
         if window.is_floating { "yes" } else { "no" }
     );
     println!("  Follow mode: {}", window.follow_mode);
+    if let Some(pinned) = window.pinned {
+        println!("  Pinned: {}", if pinned { "yes" } else { "no" });
+    }
 
     if let Some(pid) = window.pid {
         println!("  PID: {pid}");

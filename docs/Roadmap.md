@@ -7,6 +7,7 @@
 - [x] **[focus-or-spawn](feat/window-focus-or-spawn.md)**：有窗口时切到它所在的工作区，没有时启动应用；启动中的重复请求由动作内部合并。
 - [x] **[窗口暂存与召回](feat/window-stash-recall.md)**：通过命名工作区暂存窗口，按条件召回到当前工作区；无匹配窗口时可启动应用并在窗口出现后召回。
 - [x] **[窗口跟随](feat/window-follow.md)**：通过窗口规则自动开启始终跟随或按需跟随，也支持 CLI／KDL／IPC 临时调整，切换工作区或显示器时保持窗口可用。
+- [x] **[窗口置顶](feat/window-pinned.md)**：浮动窗口可覆盖全屏应用；支持规则、快捷键与 CLI／IPC，Mod+中键可往返切换浮动置顶和平铺。
 - [x] **[Agent 指定窗口截图](feat/window-screenshot.md)**：复用窗口查询选择目标，支持静默截图、等待完成并返回保存路径或错误。
 
 ## Niri 原生

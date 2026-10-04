@@ -44,6 +44,9 @@ pub struct Tile<W: LayoutElement> {
     /// When this tile follows the focused workspace. Kept across layout moves.
     pub(super) follow_mode: WindowFollowMode,
 
+    /// Manual pin preference; None follows the current window rules.
+    pub(super) pinned_override: Option<bool>,
+
     /// The border around the window.
     border: FocusRing,
 
@@ -199,6 +202,7 @@ impl<W: LayoutElement> Tile<W> {
         Self {
             window,
             follow_mode,
+            pinned_override: None,
             border: FocusRing::new(border_config.into()),
             focus_ring: FocusRing::new(focus_ring_config),
             shadow: Shadow::new(shadow_config),
@@ -717,6 +721,13 @@ impl<W: LayoutElement> Tile<W> {
 
     pub fn follow_mode(&self) -> WindowFollowMode {
         self.follow_mode
+    }
+
+    /// The window's own pin preference, including when it is temporarily tiled.
+    /// Transient children inherit their parent's effective stacking group separately.
+    pub fn is_pinned(&self) -> bool {
+        self.pinned_override
+            .unwrap_or(self.window.rules().pinned.unwrap_or(false))
     }
 
     pub fn sizing_mode(&self) -> SizingMode {
