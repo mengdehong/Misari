@@ -1,0 +1,22 @@
+[package]
+name = "we-web"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+
+[dependencies]
+anyhow = "1"
+cef = { version = "=154.4.0", default-features = false }
+libc = "0.2"
+libpulse-binding = { version = "2.30", default-features = false }
+libpulse-simple-binding = { version = "2.29", default-features = false }
+memmap2 = "0.9"
+serde_json = "1"
+url = "2"
+
+[[test]]
+name = "runtime"
+harness = false
+
+[dev-dependencies]
+tempfile = "3"

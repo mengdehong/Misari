@@ -1,0 +1,63 @@
+# wallpaperd 配置文件示例
+# 目标路径: $XDG_CONFIG_HOME/misari/wallpaperd.toml (默认 ~/.config/misari/wallpaperd.toml)
+# 修改配置后需重启 wallpaperd 服务生效: systemctl --user restart wallpaperd
+
+# 壁纸素材扫描目录列表（支持绝对路径或 ~/path）
+# wallpaperd list 会自动扫描其中的图片、视频、GIF、Shader 及 Wallpaper Engine 壁纸
+# 自动探测 `~/.local/share/Steam、~/.steam/steam、~/Share/Steam` 目录中的 steamapps/workshop/content/431960（Wallpaper Engine 创意工坊壁纸）：
+# 其他磁盘或自定义库需手动添加对应的 431960 目录
+asset_dirs = [
+    # "~/Pictures/Wallpapers",
+    # "/mnt/games/SteamLibrary/steamapps/workshop/content/431960",
+]
+
+# 默认壁纸路径（可选）
+# default = "~/Pictures/Wallpapers/default.jpg"
+
+# 默认适配方式: "cover"（裁切填满）| "contain"（完整显示）| "stretch"（拉伸）
+fit = "cover"
+
+# 默认切换效果: "cut" | "fade" | "disc" | "honeycomb" | "spiral" | "stripes"
+transition = "cut"
+
+# 自动暂停与静音策略
+# 锁屏、会话不活跃、休眠时自动暂停（默认: true）
+pause_on_session = true
+
+# 当前工作区存在全屏窗口时自动暂停（默认: true）
+pause_on_fullscreen = true
+
+# 系统中有其他应用播放声音时自动静音壁纸（默认: true）
+mute_on_other_audio = true
+
+# 是否启用 MPRIS 媒体联动（默认: true）
+# 自动监听音乐播放器的元数据、播放状态、进度条与专辑封面，并分发给支持的场景与 Web 壁纸
+media_integration = true
+
+# 全局默认播放设置
+[playback]
+# 渲染帧率上限，取值范围 1 ~ 240（默认: 30）
+fps = 30
+
+# 是否静音（默认: true）
+mute = true
+
+# 播放音量，取值范围 0 ~ 100（默认: 100）
+volume = 100
+
+# 启动时是否默认暂停（默认: false）
+paused = false
+
+# Wallpaper Engine 相关配置
+[wallpaper_engine]
+# Wallpaper Engine 核心 assets 资源目录（可选，支持绝对路径或 ~/path）
+# 可自行指定路径：
+# assets = "~/.local/share/Steam/steamapps/common/wallpaper_engine/assets"
+
+# 按显示输出配置默认壁纸与适配方式（输出名称可通过 wallpaperd status 查看）
+# 未设置的字段继承全局 default、fit；default 支持绝对路径或 ~/path
+# 已保存的逐屏壁纸及适配方式优先；已主动关闭的壁纸保持关闭
+# 显式 --fit 优先于逐屏及全局 fit；轮播继续使用自身的 fit、transition 设置
+# [outputs."DP-1"]
+# default = "~/Pictures/Wallpapers/portrait.jpg"
+# fit = "contain"

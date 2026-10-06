@@ -1,0 +1,35 @@
+[general]
+backend = "layer_shell"
+fps_limit = 60
+restart_wine_on_exit = false
+refind_window_on_capture_error = true
+scale_mode = "cover"
+hide_debug_window = false
+disable_debug_window_input = true
+
+[isolation]
+mode = "gamescope_headless"
+command = "/usr/bin/gamescope"
+startup_timeout_secs = 30
+
+[wine]
+command = "/usr/bin/wine"
+command_mode = "exe_with_args"
+wallpaper_exe = "/home/wenmou/Share/Steam/steamapps/common/wallpaper_engine/wallpaper64.exe"
+args = []
+
+[wine.env]
+WINEPREFIX = "/home/wenmou/.cache/oh-my-niri/wallpaperd-compare/wine-prefix"
+WINEDEBUG = "-all"
+WINEDLLOVERRIDES = "winemenubuilder.exe=d;mscoree,mshtml="
+
+[capture]
+wm_class_contains = "wallpaper64"
+title_contains = "WE-DEBUG-WINDOW"
+
+[runtime]
+mode = "wine_layerd"
+wallpaper_type = "web"
+
+[cgroup]
+enabled = false

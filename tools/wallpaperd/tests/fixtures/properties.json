@@ -1,0 +1,151 @@
+{
+  "type": "scene",
+  "general": {
+    "properties": {
+      "_01": {
+        "fraction": true,
+        "index": 29,
+        "max": 15,
+        "min": 0,
+        "order": 129,
+        "precision": 2,
+        "step": 0.1,
+        "text": "<big><b>🔘组件随音频感应变化大小（拉至0取消）",
+        "type": "slider",
+        "value": 1.4
+      },
+      "b": {
+        "index": 6,
+        "order": 106,
+        "text": "<center><big><b>🔻我的个人主页🔻<br/><a href='https://space.bilibili.com/279406515?spm_id_from=333.1007.0.0'>夜莺Night的个人空间 (点击跳转)</a><big></p>",
+        "type": "text",
+        "value": ""
+      },
+      "b1": {
+        "condition": "time.value",
+        "index": 65,
+        "options": [
+          {
+            "label": "字体1",
+            "value": "1"
+          },
+          {
+            "label": "字体2",
+            "value": "2"
+          },
+          {
+            "label": "字体3",
+            "value": "3"
+          },
+          {
+            "label": "字体4",
+            "value": "4"
+          },
+          {
+            "label": "字体5",
+            "value": "5"
+          }
+        ],
+        "order": 165,
+        "text": "<b>🔘时间组件字体Time component font",
+        "type": "combo",
+        "value": "5"
+      },
+      "h3brmainsettingsbrh3": {
+        "index": 13,
+        "order": 113,
+        "text": "⚙️主要设置/Main settings",
+        "type": "group",
+        "value": ""
+      },
+      "music1": {
+        "index": 89,
+        "order": 189,
+        "text": "♪♪音乐/Music",
+        "type": "group",
+        "value": ""
+      },
+      "musicbar": {
+        "index": 30,
+        "order": 130,
+        "text": "<hr/><big><b>🔘音频条 Audio Bar",
+        "type": "bool",
+        "value": true
+      },
+      "newproperty19": {
+        "index": 28,
+        "order": 128,
+        "text": "🔊音频感应设置/Audio induction settings",
+        "type": "group",
+        "value": ""
+      },
+      "newproperty21": {
+        "index": 93,
+        "order": 193,
+        "text": "💴关于赞助/Regarding Sponsorship",
+        "type": "group",
+        "value": ""
+      },
+      "newproperty4": {
+        "condition": "musicbar.value",
+        "index": 31,
+        "options": [
+          {
+            "label": "样式1",
+            "value": "0"
+          },
+          {
+            "label": "样式2",
+            "value": "1"
+          },
+          {
+            "label": "样式3",
+            "value": "2"
+          }
+        ],
+        "order": 131,
+        "text": "<b>🔘音频条样式",
+        "type": "combo",
+        "value": "1"
+      },
+      "newproperty5": {
+        "index": 35,
+        "order": 135,
+        "text": "🌐组件设置/ Component Settings",
+        "type": "group",
+        "value": ""
+      },
+      "newproperty50": {
+        "index": 42,
+        "order": 142,
+        "text": "<hr><big><b>🔘组件自定义文字",
+        "type": "bool",
+        "value": true
+      },
+      "newproperty51": {
+        "condition": "newproperty50.value",
+        "index": 45,
+        "order": 145,
+        "text": "自定义文字1颜色",
+        "type": "color",
+        "value": "0.6431372549019608 0.8627450980392157 0.8588235294117647"
+      },
+      "newproperty55": {
+        "condition": "newproperty50.value",
+        "index": 43,
+        "order": 143,
+        "text": "<b>自定义文字",
+        "type": "textinput",
+        "value": "Bilibili/抖音 夜莺Night"
+      },
+      "time": {
+        "condition": "",
+        "index": 64,
+        "order": 164,
+        "text": "<big><b>🔘时间组件显示Time component display",
+        "type": "bool",
+        "value": true
+      }
+    }
+  }
+}
