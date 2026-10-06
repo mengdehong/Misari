@@ -126,3 +126,52 @@ fn other_audio_mutes_without_pausing_and_preserves_user_choice() {
             && state["outputs"]["winit"]["mute"] == true
     });
 }
+
+#[test]
+#[ignore = "requires headless Weston, ffmpeg and WALLPAPERD_TEST_NIRI"]
+fn video_pixels_loop_pause_and_resume() {
+    let mut rig = Rig::new();
+    let video = rig.root().join("loop.mkv");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=red:s=64x64:r=20:d=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=lime:s=64x64:r=20:d=1",
+            "-filter_complex",
+            "[0:v][1:v]concat=n=2:v=1:a=0",
+            "-c:v",
+            "ffv1",
+            "-colorspace",
+            "smpte170m",
+            "-y",
+        ])
+        .arg(&video)
+        .output()
+        .unwrap();
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    rig.set(&video, "cut", 20);
+    rig.wait_corner([255, 0, 0]);
+    rig.wait_corner([0, 255, 0]);
+    rig.wait_corner([255, 0, 0]); // The decoder must loop, not freeze on the last frame.
+    rig.ok(&["pause"]);
+    thread::sleep(Duration::from_millis(200));
+    let paused = rig.shot();
+    let frames = rig.frames();
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(rig.shot(), paused);
+    assert_eq!(rig.frames(), frames);
+    rig.ok(&["resume"]);
+    rig.wait_corner([0, 255, 0]);
+}

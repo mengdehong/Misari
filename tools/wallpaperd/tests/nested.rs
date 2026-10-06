@@ -39,6 +39,11 @@ struct Rig {
 }
 
 impl Rig {
+    fn binary() -> OsString {
+        std::env::var_os("WALLPAPERD_TEST_BINARY")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_wallpaperd").into())
+    }
+
     fn new() -> Self {
         let niri = std::env::var_os("WALLPAPERD_TEST_NIRI").expect("set WALLPAPERD_TEST_NIRI");
         let parent_runtime = std::env::var_os("XDG_RUNTIME_DIR").expect("Wayland session required");
@@ -143,7 +148,7 @@ impl Rig {
             .open(self.root().join("wallpaperd.log"))
             .unwrap();
         self.daemon = Some(
-            Command::new(env!("CARGO_BIN_EXE_wallpaperd"))
+            Command::new(Self::binary())
                 .arg("serve")
                 .env("WAYLAND_DEBUG", "client")
                 .envs(self.env.iter().cloned())
@@ -168,7 +173,7 @@ impl Rig {
     }
 
     fn cli(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_wallpaperd"))
+        Command::new(Self::binary())
             .args(args)
             .envs(self.env.iter().cloned())
             .output()

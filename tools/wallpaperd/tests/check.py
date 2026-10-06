@@ -18,6 +18,7 @@ AUDIO = ["pipewire", "pipewire-pulse", "wireplumber", "pactl", "paplay"]
 # Each suite owns its Cargo selection and required programs. Weston means headless.
 GROUPS = {
     "nested": (["--test", "nested"], ["weston", "dbus-run-session", "weston-simple-shm", *AUDIO]),
+    "video": (["--test", "nested", "video_pixels_"], ["weston", "ffmpeg"]),
     "properties": (["--test", "nested", "rust_properties_"], ["weston"]),
     "mouse": (["--test", "nested", "mouse_"], ["weston", "weston-simple-shm"]),
     "library": (["--test", "nested", "library_import_"], ["weston"]),
