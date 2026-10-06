@@ -32,6 +32,7 @@ pub mod animations;
 pub mod appearance;
 pub mod binds;
 pub mod debug;
+pub mod edge_scroll;
 pub mod error;
 pub mod gestures;
 pub mod input;
@@ -49,6 +50,7 @@ pub use crate::animations::{Animation, Animations};
 pub use crate::appearance::*;
 pub use crate::binds::*;
 pub use crate::debug::Debug;
+pub use crate::edge_scroll::{EdgeScrollRule, ScreenEdge};
 pub use crate::error::{ConfigIncludeError, ConfigParseResult};
 pub use crate::gestures::Gestures;
 pub use crate::input::{Input, ModKey, ScrollMethod, TrackLayout, WarpMouseToFocusMode, Xkb};
@@ -90,6 +92,7 @@ pub struct Config {
     pub layer_rules: Vec<LayerRule>,
     pub binds: Binds,
     pub modifier_binds: ModifierBinds,
+    pub edge_scroll: Vec<EdgeScrollRule>,
     pub switch_events: SwitchBinds,
     pub debug: Debug,
     pub workspaces: Vec<Workspace>,
@@ -170,6 +173,7 @@ where
                     | "spawn-sh-at-startup"
                     | "window-rule"
                     | "layer-rule"
+                    | "edge-scroll"
                     | "workspace"
                     | "include"
             ) && !seen.insert(name)
@@ -220,6 +224,39 @@ where
                 "window-rule" => m_push!(window_rules),
                 "layer-rule" => m_push!(layer_rules),
                 "workspace" => m_push!(workspaces),
+                "edge-scroll" => {
+                    let rule = EdgeScrollRule::decode_node(node, ctx)?;
+                    if rule.width.0 <= 0.
+                        || rule.output.as_deref() == Some("")
+                        || rule.binds.0.is_empty()
+                    {
+                        return Err(DecodeError::unexpected(
+                            node,
+                            "edge-scroll rule",
+                            "expected a positive width, a non-empty output name when set, and at least one scroll bind",
+                        ));
+                    }
+                    if rule.binds.0.iter().any(|bind| {
+                        !matches!(
+                            bind.key.trigger,
+                            Trigger::WheelScrollUp
+                                | Trigger::WheelScrollDown
+                                | Trigger::WheelScrollLeft
+                                | Trigger::WheelScrollRight
+                                | Trigger::TouchpadScrollUp
+                                | Trigger::TouchpadScrollDown
+                                | Trigger::TouchpadScrollLeft
+                                | Trigger::TouchpadScrollRight
+                        )
+                    }) {
+                        return Err(DecodeError::unexpected(
+                            node,
+                            "edge-scroll bind",
+                            "only WheelScroll and TouchpadScroll triggers are supported",
+                        ));
+                    }
+                    config.borrow_mut().edge_scroll.push(rule);
+                }
 
                 // Single-part sections.
                 "binds" => {
@@ -2309,6 +2346,7 @@ mod tests {
             modifier_binds: ModifierBinds(
                 [],
             ),
+            edge_scroll: [],
             switch_events: SwitchBinds {
                 lid_open: None,
                 lid_close: None,

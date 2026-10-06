@@ -40,6 +40,27 @@ binds {
     F10 hotkey-overlay-title="Exit development niri" { quit skip-confirmation=true; }
 }
 
+// Screen-edge scrolling: volume, or Shift + scroll for per-monitor brightness.
+edge-scroll "top" width=4 {
+    binds {
+        WheelScrollUp cooldown-ms=50 { spawn "noctalia" "msg" "volume-up" "2%"; }
+        WheelScrollDown cooldown-ms=50 { spawn "noctalia" "msg" "volume-down" "2%"; }
+        TouchpadScrollUp cooldown-ms=50 { spawn "noctalia" "msg" "volume-up" "2%"; }
+        TouchpadScrollDown cooldown-ms=50 { spawn "noctalia" "msg" "volume-down" "2%"; }
+    }
+}
+
+// Replace eDP-1 with the connector name from `niri msg outputs`.
+// Add a region for each monitor whose brightness should be adjustable.
+edge-scroll "top" width=4 output="eDP-1" {
+    binds {
+        Shift+WheelScrollUp cooldown-ms=50 { spawn "noctalia" "msg" "brightness-up" "eDP-1" "2%"; }
+        Shift+WheelScrollDown cooldown-ms=50 { spawn "noctalia" "msg" "brightness-down" "eDP-1" "2%"; }
+        Shift+TouchpadScrollUp cooldown-ms=50 { spawn "noctalia" "msg" "brightness-up" "eDP-1" "2%"; }
+        Shift+TouchpadScrollDown cooldown-ms=50 { spawn "noctalia" "msg" "brightness-down" "eDP-1" "2%"; }
+    }
+}
+
 recent-windows {
     binds {
         Alt+Tab { next-window scope="workspace"; }

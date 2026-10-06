@@ -138,6 +138,7 @@ use crate::handlers::image_copy_capture::{
     self as image_copy_capture_impl, CaptureBuffer, ImageCopyCursorSession, ImageCopySession,
 };
 use crate::handlers::{configure_lock_surface, XDG_ACTIVATION_TOKEN_TIMEOUT};
+use crate::input::edge_scroll::EdgeScroll;
 use crate::input::pick_color_grab::PickColorGrab;
 use crate::input::scroll_swipe_gesture::ScrollSwipeGesture;
 use crate::input::scroll_tracker::ScrollTracker;
@@ -459,6 +460,7 @@ pub struct Niri {
     pub vertical_finger_scroll_tracker: ScrollTracker,
     pub horizontal_finger_scroll_tracker: ScrollTracker,
     pub mods_with_finger_scroll_binds: HashSet<Modifiers>,
+    pub edge_scroll: EdgeScroll,
 
     pub lock_state: LockState,
 
@@ -1803,6 +1805,7 @@ impl State {
 
         self.niri.config_error_notification.hide();
         self.niri.modifier_press = None;
+        self.niri.edge_scroll.cancel();
 
         // Find & orphan removed named workspaces.
         let mut removed_workspaces: Vec<String> = vec![];
@@ -3004,6 +3007,8 @@ impl Niri {
             vertical_finger_scroll_tracker: ScrollTracker::new(10),
             horizontal_finger_scroll_tracker: ScrollTracker::new(10),
             mods_with_finger_scroll_binds,
+
+            edge_scroll: EdgeScroll::default(),
 
             lock_state: LockState::Unlocked,
             locked_hint: None,

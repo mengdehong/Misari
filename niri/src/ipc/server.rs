@@ -637,6 +637,7 @@ impl State {
     }
 
     pub fn ipc_refresh_layout(&mut self) {
+        self.refresh_edge_scroll();
         self.ipc_refresh_workspaces();
         self.ipc_refresh_windows();
         self.ipc_refresh_overview();

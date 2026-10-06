@@ -58,6 +58,7 @@ use crate::utils::{center, get_monotonic_time, CastSessionId, ResizeEdge};
 
 pub mod backend_ext;
 pub mod click_grab;
+pub mod edge_scroll;
 pub mod move_grab;
 pub mod pick_color_grab;
 pub mod pick_window_grab;
@@ -301,6 +302,7 @@ impl State {
 
     fn on_device_removed(&mut self, device: impl Device) {
         self.niri.modifier_press = None;
+        self.niri.edge_scroll.remove_device(&device.id());
         if device.has_capability(DeviceCapability::TabletTool) {
             let tablet_seat = self.niri.seat.tablet_seat();
 
@@ -3278,6 +3280,10 @@ impl State {
         // axis event to reach the window.
         self.niri.pointer_visibility = PointerVisibility::Visible;
         self.niri.tablet_cursor_location = None;
+
+        if self.on_edge_scroll::<I>(&event) {
+            return;
+        }
 
         let timestamp = Duration::from_micros(event.time().micros());
 

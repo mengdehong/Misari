@@ -1,6 +1,7 @@
 use smithay::backend::input::{
-    ButtonState, Device, DeviceCapability, Event, InputBackend, InputTime, KeyState,
-    KeyboardKeyEvent, Keycode, PointerButtonEvent, UnusedEvent,
+    Axis, AxisRelativeDirection, AxisSource, ButtonState, Device, DeviceCapability, Event,
+    InputBackend, InputTime, KeyState, KeyboardKeyEvent, Keycode, PointerAxisEvent,
+    PointerButtonEvent, UnusedEvent,
 };
 use smithay::output::Output;
 
@@ -21,6 +22,46 @@ pub struct TestKeyboardKeyEvent {
 pub struct TestPointerButtonEvent {
     pub code: u32,
     pub state: ButtonState,
+}
+
+pub struct TestPointerAxisEvent {
+    pub source: AxisSource,
+    pub amounts: [Option<f64>; 2],
+    pub v120: [Option<f64>; 2],
+}
+
+impl Event<TestInputBackend> for TestPointerAxisEvent {
+    fn time(&self) -> InputTime {
+        InputTime::now()
+    }
+
+    fn device(&self) -> TestInputDevice {
+        TestInputDevice
+    }
+}
+
+impl PointerAxisEvent<TestInputBackend> for TestPointerAxisEvent {
+    fn amount(&self, axis: Axis) -> Option<f64> {
+        self.amounts[match axis {
+            Axis::Horizontal => 0,
+            Axis::Vertical => 1,
+        }]
+    }
+
+    fn amount_v120(&self, axis: Axis) -> Option<f64> {
+        self.v120[match axis {
+            Axis::Horizontal => 0,
+            Axis::Vertical => 1,
+        }]
+    }
+
+    fn source(&self) -> AxisSource {
+        self.source
+    }
+
+    fn relative_direction(&self, _axis: Axis) -> AxisRelativeDirection {
+        AxisRelativeDirection::Identical
+    }
 }
 
 impl Event<TestInputBackend> for TestPointerButtonEvent {
@@ -45,7 +86,7 @@ impl InputBackend for TestInputBackend {
     type Device = TestInputDevice;
 
     type KeyboardKeyEvent = TestKeyboardKeyEvent;
-    type PointerAxisEvent = UnusedEvent;
+    type PointerAxisEvent = TestPointerAxisEvent;
     type PointerButtonEvent = TestPointerButtonEvent;
     type PointerMotionEvent = UnusedEvent;
     type PointerMotionAbsoluteEvent = UnusedEvent;
