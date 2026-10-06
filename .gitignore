@@ -17,3 +17,16 @@ target/
 .env
 .env.*
 !.env.example
+output/
+worktrees
+docs/design
+
+# Python bytecode caches.
+__pycache__/
+*.py[cod]
+
+# Arch makepkg outputs.
+/packaging/**/cef_binary_*.tar.bz2
+/packaging/**/src/
+/packaging/**/pkg/
+/packaging/**/*.pkg.tar.*
