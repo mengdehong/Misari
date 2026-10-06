@@ -16,6 +16,6 @@ niri msg action screenshot-window --id 42 --path /tmp/window-42.png --silent --w
 
 `--path` 的父目录须已存在，已有文件会被覆盖；省略时沿用 `screenshot-path`。带 `--wait` 请求写盘但未配置保存路径时返回错误。`--write-to-disk=false` 禁用写盘，等待结果为 `{"path":null}`，普通输出为空；再加 `--silent` 则不会产生文件或剪贴板内容。
 
-IPC 沿用 `Action.ScreenshotWindow`，新增 `silent`、`wait` 两个布尔字段，默认均为 `false`。CLI 将相对路径转为绝对路径，直接调用 IPC 必须传绝对路径。
+IPC 的 `Action.ScreenshotWindow` 接受 `silent`、`wait`，默认均为 `false`。CLI 自动转换相对路径，直接调用 IPC 必须传绝对路径。
 
-`wait=true` 通过当前连接返回 `{"Ok":{"ScreenshotSaved":{"path":"/tmp/window-42.png"}}}` 或 `{"Err":"原因"}`，无需订阅事件流；`wait=false` 仍返回 `Handled`。等待不阻塞桌面事件循环，也不等待桌面通知送达。
+`wait=true` 通过当前连接返回 `{"Ok":{"ScreenshotSaved":{"path":"/tmp/window-42.png"}}}` 或 `{"Err":"原因"}`，无需订阅事件流；`wait=false` 返回 `Handled`。

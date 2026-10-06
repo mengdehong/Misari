@@ -1,0 +1,98 @@
+// 新功能配置示例，按需复制；程序、app-id 和显示器名称按实际环境修改。
+
+binds {
+    // 按条件聚焦：切到目标所在地，不移动窗口。
+    Mod+B { focus-window-matching app-id="^firefox$" title="GitHub"; }
+
+    // 有窗口时聚焦，无窗口时启动；等待期间相同请求去重。
+    Mod+Shift+B { focus-or-spawn "firefox" app-id="^firefox$"; }
+
+    // 召回到当前工作区；附带命令时可在无匹配窗口时启动。
+    Mod+R { recall-window app-id="^firefox$"; }
+    Mod+Shift+R { recall-window "firefox" app-id="^firefox$"; }
+
+    // 跟随：手动切换或指定模式。
+    Mod+F9 repeat=false { toggle-window-follow; }
+    Mod+Shift+F9 repeat=false { set-window-follow "if-invisible"; }
+
+    // 置顶：平铺时浮动并置顶，已置顶时取消并转回平铺。
+    Mod+P repeat=false { toggle-window-pinned when-tiled="float"; }
+    Mod+Shift+P repeat=false { set-window-pinned "auto"; }
+
+    // 静默截图：不修改剪贴板、不发送通知；wait 仅用于 CLI/IPC。
+    Mod+Print { screenshot-window silent=true; }
+
+    // 组合用法：用普通命名工作区暂存窗口，再通过 recall-window 取回。
+    Mod+0 { focus-workspace "stash"; }
+    Mod+Shift+0 repeat=false { move-window-to-workspace "stash" focus=false; }
+}
+
+// 跟随规则只设置新窗口的初始模式，支持浮动和平铺窗口。
+window-rule {
+    match app-id="^mpv$"
+    open-follow-mode "if-invisible"
+}
+
+// 置顶规则只控制层级，仅浮动时生效。
+window-rule {
+    match app-id="^firefox$" title="^Picture-in-Picture$"
+    pinned true
+}
+
+// 修饰键独按：短按打开概览，长按显示快捷键；参与组合键时不触发。
+modifier-binds {
+    Super_L long-press-ms=400 {
+        short { toggle-overview; }
+        long { show-hotkey-overlay; }
+    }
+}
+
+// 最近窗口：按工作区切换，或仅切换同应用窗口。
+recent-windows {
+    binds {
+        Alt+Tab { next-window scope="workspace"; }
+        Alt+grave { next-window filter="app-id"; }
+    }
+}
+
+// 原生边缘绑定：光标在左侧 4 个逻辑像素内时，滚动切换工作区。
+edge-scroll "left" width=4 {
+    binds {
+        WheelScrollUp cooldown-ms=150 { focus-workspace-up; }
+        WheelScrollDown cooldown-ms=150 { focus-workspace-down; }
+        TouchpadScrollUp cooldown-ms=150 { focus-workspace-up; }
+        TouchpadScrollDown cooldown-ms=150 { focus-workspace-down; }
+    }
+}
+
+// 组合用法：命名工作区作为暂存区，仍参与正常工作区切换。
+workspace "stash"
+
+// 组合用法：浮动 + 置顶 + 跟随，让画中画窗口跨工作区显示。
+window-rule {
+    match app-id="^firefox$" title="^Picture-in-Picture$"
+    open-floating true
+    pinned true
+    open-follow-mode "if-invisible"
+}
+
+// 组合用法：Niri 启动命令，Noctalia 提供音量、亮度调节与反馈。
+// 需运行 Noctalia 并启用对应后端；替换所有 eDP-1 为实际连接器名称。
+edge-scroll "top" width=4 output="eDP-1" {
+    binds {
+        WheelScrollUp cooldown-ms=50 { spawn "noctalia" "msg" "volume-up" "2%"; }
+        WheelScrollDown cooldown-ms=50 { spawn "noctalia" "msg" "volume-down" "2%"; }
+        TouchpadScrollUp cooldown-ms=50 { spawn "noctalia" "msg" "volume-up" "2%"; }
+        TouchpadScrollDown cooldown-ms=50 { spawn "noctalia" "msg" "volume-down" "2%"; }
+        Ctrl+WheelScrollUp cooldown-ms=50 { spawn "noctalia" "msg" "brightness-up" "eDP-1" "2%"; }
+        Ctrl+WheelScrollDown cooldown-ms=50 { spawn "noctalia" "msg" "brightness-down" "eDP-1" "2%"; }
+        Ctrl+TouchpadScrollUp cooldown-ms=50 { spawn "noctalia" "msg" "brightness-up" "eDP-1" "2%"; }
+        Ctrl+TouchpadScrollDown cooldown-ms=50 { spawn "noctalia" "msg" "brightness-down" "eDP-1" "2%"; }
+    }
+}
+
+// 组合用法：将 Noctalia 的概览背景放入 Niri 的背景合成层。
+layer-rule {
+    match namespace="^noctalia-backdrop$"
+    place-within-backdrop true
+}
