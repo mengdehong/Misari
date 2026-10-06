@@ -1,0 +1,4 @@
+{
+  "settings.sync_backgrounds.label": "同步概览与锁屏背景",
+  "settings.sync_backgrounds.description": "使用各屏壁纸的静态帧，换壁纸或修改 WE 属性后更新；锁屏自定义图片优先。"
+}

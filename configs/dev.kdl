@@ -1,5 +1,11 @@
 include "~/.config/niri/binds.kdl"
 
+// Place Noctalia's overview background within niri's backdrop.
+layer-rule {
+    match namespace="^noctalia-backdrop$"
+    place-within-backdrop true
+}
+
 input {
     mod-key "Super"
     mod-key-nested "Super"

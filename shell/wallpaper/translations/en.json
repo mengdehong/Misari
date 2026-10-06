@@ -1,0 +1,4 @@
+{
+  "settings.sync_backgrounds.label": "Sync overview and lock screen backgrounds",
+  "settings.sync_backgrounds.description": "Use a still frame of each output's wallpaper. Refresh after wallpaper or WE property changes; custom lock screen images take precedence."
+}

@@ -1,0 +1,33 @@
+id = "misari/wallpaper"
+name = "Wallpaper"
+version = "0.4.5"
+plugin_api = 24
+author = "wenmou"
+description = "Manage wallpapers, edit WE properties and rotate playlists with wallpaperd."
+icon = "photo"
+dependencies = ["wallpaperd"]
+
+[[setting]]
+key = "sync_backgrounds"
+type = "bool"
+label_key = "settings.sync_backgrounds.label"
+description_key = "settings.sync_backgrounds.description"
+default = true
+
+[[service]]
+id = "backend"
+entry = "service.luau"
+
+[[widget]]
+id = "wallpaper"
+entry = "widget.luau"
+
+[[panel]]
+id = "browser"
+entry = "panel.luau"
+width = 1240
+height = 780
+placement = "floating"
+position = "center"
+keyboard_focus = "exclusive"
+capture_keys = ["ctrl+f", "ctrl+r"]
