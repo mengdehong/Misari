@@ -115,6 +115,14 @@ pub enum Request {
     /// been removed. This can happen if the corresponding [`Event::WorkspacesChanged`] arrives
     /// before the corresponding [`Event::WindowOpenedOrChanged`].
     EventStream,
+    /// Observe pointer positions without receiving the regular compositor event stream.
+    ///
+    /// Replies with `Reply::Ok(Response::Handled)`, then sends an
+    /// `Option<PointerPosition>` per line, including the initial position. `None` means
+    /// the pointer is unavailable (including during lock, overview, and compositor UI).
+    /// Positions use logical output coordinates, independent of output scale and transform.
+    /// Buttons and keyboard input are not observed; use Wayland for surface input.
+    PointerStream,
     /// Respond with an error (for testing error handling).
     ReturnError,
     /// Request information about the overview.
@@ -132,6 +140,18 @@ pub enum Request {
 ///   `Reply::Ok(Response::Handled)`. Kind of like an `Ok(())`.
 /// * Otherwise, it will be `Reply::Ok(response)` with one of the other [`Response`] variants.
 pub type Reply = Result<Response, String>;
+
+/// Pointer position in the logical coordinate space of one output.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct PointerPosition {
+    /// Connector name of the output under the pointer.
+    pub output: String,
+    /// Distance from the output's left edge in logical pixels.
+    pub x: f64,
+    /// Distance from the output's top edge in logical pixels.
+    pub y: f64,
+}
 
 /// Successful response from niri to client.
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1513,6 +1533,12 @@ pub struct Window {
     /// None means the compositor predates this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned: Option<bool>,
+    /// Whether this window is fullscreen in the current committed layout.
+    ///
+    /// `None` means the compositor predates this field. Maximized and windowed-fullscreen
+    /// windows are not fullscreen for this purpose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_fullscreen: Option<bool>,
     /// When this window follows the focused workspace.
     #[serde(default)]
     pub follow_mode: WindowFollowMode,

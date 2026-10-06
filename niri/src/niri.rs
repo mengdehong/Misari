@@ -1422,6 +1422,21 @@ impl State {
 
         let pointer = &self.niri.seat.get_pointer().unwrap();
         let location = pointer.current_location();
+        // Background and bottom layers do not receive input in the overview, including
+        // releases from a press that started before opening it.
+        if self.niri.layout.is_overview_open()
+            && pointer.grab_start_data().is_some_and(|grab| {
+                grab.focus.is_some_and(|(surface, _)| {
+                    let root = self.niri.find_root_shell_surface(&surface);
+                    self.niri.mapped_layer_surfaces.keys().any(|layer| {
+                        layer.wl_surface() == &root
+                            && matches!(layer.layer(), Layer::Background | Layer::Bottom)
+                    })
+                })
+            })
+        {
+            pointer.unset_grab(self, SERIAL_COUNTER.next_serial(), InputTime::now());
+        }
         let mut under = match self.niri.pointer_visibility {
             PointerVisibility::Disabled => PointContents::default(),
             _ => self.niri.contents_under(location),

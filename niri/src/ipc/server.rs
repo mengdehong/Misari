@@ -17,8 +17,8 @@ use futures_util::{select_biased, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, Fu
 use niri_config::OutputName;
 use niri_ipc::state::{EventStreamState, EventStreamStatePart as _};
 use niri_ipc::{
-    Action, Event, KeyboardLayouts, OutputConfigChanged, Overview, Reply, Request, Response,
-    Timestamp, WindowLayout, Workspace,
+    Action, Event, KeyboardLayouts, OutputConfigChanged, Overview, PointerPosition, Reply, Request,
+    Response, Timestamp, WindowLayout, Workspace,
 };
 use smithay::desktop::layer_map_for_output;
 use smithay::input::pointer::{
@@ -51,6 +51,8 @@ pub struct IpcServer {
     pub socket_path: Option<PathBuf>,
     event_streams: Rc<RefCell<Vec<EventStreamSender>>>,
     event_stream_state: Rc<RefCell<EventStreamState>>,
+    pointer_streams: Rc<RefCell<Vec<EventStreamSender<Option<PointerPosition>>>>>,
+    pointer_state: Rc<RefCell<Option<PointerPosition>>>,
 }
 
 struct ClientCtx {
@@ -59,16 +61,18 @@ struct ClientCtx {
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
     event_streams: Rc<RefCell<Vec<EventStreamSender>>>,
     event_stream_state: Rc<RefCell<EventStreamState>>,
+    pointer_streams: Rc<RefCell<Vec<EventStreamSender<Option<PointerPosition>>>>>,
+    pointer_state: Rc<RefCell<Option<PointerPosition>>>,
 }
 
-struct EventStreamClient {
-    events: Receiver<Event>,
+struct EventStreamClient<T = Event> {
+    events: Receiver<T>,
     disconnect: Receiver<()>,
     write: Box<dyn AsyncWrite + Unpin>,
 }
 
-struct EventStreamSender {
-    events: Sender<Event>,
+struct EventStreamSender<T = Event> {
+    events: Sender<T>,
     disconnect: Sender<()>,
 }
 
@@ -112,6 +116,8 @@ impl IpcServer {
             socket_path,
             event_streams: Rc::new(RefCell::new(Vec::new())),
             event_stream_state: Rc::new(RefCell::new(EventStreamState::default())),
+            pointer_streams: Rc::new(RefCell::new(Vec::new())),
+            pointer_state: Rc::new(RefCell::new(None)),
         })
     }
 
@@ -175,6 +181,8 @@ fn on_new_ipc_client(state: &mut State, stream: UnixStream) {
         ipc_outputs: state.backend.ipc_outputs(),
         event_streams: ipc_server.event_streams.clone(),
         event_stream_state: ipc_server.event_stream_state.clone(),
+        pointer_streams: ipc_server.pointer_streams.clone(),
+        pointer_state: ipc_server.pointer_state.clone(),
     };
 
     let future = async move {
@@ -210,6 +218,7 @@ async fn handle_client(ctx: ClientCtx, stream: Async<'static, UnixStream>) -> an
             .map_err(|err| err.to_string());
         let requested_error = matches!(request, Ok(Request::ReturnError));
         let requested_event_stream = matches!(request, Ok(Request::EventStream));
+        let requested_pointer_stream = matches!(request, Ok(Request::PointerStream));
 
         let reply = match request {
             Ok(request) => process(&ctx, request).await,
@@ -226,6 +235,32 @@ async fn handle_client(ctx: ClientCtx, stream: Async<'static, UnixStream>) -> an
         serde_json::to_writer(&mut buf, &reply).context("error formatting reply")?;
         buf.push(b'\n');
         write.write_all(&buf).await.context("error writing reply")?;
+
+        if requested_pointer_stream && reply.is_ok() {
+            // Motion is a replaceable snapshot; a slow reader retains only the newest one.
+            let (events_tx, events_rx) = async_channel::bounded(1);
+            let (disconnect_tx, disconnect_rx) = async_channel::bounded(1);
+            events_tx
+                .try_send(ctx.pointer_state.borrow().clone())
+                .unwrap();
+            let client = EventStreamClient {
+                events: events_rx,
+                disconnect: disconnect_rx,
+                write: Box::new(write) as _,
+            };
+            ctx.scheduler
+                .schedule(async move {
+                    if let Err(err) = handle_event_stream_client(client).await {
+                        warn!("error handling IPC pointer stream client: {err:?}");
+                    }
+                })
+                .context("error scheduling IPC pointer stream")?;
+            ctx.pointer_streams.borrow_mut().push(EventStreamSender {
+                events: events_tx,
+                disconnect: disconnect_tx,
+            });
+            return Ok(());
+        }
 
         if requested_event_stream {
             let (events_tx, events_rx) = async_channel::bounded(EVENT_STREAM_BUFFER_SIZE);
@@ -498,6 +533,17 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             Response::FocusedOutput(output)
         }
         Request::EventStream => Response::Handled,
+        Request::PointerStream => {
+            let (tx, rx) = async_channel::bounded(1);
+            ctx.event_loop.insert_idle(move |state| {
+                state.ipc_refresh_pointer();
+                let _ = tx.send_blocking(());
+            });
+            rx.recv()
+                .await
+                .map_err(|_| String::from("error getting pointer position"))?;
+            Response::Handled
+        }
         Request::OverviewState => {
             let state = ctx.event_stream_state.borrow();
             let is_open = state.overview.is_open;
@@ -538,7 +584,9 @@ fn validate_action(action: &Action) -> Result<(), String> {
     Ok(())
 }
 
-async fn handle_event_stream_client(client: EventStreamClient) -> anyhow::Result<()> {
+async fn handle_event_stream_client<T: serde::Serialize>(
+    client: EventStreamClient<T>,
+) -> anyhow::Result<()> {
     let EventStreamClient {
         events,
         disconnect,
@@ -580,6 +628,7 @@ fn make_ipc_window(
         is_focused: mapped.is_focused(),
         is_floating: mapped.is_floating(),
         pinned: Some(tile.is_pinned()),
+        is_fullscreen: Some(tile.sizing_mode().is_fullscreen()),
         follow_mode: tile.follow_mode(),
         is_urgent: mapped.is_urgent(),
         layout,
@@ -588,6 +637,49 @@ fn make_ipc_window(
 }
 
 impl State {
+    pub fn ipc_pointer_changed(&self) {
+        if self
+            .niri
+            .ipc_server
+            .as_ref()
+            .is_some_and(|server| !server.pointer_streams.borrow().is_empty())
+        {
+            self.ipc_refresh_pointer();
+        }
+    }
+
+    fn ipc_refresh_pointer(&self) {
+        let Some(server) = &self.niri.ipc_server else {
+            return;
+        };
+        let position = if self.niri.is_locked()
+            || !self.niri.pointer_visibility.is_visible()
+            || self.niri.layout.is_overview_open()
+            || self.niri.screenshot_ui.is_open()
+            || self.niri.window_mru_ui.is_open()
+            || self.niri.exit_confirm_dialog.is_open()
+        {
+            None
+        } else {
+            let pointer = self.niri.seat.get_pointer().unwrap();
+            self.niri
+                .output_under(pointer.current_location())
+                .map(|(output, pos)| PointerPosition {
+                    output: output.name(),
+                    x: pos.x,
+                    y: pos.y,
+                })
+        };
+        let mut previous = server.pointer_state.borrow_mut();
+        let mut streams = server.pointer_streams.borrow_mut();
+        if *previous == position {
+            streams.retain(|stream| !stream.events.is_closed());
+        } else {
+            previous.clone_from(&position);
+            streams.retain(|stream| stream.events.force_send(position.clone()).is_ok());
+        }
+    }
+
     pub fn ipc_keyboard_layouts_changed(&mut self) {
         let keyboard = self.niri.seat.get_keyboard().unwrap();
         let keyboard_layouts = keyboard.with_xkb_state(self, |context| {
@@ -638,6 +730,7 @@ impl State {
 
     pub fn ipc_refresh_layout(&mut self) {
         self.refresh_edge_scroll();
+        self.ipc_pointer_changed();
         self.ipc_refresh_workspaces();
         self.ipc_refresh_windows();
         self.ipc_refresh_overview();
@@ -778,6 +871,7 @@ impl State {
             let workspace_id = ws_id.map(|id| id.get());
             let mut changed = ipc_win.workspace_id != workspace_id
                 || ipc_win.is_floating != mapped.is_floating()
+                || ipc_win.is_fullscreen != Some(tile.sizing_mode().is_fullscreen())
                 || ipc_win.follow_mode != tile.follow_mode();
             changed |= ipc_win.pinned != Some(tile.is_pinned());
 
