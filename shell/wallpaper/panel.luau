@@ -708,37 +708,10 @@ for _, variable in ipairs({ "LC_ALL", "LC_MESSAGES", "LANGUAGE", "LANG" }) do
 end
 local chineseProperties = propertyLocale:sub(1, 2) == "zh"
 
-local function isChineseText(text)
-    local cjk, latin = 0, 0
-    for _, code in utf8.codes(text) do
-        if code >= 0x3400 and code <= 0x9FFF or code >= 0x3040 and code <= 0x30FF then cjk += 1
-        elseif code >= 65 and code <= 90 or code >= 97 and code <= 122 then latin += 1 end
-    end
-    -- A Han character in an emoticon (e.g. (*´∀人)) does not make English prose Chinese.
-    return cjk > 0 and cjk * 2 >= latin
-end
-
-local function plainText(text)
-    return (tostring(text):gsub("<[bB][rR]%s*/?%s*>", "\n")
-        :gsub("</[pP]>", "\n"):gsub("</[hH]%d>", "\n"):gsub("<[^>]*>", "")
-        :gsub("&nbsp;", " "):gsub("&amp;", "&"):gsub("&quot;", '"')
-        :gsub("&#39;", "'"):gsub("&lt;", "<"):gsub("&gt;", ">")
-        :gsub("^%s+", ""):gsub("%s+$", ""))
-end
+local formatPropertyText = require("./property_text.luau")
 
 local function localizedText(text)
-    text = plainText(text)
-    local first, second = text:match("^(.-)%s*/%s*(.+)$")
-    if first and not text:find("://", 1, true) and isChineseText(first) ~= isChineseText(second) then
-        text = isChineseText(first) == chineseProperties and first or second
-    end
-    -- Author notes often put translations in separate HTML paragraphs.
-    local native, foreign = {}, {}
-    for line in text:gmatch("[^\n]+") do
-        table.insert(isChineseText(line) and native or foreign, line)
-    end
-    if #native > 0 and #foreign > 0 then text = table.concat(chineseProperties and native or foreign, "\n") end
-    return (text:gsub("^%s+", ""):gsub("%s+$", ""))
+    return formatPropertyText(text, chineseProperties)
 end
 
 local function propertyText(definition)
