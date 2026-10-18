@@ -31,6 +31,10 @@ build:
     cargo build --locked --release --manifest-path nirius/Cargo.toml
     cargo build --locked --release --manifest-path tools/wallpaperd/Cargo.toml
 
+# Build and install the personal desktop without restarting the current session.
+install:
+    ./install.sh
+
 dev-check:
     cargo build --locked --manifest-path niri/Cargo.toml --bin niri
     ./niri/target/debug/niri validate --config configs/dev.kdl
