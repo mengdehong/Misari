@@ -232,7 +232,7 @@ void mainImage(out vec4 color, in vec2 fragCoord) {
 
 包含：
 
-- [Wine 桥接（we-layerd）](https://github.com/Aromatic05/we-layerd/tree/a744410164c6ca5c26c38f73f53ead355fa064e4)：v1-last-main（`a744410`）；scene/video 使用 GE-Proton 11-7 + DXVK，web 使用 Wine 11.18；均启用 gamescope headless。
+- [Wine 桥接（we-layerd）](https://github.com/Aromatic05/we-layerd/tree/a744410164c6ca5c26c38f73f53ead355fa064e4)：v1-last-main（`a744410`）；scene/video 默认配置使用 GE-Proton 11-9 + DXVK（下表测试使用 11-7），web 使用 Wine 11.18；均启用 gamescope headless。
 - [LWE（linux-wallpaperengine）](https://github.com/Almamu/linux-wallpaperengine)：b016d7d1 + web 纹理 ID 单行修复
 - [Waywallen](https://github.com/waywallen/waywallen) 0.4.3 + [OWE（Open Wallpaper Engine）](https://github.com/waywallen/open-wallpaper-engine) 0.3.0
 - [we-layerd](https://github.com/Aromatic05/we-layerd) 0.2.9
@@ -276,8 +276,6 @@ void mainImage(out vec4 color, in vec2 fragCoord) {
 对比结果
 
 ```text
-./tools/wallpaperd/scripts/benchmark.py --bench --headless --fps 60 --warmup 15 --duration 30
-
 +-------+---------+--------+---------+-------------+-------------+--------------+
 | Type  | Metrics | 1 Wine | 2 LWE   | 3 waywallen | 4 we-layerd | 5 wallpaperd |
 +-------+---------+--------+---------+-------------+-------------+--------------+

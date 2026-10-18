@@ -3,6 +3,7 @@
 /docs/research/
 
 # Build outputs and local tooling
+/local/
 target/
 /result
 .direnv/
