@@ -1,5 +1,0 @@
-{
-  "languageMode": "nonstrict",
-  "globals": ["noctalia", "ui", "panel", "barWidget"],
-  "lint": { "FunctionUnused": false }
-}

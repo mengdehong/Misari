@@ -1,7 +1,0 @@
-# Noctalia loads this when copied into ~/.config/noctalia/ as a *.toml override.
-[backdrop]
-enabled = false
-
-[lockscreen]
-wallpaper = ""
-blurred_desktop = false

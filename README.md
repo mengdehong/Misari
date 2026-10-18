@@ -11,7 +11,6 @@ Misari 是个人维护的 Linux 桌面项目，基于 niri：窗口横向排列�
 | [niri](niri/docs/README.md)（fork 版） | 排列窗口，在不同工作区之间切换。工作区可以理解为用来分组放置窗口的多个桌面。 |
 | [Noctalia](https://noctalia.dev/) | 使用状态栏、应用启动器、控制中心和锁屏界面。 |
 | [wallpaperd](tools/wallpaperd/README.md) | 在后台播放壁纸，记住每块屏幕的选择和播放设置。 |
-| [Wallpaper 插件](shell/wallpaper/README.md) | 在 Noctalia 中浏览、选择和收藏壁纸，设置自动轮播。 |
 
 ## 窗口管理新增功能
 
@@ -38,7 +37,7 @@ Misari 是个人维护的 Linux 桌面项目，基于 niri：窗口横向排列�
 - **与壁纸互动**：支持鼠标互动、随声音变化的效果，以及壁纸作者提供的颜色、文字等设置；支持的壁纸还可以显示正在播放的歌曲信息。
 - **同步桌面背景**：多屏播放同一视频或场景壁纸时同步进度，也可将壁纸画面用于工作区概览和锁屏背景。
 
-日常操作可以通过 [Wallpaper 面板](shell/wallpaper/README.md) 完成；播放设置和命令行用法见 [wallpaperd 文档](tools/wallpaperd/README.md)。
+播放设置和命令行用法见 [wallpaperd 文档](tools/wallpaperd/README.md)。
 
 ## 开始使用
 
@@ -46,6 +45,6 @@ Misari 安装包提供的命令仍叫 `niri`，安装时会与官方 `niri` 包�
 
 1. 按 [niri 安装与配置说明](niri/docs/README.md) 准备桌面。个人配置放在 `~/.config/niri/config.kdl`；可从 [默认配置](niri/resources/default-config.kdl) 开始，再按需加入上面的功能示例。
 2. 从 [Noctalia 官网](https://noctalia.dev/) 查看安装指南，配置状态栏、应用启动器和其他桌面界面。
-3. 如果需要动态壁纸，按 [wallpaperd 安装说明](tools/wallpaperd/README.md#快速上手) 安装并启动壁纸服务，再按 [Wallpaper 插件说明](shell/wallpaper/README.md#启用) 启用面板。
+3. 如果需要动态壁纸，按 [wallpaperd 安装说明](tools/wallpaperd/README.md#快速上手) 安装并启动壁纸服务。
 
 保存 niri 配置后会自动生效。修改后可在终端运行 `niri validate` 检查配置是否有误。
