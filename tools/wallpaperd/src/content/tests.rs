@@ -358,6 +358,21 @@ fn gpu_image_shader_pause_resize_and_blend() {
         );
     }
     assert!((126..=129).contains(&blended[0]) && (126..=129).contains(&blended[1]));
+    for (progress, green) in [(0.0, 0_i32), (0.25, 40), (0.75, 215), (1.0, 255)] {
+        gpu.present(
+            shader.target(),
+            Some(image.target()),
+            crate::domain::Transition::Fade,
+            progress,
+        )
+        .unwrap();
+        let pixel = surface_pixel(&gpu, 4, 6);
+        assert!(
+            (i32::from(pixel[1]) - green).abs() <= 1,
+            "fade must ease at its endpoints: {pixel:?}"
+        );
+        assert_eq!(pixel[3], 255);
+    }
     gpu.resize(Size::new(12, 6).unwrap());
     shader.resized();
     assert!(shader.render(&gpu).unwrap());

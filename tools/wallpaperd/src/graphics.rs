@@ -364,14 +364,8 @@ impl Gpu {
                 if transition == Transition::Stripes {
                     feather = (feather / 0.08).max(0.02);
                 }
-                self.gl.uniform_1_f32(
-                    self.compose.uniform(2),
-                    if transition == Transition::Fade {
-                        progress
-                    } else {
-                        eased
-                    },
-                );
+                // Zero endpoint velocity also keeps a plain crossfade from starting/stopping abruptly.
+                self.gl.uniform_1_f32(self.compose.uniform(2), eased);
                 self.gl
                     .uniform_1_i32(self.compose.uniform(3), transition as i32);
                 self.gl.uniform_4_f32(
