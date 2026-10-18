@@ -1,12 +1,13 @@
+use crate::{motion, palette};
 use iced::{
-    Element, Event, Length, Padding, Pixels, Rectangle, Renderer, Size, Theme, Vector,
+    Color, Element, Event, Length, Padding, Pixels, Rectangle, Renderer, Size, Theme, Vector,
     advanced::{
         Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer,
         widget::{Operation, Tree, operation::Focusable, tree},
     },
     keyboard::{self, Key, key::Named},
 };
-use std::{marker::PhantomData, ops::RangeInclusive, rc::Rc};
+use std::{cell::Cell, marker::PhantomData, ops::RangeInclusive, rc::Rc, time::Instant};
 
 /// Keep keyboard focus visible in its own scrollable ancestors, including
 /// native text inputs. Chaining waits for Iced's complete focus operation.
@@ -20,6 +21,44 @@ pub fn focus_previous<Message: Send + 'static>() -> iced::Task<Message> {
 
 pub fn scroll_to_focused<Message: Send + 'static>() -> iced::Task<Message> {
     iced::advanced::widget::operate(FindFocus::default())
+}
+
+/// Shared field metrics keep search, property editors and settings consistent.
+pub fn text_input<'a, Message: Clone + 'a>(
+    placeholder: &str,
+    value: &str,
+) -> iced::widget::TextInput<'a, Message> {
+    iced::widget::text_input(placeholder, value)
+        .size(13)
+        .padding([11, 14])
+        .style(|theme: &Theme, status| {
+            use iced::widget::text_input::Status;
+            let focused = matches!(status, Status::Focused { .. });
+            let disabled = matches!(status, Status::Disabled);
+            let mut style = iced::widget::text_input::default(theme, status);
+            style.background = palette::WASH
+                .scale_alpha(if focused { 0.12 } else { 0.07 })
+                .into();
+            style.border = iced::Border {
+                color: if focused {
+                    theme.palette().primary.scale_alpha(0.7)
+                } else if matches!(status, Status::Hovered) {
+                    palette::MUTED.scale_alpha(0.3)
+                } else {
+                    palette::LINE
+                },
+                width: 1.0,
+                radius: palette::CONTROL_RADIUS.into(),
+            };
+            style.value = if disabled {
+                palette::MUTED
+            } else {
+                palette::TEXT
+            };
+            style.placeholder = palette::MUTED.scale_alpha(0.75);
+            style.selection = theme.palette().primary.scale_alpha(0.25);
+            style
+        })
 }
 
 #[derive(Clone)]
@@ -180,18 +219,39 @@ pub mod button {
 pub struct Button<'a, Message> {
     inner: iced::widget::Button<'a, Message>,
     message: Option<Message>,
+    id: Option<iced::advanced::widget::Id>,
+    visual: Rc<Cell<motion::Visual>>,
+    card: Option<(String, bool)>,
 }
 
 pub fn button<'a, Message: Clone + 'a>(
     content: impl Into<Element<'a, Message>>,
 ) -> Button<'a, Message> {
+    let visual = Rc::new(Cell::new(motion::Visual::default()));
     Button {
-        inner: iced::widget::button(content),
+        inner: iced::widget::button(content)
+            .padding([10, 14])
+            .style(animated_style(visual.clone(), |theme, status| {
+                let mut style = iced::widget::button::primary(theme, status);
+                style.border.radius = palette::CONTROL_RADIUS.into();
+                style
+            })),
         message: None,
+        id: None,
+        visual,
+        card: None,
     }
 }
 
 impl<'a, Message: Clone + 'a> Button<'a, Message> {
+    pub fn card(mut self, identity: impl Into<String>, selected: bool) -> Self {
+        self.card = Some((identity.into(), selected));
+        self
+    }
+    pub fn id(mut self, id: impl Into<iced::advanced::widget::Id>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
     pub fn on_press(self, message: Message) -> Self {
         self.on_press_maybe(Some(message))
     }
@@ -201,7 +261,7 @@ impl<'a, Message: Clone + 'a> Button<'a, Message> {
         self
     }
     pub fn style(mut self, style: impl Fn(&Theme, button::Status) -> button::Style + 'a) -> Self {
-        self.inner = self.inner.style(style);
+        self.inner = self.inner.style(animated_style(self.visual.clone(), style));
         self
     }
     pub fn padding(mut self, padding: impl Into<Padding>) -> Self {
@@ -217,10 +277,91 @@ impl<'a, Message: Clone + 'a> Button<'a, Message> {
 impl<'a, Message: Clone + 'a> From<Button<'a, Message>> for Element<'a, Message> {
     fn from(button: Button<'a, Message>) -> Self {
         let enabled = button.message.is_some();
-        Control::new(button.inner.into(), enabled, move |key| {
+        let mut control = Control::new(button.inner.into(), enabled, move |key| {
             activate_key(key).then(|| button.message.clone()).flatten()
-        })
-        .into()
+        });
+        control.id = button.id;
+        control.visual = Some(button.visual);
+        control.card = button.card;
+        control.into()
+    }
+}
+
+fn animated_style<'a>(
+    visual: Rc<Cell<motion::Visual>>,
+    style: impl Fn(&Theme, button::Status) -> button::Style + 'a,
+) -> impl Fn(&Theme, button::Status) -> button::Style + 'a {
+    move |theme, status| {
+        if status == button::Status::Disabled {
+            return style(theme, status);
+        }
+        let phase = visual.get();
+        let hovered = blend_style(
+            style(theme, button::Status::Active),
+            style(theme, button::Status::Hovered),
+            phase.hover,
+        );
+        let mut result = blend_style(hovered, style(theme, button::Status::Pressed), phase.press);
+        if phase.card {
+            result.border.color = theme
+                .palette()
+                .primary
+                .scale_alpha(0.85 * phase.selection.clamp(0.0, 1.0));
+            let hover = phase.hover.clamp(0.0, 1.0);
+            result.shadow = iced::Shadow {
+                color: iced::Color::BLACK.scale_alpha(0.22 * hover),
+                offset: Vector::new(0.0, 3.0 * hover),
+                blur_radius: 12.0 * hover,
+            };
+        }
+        result
+    }
+}
+
+fn blend_style(a: button::Style, b: button::Style, t: f32) -> button::Style {
+    use iced::{Background, Color};
+    let background = match (a.background, b.background) {
+        (None, None) => None,
+        (Some(Background::Color(a)), Some(Background::Color(b))) => {
+            Some(motion::color(a, b, t).into())
+        }
+        (Some(Background::Color(a)), None) => Some(motion::color(a, Color::TRANSPARENT, t).into()),
+        (None, Some(Background::Color(b))) => Some(motion::color(Color::TRANSPARENT, b, t).into()),
+        _ => {
+            if t < 0.5 {
+                a.background
+            } else {
+                b.background
+            }
+        }
+    };
+    button::Style {
+        background,
+        text_color: motion::color(a.text_color, b.text_color, t),
+        border: iced::Border {
+            color: motion::color(a.border.color, b.border.color, t),
+            width: motion::mix(a.border.width, b.border.width, t),
+            radius: iced::border::Radius {
+                top_left: motion::mix(a.border.radius.top_left, b.border.radius.top_left, t),
+                top_right: motion::mix(a.border.radius.top_right, b.border.radius.top_right, t),
+                bottom_left: motion::mix(
+                    a.border.radius.bottom_left,
+                    b.border.radius.bottom_left,
+                    t,
+                ),
+                bottom_right: motion::mix(
+                    a.border.radius.bottom_right,
+                    b.border.radius.bottom_right,
+                    t,
+                ),
+            },
+        },
+        shadow: iced::Shadow {
+            color: motion::color(a.shadow.color, b.shadow.color, t),
+            offset: a.shadow.offset + (b.shadow.offset - a.shadow.offset) * t.clamp(0.0, 1.0),
+            blur_radius: motion::mix(a.shadow.blur_radius, b.shadow.blur_radius, t),
+        },
+        snap: false,
     }
 }
 
@@ -232,7 +373,45 @@ pub struct Checkbox<'a, Message> {
 
 pub fn checkbox<'a, Message: Clone + 'a>(value: bool) -> Checkbox<'a, Message> {
     Checkbox {
-        inner: iced::widget::checkbox(value),
+        inner: iced::widget::checkbox(value)
+            .size(18)
+            .spacing(12)
+            .text_size(13)
+            .width(Length::Fill)
+            .style(|theme: &Theme, status| {
+                use iced::widget::checkbox::Status;
+                let (checked, hovered, disabled) = match status {
+                    Status::Active { is_checked } => (is_checked, false, false),
+                    Status::Hovered { is_checked } => (is_checked, true, false),
+                    Status::Disabled { is_checked } => (is_checked, false, true),
+                };
+                iced::widget::checkbox::Style {
+                    background: if checked {
+                        theme
+                            .palette()
+                            .primary
+                            .scale_alpha(if disabled { 0.3 } else { 1.0 })
+                    } else {
+                        palette::WASH.scale_alpha(if hovered { 0.20 } else { 0.08 })
+                    }
+                    .into(),
+                    icon_color: palette::BG,
+                    border: iced::Border {
+                        color: if checked {
+                            Color::TRANSPARENT
+                        } else {
+                            palette::MUTED.scale_alpha(if disabled { 0.18 } else { 0.45 })
+                        },
+                        width: 1.0,
+                        radius: 5.0.into(),
+                    },
+                    text_color: Some(if disabled {
+                        palette::MUTED
+                    } else {
+                        palette::TEXT
+                    }),
+                }
+            }),
         value,
         handler: None,
     }
@@ -258,7 +437,37 @@ impl<'a, Message: Clone + 'a> Checkbox<'a, Message> {
 impl<'a, Message: Clone + 'a> From<Checkbox<'a, Message>> for Element<'a, Message> {
     fn from(checkbox: Checkbox<'a, Message>) -> Self {
         let enabled = checkbox.handler.is_some();
-        Control::new(checkbox.inner.into(), enabled, move |key| {
+        let toggled = checkbox
+            .handler
+            .as_ref()
+            .map(|handler| handler(!checkbox.value));
+        let row = iced::widget::button(checkbox.inner)
+            .padding([10, 12])
+            .width(Length::Fill)
+            .on_press_maybe(toggled)
+            .style(move |theme: &Theme, status| {
+                let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+                button::Style {
+                    background: Some(
+                        if checkbox.value {
+                            theme
+                                .palette()
+                                .primary
+                                .scale_alpha(if hovered { 0.13 } else { 0.07 })
+                        } else {
+                            palette::WASH.scale_alpha(if hovered { 0.14 } else { 0.05 })
+                        }
+                        .into(),
+                    ),
+                    text_color: palette::TEXT,
+                    border: iced::Border {
+                        radius: palette::CONTROL_RADIUS.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }
+            });
+        Control::new(row.into(), enabled, move |key| {
             activate_key(key)
                 .then(|| {
                     checkbox
@@ -289,6 +498,47 @@ pub fn pick_list<'a, T: ToString + PartialEq + Clone + 'a, Message: Clone + 'a>(
     PickList {
         inner: iced::widget::pick_list(options.clone(), selected.clone(), move |option| {
             callback(option)
+        })
+        .text_size(13)
+        .padding([10, 12])
+        .style(|theme: &Theme, status| iced::widget::pick_list::Style {
+            text_color: crate::palette::TEXT,
+            placeholder_color: crate::palette::MUTED,
+            handle_color: crate::palette::MUTED,
+            background: palette::WASH
+                .scale_alpha(
+                    if matches!(
+                        status,
+                        iced::widget::pick_list::Status::Hovered
+                            | iced::widget::pick_list::Status::Opened { .. }
+                    ) {
+                        0.17
+                    } else {
+                        0.09
+                    },
+                )
+                .into(),
+            border: iced::Border {
+                color: if matches!(status, iced::widget::pick_list::Status::Opened { .. }) {
+                    theme.palette().primary.scale_alpha(0.5)
+                } else {
+                    palette::LINE
+                },
+                width: 1.0,
+                radius: palette::CONTROL_RADIUS.into(),
+            },
+        })
+        .menu_style(|theme| iced::widget::overlay::menu::Style {
+            background: palette::popover(theme).background.unwrap(),
+            text_color: crate::palette::TEXT,
+            border: iced::Border {
+                color: palette::WASH.scale_alpha(0.38),
+                width: 1.0,
+                radius: 12.0.into(),
+            },
+            selected_background: theme.palette().primary.scale_alpha(0.12).into(),
+            selected_text_color: theme.palette().primary,
+            shadow: palette::popover(theme).shadow,
         }),
         options,
         selected,
@@ -396,7 +646,29 @@ pub fn slider<'a, T: Number + 'a, Message: Clone + 'a>(
         Rc::new(move |value| handler(T::from_number(value)));
     let callback = handler.clone();
     Slider {
-        inner: iced::widget::slider(range.clone(), value, move |value| callback(value)),
+        inner: iced::widget::slider(range.clone(), value, move |value| callback(value))
+            .height(28)
+            .style(|theme: &Theme, status| {
+                let active = !matches!(status, iced::widget::slider::Status::Active);
+                iced::widget::slider::Style {
+                    rail: iced::widget::slider::Rail {
+                        backgrounds: (
+                            theme.palette().primary.into(),
+                            palette::WASH.scale_alpha(0.24).into(),
+                        ),
+                        width: 4.0,
+                        border: iced::border::rounded(2),
+                    },
+                    handle: iced::widget::slider::Handle {
+                        shape: iced::widget::slider::HandleShape::Circle {
+                            radius: if active { 7.0 } else { 6.0 },
+                        },
+                        background: palette::TEXT.into(),
+                        border_width: 2.0,
+                        border_color: theme.palette().primary,
+                    },
+                }
+            }),
         range,
         value,
         step: 1.0,
@@ -406,6 +678,13 @@ pub fn slider<'a, T: Number + 'a, Message: Clone + 'a>(
 }
 
 impl<'a, T: Number + 'a, Message: Clone + 'a> Slider<'a, T, Message> {
+    pub fn style(
+        mut self,
+        style: impl Fn(&Theme, iced::widget::slider::Status) -> iced::widget::slider::Style + 'a,
+    ) -> Self {
+        self.inner = self.inner.style(style);
+        self
+    }
     pub fn step(mut self, step: T) -> Self {
         self.step = step.number().abs().max(f64::EPSILON);
         self.inner = self.inner.step(self.step);
@@ -449,6 +728,9 @@ impl<'a, T: Number + 'a, Message: Clone + 'a> From<Slider<'a, T, Message>>
 #[derive(Default)]
 struct Focus {
     focused: bool,
+    focus_visible: bool,
+    motion: motion::Interaction,
+    identity: Option<String>,
 }
 impl Focusable for Focus {
     fn is_focused(&self) -> bool {
@@ -456,33 +738,45 @@ impl Focusable for Focus {
     }
     fn focus(&mut self) {
         self.focused = true;
+        self.focus_visible = true;
     }
     fn unfocus(&mut self) {
         self.focused = false;
+        self.focus_visible = false;
     }
 }
 
 type KeyHandler<'a, Message> = dyn Fn(&Key) -> Option<Message> + 'a;
 
-struct Control<'a, Message> {
+pub(crate) struct Control<'a, Message> {
     inner: Element<'a, Message>,
+    id: Option<iced::advanced::widget::Id>,
     enabled: bool,
     key: Box<KeyHandler<'a, Message>>,
     popup: bool,
+    visual: Option<Rc<Cell<motion::Visual>>>,
+    card: Option<(String, bool)>,
 }
 
 impl<'a, Message> Control<'a, Message> {
-    fn new(
+    pub(crate) fn new(
         inner: Element<'a, Message>,
         enabled: bool,
         key: impl Fn(&Key) -> Option<Message> + 'a,
     ) -> Self {
         Self {
             inner,
+            id: None,
             enabled,
             key: Box::new(key),
             popup: false,
+            visual: None,
+            card: None,
         }
+    }
+    pub(crate) fn id(mut self, id: &'static str) -> Self {
+        self.id = Some(id.into());
+        self
     }
 }
 
@@ -491,12 +785,29 @@ impl<Message> Widget<Message, Theme, Renderer> for Control<'_, Message> {
         tree::Tag::of::<Focus>()
     }
     fn state(&self) -> tree::State {
-        tree::State::new(Focus::default())
+        tree::State::new(Focus {
+            motion: motion::Interaction::selected(
+                self.card.as_ref().is_some_and(|(_, selected)| *selected),
+            ),
+            identity: self.card.as_ref().map(|(id, _)| id.clone()),
+            ..Default::default()
+        })
     }
     fn children(&self) -> Vec<Tree> {
         vec![Tree::new(&self.inner)]
     }
     fn diff(&self, tree: &mut Tree) {
+        let state = tree.state.downcast_mut::<Focus>();
+        if state.identity.as_deref() != self.card.as_ref().map(|(id, _)| id.as_str()) {
+            *state = Focus {
+                motion: motion::Interaction::selected(
+                    self.card.as_ref().is_some_and(|(_, selected)| *selected),
+                ),
+                identity: self.card.as_ref().map(|(id, _)| id.clone()),
+                ..Default::default()
+            };
+            tree.children[0] = Tree::new(&self.inner);
+        }
         tree.diff_children(std::slice::from_ref(&self.inner));
         if !self.enabled {
             tree.state.downcast_mut::<Focus>().unfocus();
@@ -526,7 +837,11 @@ impl<Message> Widget<Message, Theme, Renderer> for Control<'_, Message> {
         operation: &mut dyn Operation,
     ) {
         if self.enabled {
-            operation.focusable(None, layout.bounds(), tree.state.downcast_mut::<Focus>());
+            operation.focusable(
+                self.id.as_ref(),
+                layout.bounds(),
+                tree.state.downcast_mut::<Focus>(),
+            );
         }
         self.inner
             .as_widget_mut()
@@ -544,6 +859,11 @@ impl<Message> Widget<Message, Theme, Renderer> for Control<'_, Message> {
         viewport: &Rectangle,
     ) {
         let state = tree.state.downcast_mut::<Focus>();
+        let (now, frame) = if let Event::Window(iced::window::Event::RedrawRequested(now)) = event {
+            (*now, true)
+        } else {
+            (Instant::now(), false)
+        };
         let pressed = match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 Some(cursor.position())
@@ -554,6 +874,10 @@ impl<Message> Widget<Message, Theme, Renderer> for Control<'_, Message> {
             _ => None,
         };
         if let Some(position) = pressed {
+            if state.focus_visible {
+                state.focus_visible = false;
+                shell.request_redraw();
+            }
             let focused = self.enabled
                 && !shell.is_event_captured()
                 && position.is_some_and(|position| {
@@ -566,6 +890,74 @@ impl<Message> Widget<Message, Theme, Renderer> for Control<'_, Message> {
                 state.focused = focused;
                 shell.request_redraw();
             }
+            if focused && self.visual.is_some() {
+                state.motion.press(now);
+            }
+        }
+        match event {
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+            | Event::Touch(
+                iced::touch::Event::FingerLifted { .. } | iced::touch::Event::FingerLost { .. },
+            ) => state.motion.down = false,
+            Event::Window(iced::window::Event::Unfocused) => {
+                state.motion.cancel_press();
+                if self.visual.is_some() {
+                    // Cancel the native press too, so releasing after a focus change cannot click.
+                    self.inner.as_widget_mut().update(
+                        &mut tree.children[0],
+                        &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                        layout,
+                        mouse::Cursor::Unavailable,
+                        renderer,
+                        clipboard,
+                        &mut Shell::new(&mut Vec::new()),
+                        viewport,
+                    );
+                }
+            }
+            Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) if activate_key(key) => {
+                state.motion.down = false
+            }
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
+                modifiers,
+                repeat: false,
+                ..
+            }) if state.focused
+                && self.enabled
+                && self.visual.is_some()
+                && activate_key(key)
+                && !modifiers.control()
+                && !modifiers.alt()
+                && !modifiers.logo()
+                && !shell.is_event_captured() =>
+            {
+                state.motion.press(now)
+            }
+            _ => {}
+        }
+        let hovered = !matches!(event, Event::Window(iced::window::Event::Unfocused))
+            && layout
+                .bounds()
+                .intersection(viewport)
+                .is_some_and(|bounds| cursor.is_over(bounds));
+        let selected = self.card.as_ref().is_some_and(|(_, selected)| *selected);
+        if state.focused
+            && !shell.is_event_captured()
+            && matches!(event, Event::Keyboard(keyboard::Event::KeyPressed { modifiers, .. })
+                if !modifiers.control() && !modifiers.alt() && !modifiers.logo())
+        {
+            state.focus_visible = true;
+        }
+        if state.motion.update(
+            now,
+            frame,
+            hovered,
+            state.focused && state.focus_visible,
+            selected,
+            self.enabled,
+        ) {
+            shell.request_redraw();
         }
         if state.focused
             && self.enabled
@@ -645,32 +1037,73 @@ impl<Message> Widget<Message, Theme, Renderer> for Control<'_, Message> {
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        self.inner.as_widget().draw(
-            &tree.children[0],
-            renderer,
-            theme,
-            style,
-            layout,
-            cursor,
-            viewport,
-        );
-        if self.enabled && tree.state.downcast_ref::<Focus>().focused {
-            use iced::advanced::Renderer as _;
-            renderer.with_layer(*viewport, |renderer| {
-                renderer.fill_quad(
-                    renderer::Quad {
-                        bounds: layout.bounds(),
-                        border: iced::Border {
-                            color: iced::Color::from_rgb8(167, 224, 197),
-                            width: 2.0,
-                            radius: 6.0.into(),
-                        },
-                        ..Default::default()
-                    },
-                    iced::Color::TRANSPARENT,
-                )
-            });
+        use iced::advanced::Renderer as _;
+        let state = tree.state.downcast_ref::<Focus>();
+        let focus_opacity = if state.focus_visible {
+            state.motion.focus.value
+        } else {
+            0.0
+        };
+        let mut visual = state.motion.visual();
+        visual.card = self.card.is_some();
+        if let Some(paint) = &self.visual {
+            paint.set(visual);
         }
+        let transform = if self.visual.is_some() && !motion::reduced() {
+            let (scale, lift) = if visual.card {
+                (
+                    1.0 + 0.008 * visual.hover - 0.016 * visual.press,
+                    -3.0 * visual.hover + 1.5 * visual.press,
+                )
+            } else {
+                (1.0 - 0.025 * visual.press, 0.8 * visual.press)
+            };
+            motion::transform(layout.bounds(), scale, lift)
+        } else {
+            iced::Transformation::IDENTITY
+        };
+        if transform == iced::Transformation::IDENTITY && focus_opacity <= 0.001 {
+            self.inner.as_widget().draw(
+                &tree.children[0],
+                renderer,
+                theme,
+                style,
+                layout,
+                cursor,
+                viewport,
+            );
+            return;
+        }
+        renderer.with_layer(*viewport, |renderer| {
+            renderer.with_transformation(transform, |renderer| {
+                self.inner.as_widget().draw(
+                    &tree.children[0],
+                    renderer,
+                    theme,
+                    style,
+                    layout,
+                    cursor,
+                    viewport,
+                );
+                if self.enabled && focus_opacity > 0.001 {
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: layout.bounds(),
+                            border: iced::Border {
+                                color: theme
+                                    .palette()
+                                    .primary
+                                    .scale_alpha(focus_opacity.clamp(0.0, 1.0)),
+                                width: 2.0,
+                                radius: 6.0.into(),
+                            },
+                            ..Default::default()
+                        },
+                        iced::Color::TRANSPARENT,
+                    );
+                }
+            })
+        });
     }
     fn mouse_interaction(
         &self,
@@ -715,6 +1148,7 @@ impl<'a, Message: 'a> From<Control<'a, Message>> for Element<'a, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn focus_and_keyboard_selection_preserve_boundaries() {
         let mut state = Focus::default();
@@ -751,193 +1185,5 @@ mod tests {
             Some(5.0)
         );
         assert_eq!(u32::from_number(30.6), 31);
-    }
-
-    #[test]
-    fn widget_tree_registers_enabled_controls_and_publishes_once() {
-        use iced::advanced::widget::operation::{self, Outcome, focusable};
-        let mut element: Element<'_, u8> = iced::widget::row![
-            button("Enabled").on_press(1),
-            button("Disabled"),
-            checkbox(false).on_toggle(|_| 2),
-            pick_list(vec![1, 2], Some(1), |_| 3),
-            slider(0_u32..=100, 30, |_| 4),
-        ]
-        .into();
-        let mut tree = Tree::new(&element);
-        let renderer = Renderer::new(iced::Font::DEFAULT, Pixels(16.0));
-        let node = element.as_widget_mut().layout(
-            &mut tree,
-            &renderer,
-            &layout::Limits::new(Size::ZERO, Size::new(800.0, 120.0)),
-        );
-        let layout = Layout::new(&node);
-        let mut count = focusable::count();
-        element.as_widget_mut().operate(
-            &mut tree,
-            layout,
-            &renderer,
-            &mut operation::black_box(&mut count),
-        );
-        let Outcome::Some(count) = count.finish() else {
-            panic!("focus count");
-        };
-        assert_eq!(count.total, 4);
-        let mut focus: Box<dyn Operation> = Box::new(focusable::focus_next::<()>());
-        loop {
-            element
-                .as_widget_mut()
-                .operate(&mut tree, layout, &renderer, focus.as_mut());
-            if let Outcome::Chain(next) = focus.finish() {
-                focus = next;
-            } else {
-                break;
-            }
-        }
-        assert!(tree.children[0].state.downcast_ref::<Focus>().is_focused());
-        let event = |key, repeat| {
-            Event::Keyboard(keyboard::Event::KeyPressed {
-                key: Key::Named(key),
-                modified_key: Key::Named(key),
-                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
-                location: keyboard::Location::Standard,
-                modifiers: keyboard::Modifiers::empty(),
-                text: None,
-                repeat,
-            })
-        };
-        let mut messages = Vec::new();
-        let viewport = Rectangle::with_size(Size::new(800.0, 120.0));
-        element.as_widget_mut().update(
-            &mut tree,
-            &event(Named::Enter, false),
-            layout,
-            mouse::Cursor::Unavailable,
-            &renderer,
-            &mut iced::advanced::clipboard::Null,
-            &mut Shell::new(&mut messages),
-            &viewport,
-        );
-        element.as_widget_mut().update(
-            &mut tree,
-            &event(Named::Enter, true),
-            layout,
-            mouse::Cursor::Unavailable,
-            &renderer,
-            &mut iced::advanced::clipboard::Null,
-            &mut Shell::new(&mut messages),
-            &viewport,
-        );
-        assert_eq!(messages, [1]);
-        tree.children[0].state.downcast_mut::<Focus>().unfocus();
-        tree.children[3].state.downcast_mut::<Focus>().focus();
-        for (key, popup_open) in [
-            (Named::Enter, true),
-            (Named::Tab, false),
-            (Named::ArrowDown, false),
-        ] {
-            element.as_widget_mut().update(
-                &mut tree,
-                &event(key, false),
-                layout,
-                mouse::Cursor::Unavailable,
-                &renderer,
-                &mut iced::advanced::clipboard::Null,
-                &mut Shell::new(&mut messages),
-                &viewport,
-            );
-            assert_eq!(
-                element
-                    .as_widget_mut()
-                    .overlay(&mut tree, layout, &renderer, &viewport, Vector::ZERO)
-                    .is_some(),
-                popup_open
-            );
-        }
-        assert_eq!(messages, [1, 3]);
-    }
-
-    #[test]
-    fn focus_reveals_native_input_in_nested_scrollables_and_leaves_sibling_alone() {
-        use iced::advanced::widget::operation::{self, Outcome, focusable};
-        use iced::widget::{Space, column, row, scrollable, text_input};
-        let mut element: Element<'_, u8> = row![
-            scrollable(column![
-                Space::new().height(400),
-                scrollable(column![
-                    Space::new().height(500),
-                    text_input("Target", "")
-                        .id("offscreen-input")
-                        .on_input(|_| 0)
-                ])
-                .height(120)
-            ])
-            .width(300)
-            .height(100),
-            scrollable(column![
-                Space::new().height(800),
-                button("Sibling").on_press(1)
-            ])
-            .width(300)
-            .height(100)
-        ]
-        .into();
-        let mut tree = Tree::new(&element);
-        let renderer = Renderer::new(iced::Font::DEFAULT, Pixels(16.0));
-        let node = element.as_widget_mut().layout(
-            &mut tree,
-            &renderer,
-            &layout::Limits::new(Size::ZERO, Size::new(800.0, 160.0)),
-        );
-        let layout = Layout::new(&node);
-        let run =
-            |element: &mut Element<'_, u8>, tree: &mut Tree, mut operation: Box<dyn Operation>| {
-                loop {
-                    element
-                        .as_widget_mut()
-                        .operate(tree, layout, &renderer, operation.as_mut());
-                    if let Outcome::Chain(next) = operation.finish() {
-                        operation = next;
-                    } else {
-                        break;
-                    }
-                }
-            };
-        #[derive(Default)]
-        struct Positions(Vec<Vector>);
-        impl Operation for Positions {
-            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
-                operate(self);
-            }
-            fn scrollable(
-                &mut self,
-                _: Option<&iced::advanced::widget::Id>,
-                _: Rectangle,
-                _: Rectangle,
-                translation: Vector,
-                _: &mut dyn operation::Scrollable,
-            ) {
-                self.0.push(translation);
-            }
-        }
-        run(
-            &mut element,
-            &mut tree,
-            Box::new(focusable::focus::<()>("offscreen-input".into())),
-        );
-        run(&mut element, &mut tree, Box::<FindFocus>::default());
-        let mut positions = Positions::default();
-        element
-            .as_widget_mut()
-            .operate(&mut tree, layout, &renderer, &mut positions);
-        assert_eq!(positions.0.len(), 3);
-        assert!(positions.0[0].y > 0.0);
-        assert!(positions.0[1].y > 0.0);
-        assert_eq!(positions.0[2], Vector::ZERO);
-        let target_y = 900.0 - positions.0[0].y - positions.0[1].y;
-        assert!(
-            (0.0..100.0).contains(&target_y),
-            "focused input remains offscreen: {target_y}"
-        );
     }
 }

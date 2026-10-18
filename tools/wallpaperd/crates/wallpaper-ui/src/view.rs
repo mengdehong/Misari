@@ -1,23 +1,23 @@
-use crate::controls::{button, checkbox, pick_list, slider};
+use crate::controls::{button, checkbox, pick_list, slider, text_input};
+use crate::filters::{GROUPS, Group};
+use crate::icons::{Icon, icon};
 use crate::{App, Message, Page, array, strv};
 use iced::{
     Alignment, Border, Color, Element,
-    Length::{Fill, Fixed},
+    Length::{Fill, Fixed, Shrink},
     Theme,
-    widget::{
-        self, Column, Row, Space, column, container, image, progress_bar, row, scrollable, text,
-        text_input,
-    },
+    widget::{self, Column, Row, Space, column, container, image, progress_bar, row, text},
 };
 use serde_json::{Value, json};
 
-pub const BG: Color = Color::from_rgb8(17, 21, 27);
-pub const PANEL: Color = Color::from_rgb8(24, 29, 36);
-pub const CARD: Color = Color::from_rgb8(31, 37, 46);
-pub const TEXT: Color = Color::from_rgb8(232, 237, 242);
-pub const MUTED: Color = Color::from_rgb8(141, 155, 169);
-pub const ACCENT: Color = Color::from_rgb8(167, 224, 197);
-const LINE: Color = Color::from_rgb8(45, 54, 65);
+use crate::palette;
+pub use crate::palette::{BG, CARD, LINE, MUTED, PANEL, TEXT};
+
+fn scrollable<'a>(content: impl Into<Element<'a, Message>>) -> widget::Scrollable<'a, Message> {
+    widget::scrollable(content).direction(widget::scrollable::Direction::Vertical(
+        widget::scrollable::Scrollbar::hidden(),
+    ))
+}
 
 fn box_style(color: Color) -> impl Fn(&Theme) -> container::Style {
     move |_| container::Style {
@@ -30,37 +30,36 @@ fn box_style(color: Color) -> impl Fn(&Theme) -> container::Style {
     }
 }
 fn card_style(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
-    move |_, status| {
+    move |theme, status| {
         let hover = matches!(status, button::Status::Hovered | button::Status::Pressed);
         button::Style {
-            background: Some(
-                if hover {
-                    Color::from_rgb8(40, 51, 59)
-                } else {
-                    CARD
-                }
-                .into(),
-            ),
+            background: Some(if hover { CARD } else { Color::TRANSPARENT }.into()),
             text_color: TEXT,
             border: Border {
-                color: if selected { ACCENT } else { LINE },
-                width: if selected { 1.5 } else { 0.5 },
-                radius: 10.0.into(),
+                color: if selected {
+                    theme.palette().primary.scale_alpha(0.85)
+                } else {
+                    Color::TRANSPARENT
+                },
+                width: 1.0,
+                radius: 13.0.into(),
             },
             ..Default::default()
         }
     }
 }
-fn secondary_style(_: &Theme, status: button::Status) -> button::Style {
+pub(crate) fn secondary_style(_: &Theme, status: button::Status) -> button::Style {
     let disabled = status == button::Status::Disabled;
     button::Style {
         background: Some(
-            if status == button::Status::Hovered {
-                Color::from_rgb8(48, 61, 67)
-            } else {
-                CARD
-            }
-            .into(),
+            palette::WASH
+                .scale_alpha(match status {
+                    button::Status::Hovered => 0.18,
+                    button::Status::Pressed => 0.12,
+                    button::Status::Disabled => 0.035,
+                    _ => 0.09,
+                })
+                .into(),
         ),
         text_color: if disabled {
             Color::from_rgb8(86, 98, 110)
@@ -68,14 +67,14 @@ fn secondary_style(_: &Theme, status: button::Status) -> button::Style {
             TEXT
         },
         border: Border {
-            color: LINE,
+            color: if disabled { Color::TRANSPARENT } else { LINE },
             width: 1.0,
-            radius: 7.0.into(),
+            radius: palette::CONTROL_RADIUS.into(),
         },
         ..Default::default()
     }
 }
-fn secondary<'a>(
+pub(crate) fn secondary<'a>(
     label: impl Into<String>,
     message: Message,
 ) -> crate::controls::Button<'a, Message> {
@@ -84,7 +83,42 @@ fn secondary<'a>(
         .on_press(message)
         .style(secondary_style)
 }
-fn primary<'a>(
+fn icon_button<'a>(
+    glyph: Icon,
+    label: &'static str,
+    message: Option<Message>,
+) -> Element<'a, Message> {
+    icon_action(glyph, label, message, false)
+}
+fn icon_action<'a>(
+    glyph: Icon,
+    label: &'static str,
+    message: Option<Message>,
+    selected: bool,
+) -> Element<'a, Message> {
+    widget::tooltip(
+        button(container(icon(glyph)).center_x(22).center_y(22))
+            .padding(9)
+            .on_press_maybe(message)
+            .style(move |theme, status| {
+                let mut style = secondary_style(theme, status);
+                style.border.radius = 50.0.into();
+                if selected {
+                    style.text_color = theme.palette().primary;
+                    style.background = Some(theme.palette().primary.scale_alpha(0.10).into());
+                }
+                style
+            }),
+        text(label).size(12),
+        widget::tooltip::Position::Top,
+    )
+    .gap(6)
+    .padding(8)
+    .delay(std::time::Duration::from_millis(400))
+    .style(palette::glass)
+    .into()
+}
+pub(crate) fn primary<'a>(
     label: impl Into<String>,
     message: Message,
     enabled: bool,
@@ -92,12 +126,36 @@ fn primary<'a>(
     button(text(label.into()).size(14))
         .padding([11, 17])
         .on_press_maybe(enabled.then_some(message))
+        .style(|theme, status| button::Style {
+            background: Some(
+                if status == button::Status::Disabled {
+                    CARD
+                } else if status == button::Status::Hovered {
+                    theme.palette().primary.scale_alpha(0.88)
+                } else if status == button::Status::Pressed {
+                    theme.palette().primary.scale_alpha(0.76)
+                } else {
+                    theme.palette().primary
+                }
+                .into(),
+            ),
+            text_color: if status == button::Status::Disabled {
+                MUTED
+            } else {
+                BG
+            },
+            border: Border {
+                radius: palette::CONTROL_RADIUS.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
 }
 fn muted<'a>(s: impl Into<String>) -> widget::Text<'a> {
     text(s.into()).size(12).color(MUTED)
 }
 fn heading<'a>(s: impl Into<String>) -> widget::Text<'a> {
-    text(s.into()).size(20)
+    text(s.into()).size(18)
 }
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() > n {
@@ -105,6 +163,20 @@ fn truncate(s: &str, n: usize) -> String {
     } else {
         s.into()
     }
+}
+fn single_line_title<'a>(title: String, size: u32) -> Element<'a, Message> {
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    widget::responsive(move |bounds| {
+        // Reserve an ellipsis and a full glyph width, including for CJK titles.
+        let limit = (bounds.width / size as f32).floor() as usize;
+        text(truncate(&title, limit.saturating_sub(1)))
+            .size(size)
+            .wrapping(widget::text::Wrapping::None)
+            .width(Fill)
+            .into()
+    })
+    .height(size as f32 * 1.3)
+    .into()
 }
 pub fn kind_label(kind: &str) -> &'static str {
     match kind {
@@ -117,57 +189,139 @@ pub fn kind_label(kind: &str) -> &'static str {
         _ => "壁纸",
     }
 }
-fn preview<'a>(item: &Value, height: f32) -> Element<'a, Message> {
-    if let Some(path) = item["thumbnail"]
-        .as_str()
-        .filter(|s| std::path::Path::new(s).is_file())
-    {
-        Element::new(ClippedImage(
-            image(path.to_owned())
-                .width(Fill)
-                .height(Fixed(height))
-                .content_fit(iced::ContentFit::Cover),
-        ))
+fn preview<'a>(app: &App, item: &Value, height: f32, fade: bool) -> Element<'a, Message> {
+    let handle = app.previews.get(item).and_then(Clone::clone);
+    let label = if matches!(app.previews.get(item), Some(None)) {
+        "预览暂不可用"
+    } else if item["preview_url"].is_string() || item["thumbnail"].is_string() {
+        ""
     } else {
-        container(
-            column![
-                text("◈").size(36).color(ACCENT),
-                muted(if item["preview_failed"] == true {
-                    "预览暂不可用"
-                } else if item["preview_url"].is_string() {
-                    "预览正在准备"
-                } else {
-                    "暂无预览"
-                })
-            ]
-            .spacing(8)
-            .align_x(Alignment::Center),
-        )
-        .center_x(Fill)
-        .center_y(Fixed(height))
-        .style(box_style(Color::from_rgb8(32, 45, 48)))
-        .into()
-    }
+        "暂无预览"
+    };
+    widget::stack![
+        container(muted(label))
+            .center_x(Fill)
+            .center_y(Fixed(height))
+            .style(box_style(CARD)),
+        Element::new(ClippedImage {
+            handle,
+            height,
+            fade
+        })
+    ]
+    .into()
 }
 // Iced's CPU image renderer does not enforce image drawing bounds itself.
 // A renderer layer makes cover-cropping consistent for both raster and GPU renderers.
-struct ClippedImage(widget::Image);
+struct ClippedImage {
+    handle: Option<widget::image::Handle>,
+    height: f32,
+    fade: bool,
+}
+struct PreviewMotion {
+    current: Option<widget::image::Handle>,
+    previous: Option<widget::image::Handle>,
+    started: Option<std::time::Instant>,
+    progress: f32,
+}
+impl PreviewMotion {
+    fn replace(&mut self, handle: Option<widget::image::Handle>, fade: bool) {
+        if !fade {
+            self.current = handle;
+            self.previous = None;
+            self.started = None;
+            self.progress = 1.0;
+            return;
+        }
+        if self.current == handle {
+            return;
+        }
+        // ponytail: retain at most two thumbnails; rapid switches use the dominant frame.
+        self.previous = if self.progress >= 0.5 || self.previous.is_none() {
+            self.current.clone()
+        } else {
+            self.previous.take()
+        };
+        self.current = handle;
+        self.started = None;
+        self.progress = if self.current.is_some() && !crate::motion::reduced() {
+            0.0
+        } else {
+            1.0
+        };
+        if self.progress >= 1.0 {
+            self.previous = None;
+        }
+    }
+}
 impl iced::advanced::Widget<Message, Theme, iced::Renderer> for ClippedImage {
+    fn tag(&self) -> iced::advanced::widget::tree::Tag {
+        iced::advanced::widget::tree::Tag::of::<PreviewMotion>()
+    }
+    fn state(&self) -> iced::advanced::widget::tree::State {
+        iced::advanced::widget::tree::State::new(PreviewMotion {
+            current: self.handle.clone(),
+            previous: None,
+            started: None,
+            progress: if self.fade && self.handle.is_some() && !crate::motion::reduced() {
+                0.0
+            } else {
+                1.0
+            },
+        })
+    }
+    fn diff(&self, tree: &mut iced::advanced::widget::Tree) {
+        tree.state
+            .downcast_mut::<PreviewMotion>()
+            .replace(self.handle.clone(), self.fade);
+    }
     fn size(&self) -> iced::Size<iced::Length> {
-        iced::advanced::Widget::<Message, Theme, iced::Renderer>::size(&self.0)
+        iced::Size::new(Fill, Fixed(self.height))
     }
     fn layout(
         &mut self,
-        tree: &mut iced::advanced::widget::Tree,
-        renderer: &iced::Renderer,
+        _tree: &mut iced::advanced::widget::Tree,
+        _renderer: &iced::Renderer,
         limits: &iced::advanced::layout::Limits,
     ) -> iced::advanced::layout::Node {
-        iced::advanced::Widget::<Message, Theme, iced::Renderer>::layout(
-            &mut self.0,
-            tree,
-            renderer,
-            limits,
-        )
+        // Fixed preview bounds need no image measurement. In particular, avoid
+        // allocating renderer images for every off-screen row during layout.
+        iced::advanced::layout::Node::new(limits.resolve(
+            Fill,
+            Fixed(self.height),
+            iced::Size::ZERO,
+        ))
+    }
+    fn update(
+        &mut self,
+        tree: &mut iced::advanced::widget::Tree,
+        event: &iced::Event,
+        layout: iced::advanced::Layout<'_>,
+        _: iced::advanced::mouse::Cursor,
+        _: &iced::Renderer,
+        _: &mut dyn iced::advanced::Clipboard,
+        shell: &mut iced::advanced::Shell<'_, Message>,
+        viewport: &iced::Rectangle,
+    ) {
+        let iced::Event::Window(iced::window::Event::RedrawRequested(now)) = event else {
+            return;
+        };
+        let state = tree.state.downcast_mut::<PreviewMotion>();
+        if state.progress >= 1.0 {
+            return;
+        }
+        if crate::motion::reduced() || !layout.bounds().intersects(viewport) {
+            state.progress = 1.0;
+        } else {
+            let start = *state.started.get_or_insert(*now);
+            state.progress = (now.saturating_duration_since(start).as_secs_f32() / 0.22).min(1.0);
+        }
+        if state.progress < 1.0 {
+            shell.request_redraw();
+        } else {
+            state.previous = None;
+            state.started = None;
+        }
     }
     fn draw(
         &self,
@@ -183,17 +337,154 @@ impl iced::advanced::Widget<Message, Theme, iced::Renderer> for ClippedImage {
         let Some(bounds) = layout.bounds().intersection(viewport) else {
             return;
         };
+        let state = tree.state.downcast_ref::<PreviewMotion>();
         renderer.with_layer(bounds, |renderer| {
-            iced::advanced::Widget::<Message, Theme, iced::Renderer>::draw(
-                &self.0, tree, renderer, theme, style, layout, cursor, viewport,
-            )
+            let mut paint = |handle: &widget::image::Handle, opacity: f32| {
+                let image = image(handle.clone())
+                    .width(Fill)
+                    .height(Fixed(self.height))
+                    .content_fit(iced::ContentFit::Cover)
+                    .border_radius(9)
+                    .opacity(opacity);
+                iced::advanced::Widget::<Message, Theme, iced::Renderer>::draw(
+                    &image, tree, renderer, theme, style, layout, cursor, viewport,
+                );
+            };
+            if let Some(previous) = &state.previous {
+                paint(previous, 1.0);
+            }
+            if let Some(current) = &state.current {
+                paint(current, crate::motion::smoothstep(state.progress));
+            }
         });
     }
 }
+struct LoadingIndicator;
+
+#[derive(Default)]
+struct LoadingPhase {
+    started: Option<std::time::Instant>,
+    turns: f32,
+}
+
+impl iced::advanced::Widget<Message, Theme, iced::Renderer> for LoadingIndicator {
+    fn tag(&self) -> iced::advanced::widget::tree::Tag {
+        iced::advanced::widget::tree::Tag::of::<LoadingPhase>()
+    }
+
+    fn state(&self) -> iced::advanced::widget::tree::State {
+        iced::advanced::widget::tree::State::new(LoadingPhase::default())
+    }
+
+    fn size(&self) -> iced::Size<iced::Length> {
+        iced::Size::new(Fixed(64.0), Fixed(64.0))
+    }
+
+    fn layout(
+        &mut self,
+        _: &mut iced::advanced::widget::Tree,
+        _: &iced::Renderer,
+        limits: &iced::advanced::layout::Limits,
+    ) -> iced::advanced::layout::Node {
+        iced::advanced::layout::Node::new(limits.resolve(
+            Fixed(64.0),
+            Fixed(64.0),
+            iced::Size::ZERO,
+        ))
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut iced::advanced::widget::Tree,
+        event: &iced::Event,
+        layout: iced::advanced::Layout<'_>,
+        _: iced::advanced::mouse::Cursor,
+        _: &iced::Renderer,
+        _: &mut dyn iced::advanced::Clipboard,
+        shell: &mut iced::advanced::Shell<'_, Message>,
+        viewport: &iced::Rectangle,
+    ) {
+        let iced::Event::Window(iced::window::Event::RedrawRequested(now)) = event else {
+            return;
+        };
+        if crate::motion::reduced() || !layout.bounds().intersects(viewport) {
+            return;
+        }
+        let phase = tree.state.downcast_mut::<LoadingPhase>();
+        let started = *phase.started.get_or_insert(*now);
+        phase.turns = (now.saturating_duration_since(started).as_secs_f32() / 1.2).fract();
+        shell.request_redraw_at(*now + std::time::Duration::from_millis(16));
+    }
+
+    fn draw(
+        &self,
+        tree: &iced::advanced::widget::Tree,
+        renderer: &mut iced::Renderer,
+        theme: &Theme,
+        _: &iced::advanced::renderer::Style,
+        layout: iced::advanced::Layout<'_>,
+        _: iced::advanced::mouse::Cursor,
+        viewport: &iced::Rectangle,
+    ) {
+        use iced::advanced::Renderer as _;
+        let bounds = layout.bounds();
+        if !bounds.intersects(viewport) {
+            return;
+        }
+        let phase = tree.state.downcast_ref::<LoadingPhase>().turns;
+        let center = bounds.center();
+        let radius = (bounds.width.min(bounds.height) / 2.0 - 6.0).max(0.0);
+        renderer.with_layer(*viewport, |renderer| {
+            for dot in 0..16 {
+                let angle = (phase + dot as f32 / 16.0) * std::f32::consts::TAU
+                    - std::f32::consts::FRAC_PI_2;
+                let (sin, cos) = angle.sin_cos();
+                renderer.fill_quad(
+                    iced::advanced::renderer::Quad {
+                        bounds: iced::Rectangle::new(
+                            iced::Point::new(
+                                center.x + radius * cos - 2.5,
+                                center.y + radius * sin - 2.5,
+                            ),
+                            iced::Size::new(5.0, 5.0),
+                        ),
+                        border: iced::border::rounded(2.5),
+                        ..Default::default()
+                    },
+                    theme
+                        .palette()
+                        .primary
+                        .scale_alpha(0.15 + 0.85 * (dot as f32 / 15.0).powi(2)),
+                );
+            }
+        });
+    }
+}
+
+fn loading<'a>() -> Element<'a, Message> {
+    container(
+        column![Element::new(LoadingIndicator), heading("正在载入壁纸")]
+            .spacing(18)
+            .align_x(Alignment::Center),
+    )
+    .center_x(Fill)
+    .center_y(Fill)
+    .padding(35)
+    .into()
+}
+
 fn badge<'a>(label: impl Into<String>) -> Element<'a, Message> {
-    container(text(label.into()).size(10).color(ACCENT))
-        .padding([3, 7])
-        .style(box_style(Color::from_rgb8(42, 62, 57)))
+    container(text(label.into()).size(10).color(MUTED))
+        .padding([4, 9])
+        .style(|_| container::Style {
+            background: Some(palette::WASH.scale_alpha(0.09).into()),
+            border: Border {
+                color: LINE,
+                width: 1.0,
+                radius: 50.0.into(),
+            },
+            ..Default::default()
+        })
         .into()
 }
 fn empty<'a>(
@@ -202,7 +493,7 @@ fn empty<'a>(
     action: Option<(&str, Message)>,
 ) -> Element<'a, Message> {
     let mut content = column![
-        text("◌").size(52).color(ACCENT),
+        icon(Icon::Empty).size(48).color(MUTED),
         heading(title.to_owned()),
         muted(description.to_owned())
     ]
@@ -227,7 +518,34 @@ pub fn view(app: &App) -> Element<'_, Message> {
         Page::Displays => displays(app),
         Page::Settings => settings(app),
     };
-    let mut middle = row![sidebar, container(content).width(Fill).height(Fill)];
+    let content = if matches!(app.page, Page::Library | Page::Discover | Page::Workshop) {
+        content
+    } else {
+        container(content)
+            .padding(iced::Padding {
+                bottom: 140.0,
+                ..Default::default()
+            })
+            .into()
+    };
+    let gallery = container(content)
+        .id("gallery-canvas")
+        .width(Fill)
+        .height(Fill)
+        .style(palette::canvas)
+        .clip(true);
+    let floating_playback = container(widget::opaque(
+        container(playback(app)).width(Fill).max_width(960),
+    ))
+    .align_bottom(Fill)
+    .center_x(Fill)
+    .padding(iced::Padding {
+        top: 0.0,
+        left: 18.0,
+        right: 18.0,
+        bottom: 18.0,
+    });
+    let mut middle = row![sidebar, widget::stack![gallery, floating_playback]].spacing(10);
     if app.selected.is_some()
         && matches!(
             app.page,
@@ -236,102 +554,169 @@ pub fn view(app: &App) -> Element<'_, Message> {
     {
         middle = middle.push(detail(app));
     }
-    let mut body = column![middle.height(Fill), playback(app)];
-    if let Some((error, message)) = &app.notice {
-        let banner = row![
-            text(if *error { "!" } else { "✓" }).size(17),
-            text(message).size(13).width(Fill),
-            button("关闭")
-                .on_press(Message::Dismiss)
-                .style(button::text)
+    let body = middle.height(Fill).padding(12);
+    let mut layers = widget::Stack::new().width(Fill).height(Fill);
+    if let Some(ambient) = &app.ambient {
+        layers = layers.push(
+            image(ambient.clone())
+                .width(Fill)
+                .height(Fill)
+                .content_fit(iced::ContentFit::Fill),
+        );
+    }
+    layers = layers.push(body);
+    if let Some(notice) = &app.notice {
+        let toast = row![
+            icon(if notice.error {
+                Icon::Alert
+            } else {
+                Icon::Check
+            }),
+            text(&notice.message).size(13).width(Fill),
+            icon_button(Icon::Close, "关闭提示", Some(Message::Dismiss))
         ]
         .spacing(14)
         .align_y(Alignment::Center);
-        body = column![
-            container(banner)
-                .padding([12, 20])
-                .style(box_style(if *error {
-                    Color::from_rgb8(67, 38, 42)
-                } else {
-                    Color::from_rgb8(32, 58, 49)
-                })),
-            body
-        ];
+        let toast = container(toast)
+            .max_width(420)
+            .padding(12)
+            .style(move |theme| {
+                let mut style = palette::glass(theme);
+                if notice.error {
+                    style.background = Some(Color::from_rgba(0.25, 0.10, 0.13, 0.94).into());
+                }
+                style
+            });
+        let toast = crate::motion::enter(
+            toast,
+            format!("{:?}", notice.expires_at),
+            iced::Vector::new(0.0, -8.0),
+        );
+        layers = layers.push(
+            container(widget::opaque(toast))
+                .align_right(Fill)
+                .height(Fill)
+                .padding(20),
+        );
     }
-    container(body)
+    container(layers)
         .width(Fill)
         .height(Fill)
-        .style(box_style(BG))
+        .style(|_| container::Style {
+            background: Some(BG.into()),
+            ..Default::default()
+        })
         .into()
 }
 fn sidebar(app: &App) -> Element<'_, Message> {
-    let mut nav = column![
-        text("M I S A R I").size(19).color(ACCENT),
-        muted("让桌面，自有风景"),
-        Space::new().height(28),
-        muted("工作空间")
-    ]
-    .spacing(8);
-    for (page, icon) in [
-        (Page::Library, "▦"),
-        (Page::Discover, "◈"),
-        (Page::Workshop, "◎"),
-        (Page::Downloads, "↓"),
-        (Page::Playlists, "☷"),
+    if app.filters_open && matches!(app.page, Page::Library | Page::Discover | Page::Workshop) {
+        return crate::motion::enter(filter_panel(app), "filters", iced::Vector::new(-8.0, 0.0));
+    }
+    let collapsed = app.sidebar_collapsed;
+    let mut nav = Column::new().spacing(8);
+    if collapsed {
+        nav = nav.push(Space::new().height(28));
+    } else {
+        nav = nav
+            .push(
+                row![
+                    text("M I S A R I").size(18).width(Fill),
+                    Space::new().width(32).height(28)
+                ]
+                .align_y(Alignment::Center),
+            )
+            .push(Space::new().height(18));
+    }
+    for (page, glyph) in [
+        (Page::Library, Icon::Grid),
+        (Page::Discover, Icon::Compass),
+        (Page::Workshop, Icon::Workshop),
+        (Page::Playlists, Icon::Playlist),
     ] {
         let selected = app.page == page;
-        let count = match page {
-            Page::Library => app.catalog.len(),
-            Page::Downloads => array(&app.service["jobs"]).len(),
-            Page::Playlists => app.library["playlists"].as_object().map_or(0, |m| m.len()),
-            _ => 0,
-        };
-        let label = row![
-            text(icon).size(18).width(23),
-            text(page.title()).size(14).width(Fill),
-            muted(if count > 0 {
-                count.to_string()
-            } else {
-                String::new()
-            })
-        ]
-        .align_y(Alignment::Center)
-        .spacing(7);
-        nav = nav.push(
-            button(label)
-                .width(Fill)
-                .padding([12, 10])
-                .on_press(Message::Navigate(page))
-                .style(move |_, status| button::Style {
-                    background: if selected {
-                        Some(Color::from_rgb8(39, 58, 54).into())
-                    } else if status == button::Status::Hovered {
-                        Some(CARD.into())
-                    } else {
-                        None
-                    },
-                    text_color: if selected { ACCENT } else { MUTED },
-                    border: Border {
-                        radius: 8.0.into(),
-                        ..Default::default()
-                    },
+        let mut label = row![icon(glyph).width(23)]
+            .align_y(Alignment::Center)
+            .spacing(7);
+        if !collapsed {
+            label = label.push(text(page.title()).size(14).width(Fill));
+        }
+        let control = button(label)
+            .width(Fill)
+            .padding([12, 12])
+            .on_press(Message::Navigate(page))
+            .style(move |theme, status| button::Style {
+                background: if selected {
+                    Some(theme.palette().primary.scale_alpha(0.13).into())
+                } else if status == button::Status::Hovered {
+                    Some(palette::WASH.scale_alpha(0.07).into())
+                } else {
+                    None
+                },
+                text_color: if selected {
+                    theme.palette().primary
+                } else {
+                    MUTED
+                },
+                border: Border {
+                    radius: palette::CONTROL_RADIUS.into(),
                     ..Default::default()
-                }),
-        );
+                },
+                ..Default::default()
+            });
+        nav = if collapsed {
+            nav.push(
+                widget::tooltip(
+                    control,
+                    text(page.title()).size(12),
+                    widget::tooltip::Position::Right,
+                )
+                .padding(8)
+                .style(box_style(CARD)),
+            )
+        } else {
+            nav.push(control)
+        };
     }
     nav = nav
         .push(Space::new().height(Fill))
-        .push(widget::rule::horizontal(1))
-        .push(secondary("▣   显示器", Message::Navigate(Page::Displays)).width(Fill))
-        .push(secondary("⚙   设置", Message::Navigate(Page::Settings)).width(Fill))
-        .push(Space::new().height(15));
-    let logged = app.service["account"]["logged_in"] == true;
-    nav = nav
-        .push(
+        .push(widget::rule::horizontal(1));
+    for (page, glyph) in [
+        (Page::Downloads, Icon::Download),
+        (Page::Displays, Icon::Monitor),
+        (Page::Settings, Icon::Settings),
+    ] {
+        nav = if collapsed {
+            nav.push(icon_button(
+                glyph,
+                page.title(),
+                Some(Message::Navigate(page)),
+            ))
+        } else {
+            nav.push(
+                button(
+                    row![icon(glyph), text(page.title()).size(13)]
+                        .spacing(10)
+                        .align_y(Alignment::Center),
+                )
+                .padding([10, 12])
+                .on_press(Message::Navigate(page))
+                .width(Fill)
+                .style(move |theme, status| {
+                    let mut style = filter_quiet_style(theme, status);
+                    if app.page == page {
+                        style.background = Some(theme.palette().primary.scale_alpha(0.13).into());
+                        style.text_color = theme.palette().primary;
+                    }
+                    style
+                }),
+            )
+        };
+    }
+    if !collapsed {
+        let logged = app.service["account"]["logged_in"] == true;
+        nav = nav.push(Space::new().height(15)).push(
             row![
-                text("●")
-                    .size(10)
-                    .color(if logged { ACCENT } else { MUTED }),
+                text("●").size(10).color(MUTED),
                 text(if logged {
                     strv(&app.service["account"], "name")
                 } else {
@@ -340,143 +725,415 @@ fn sidebar(app: &App) -> Element<'_, Message> {
                 .size(12)
             ]
             .spacing(8),
-        )
-        .push(muted(if logged {
-            "已复用 Steam 登录"
-        } else {
-            "登录与授权由 Steam 管理"
-        }));
-    container(nav)
-        .padding([28, 18])
-        .width(188)
+        );
+    }
+    let pane = container(nav)
+        .id("navigation-pane")
+        .padding(if collapsed { 8 } else { 14 })
+        .width(if collapsed { 60 } else { 200 })
         .height(Fill)
-        .style(box_style(PANEL))
-        .into()
+        .style(palette::mica);
+    let toggle = container(sidebar_toggle(collapsed)).width(Fill);
+    let toggle = if collapsed {
+        toggle.center_x(Fill)
+    } else {
+        toggle.align_right(Fill)
+    };
+    widget::hover(pane, toggle.padding(if collapsed { 8 } else { 14 }))
 }
+
+fn sidebar_toggle<'a>(collapsed: bool) -> Element<'a, Message> {
+    widget::tooltip(
+        button(
+            container(icon(if collapsed {
+                Icon::PanelLeftOpen
+            } else {
+                Icon::PanelLeftClose
+            }))
+            .center_x(20)
+            .center_y(18),
+        )
+        .id("sidebar-toggle")
+        .padding([5, 6])
+        .on_press(Message::ToggleSidebar)
+        .style(|theme, status| {
+            let mut style = filter_quiet_style(theme, status);
+            style.border.radius = 6.0.into();
+            style
+        }),
+        text(if collapsed {
+            "展开导航"
+        } else {
+            "折叠导航"
+        })
+        .size(12),
+        widget::tooltip::Position::Right,
+    )
+    .gap(6)
+    .padding(8)
+    .delay(std::time::Duration::from_millis(400))
+    .style(palette::glass)
+    .into()
+}
+
+fn filter_quiet_style(theme: &Theme, status: button::Status) -> button::Style {
+    let mut style = button::text(theme, status);
+    style.text_color = MUTED;
+    style.background = matches!(status, button::Status::Hovered | button::Status::Pressed)
+        .then_some(palette::WASH.scale_alpha(0.07).into());
+    style.border.radius = palette::CONTROL_RADIUS.into();
+    style
+}
+
+fn chip_style(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        let hover = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        button::Style {
+            background: Some(
+                if selected {
+                    theme
+                        .palette()
+                        .primary
+                        .scale_alpha(if hover { 0.16 } else { 0.09 })
+                } else {
+                    palette::WASH.scale_alpha(if hover { 0.15 } else { 0.055 })
+                }
+                .into(),
+            ),
+            text_color: if selected {
+                theme.palette().primary
+            } else {
+                MUTED
+            },
+            border: Border {
+                color: if selected {
+                    theme.palette().primary.scale_alpha(0.18)
+                } else {
+                    palette::WASH.scale_alpha(0.07)
+                },
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            ..Default::default()
+        }
+    }
+}
+
+fn filter_panel(app: &App) -> Element<'_, Message> {
+    let remote = matches!(app.page, Page::Discover | Page::Workshop);
+    let mut sections = Column::new().spacing(24);
+    for group in GROUPS {
+        let expanded = app.filter_sections.contains(&group);
+        let count = app
+            .filter_draft
+            .selected
+            .get(&group)
+            .map_or(0, |values| values.len());
+        let header = row![
+            text(group.title()).size(13).width(Fill),
+            text(if count > 0 {
+                count.to_string()
+            } else {
+                String::new()
+            })
+            .size(11)
+            .color(app.theme.palette().primary),
+            icon(if expanded {
+                Icon::ChevronDown
+            } else {
+                Icon::ChevronRight
+            })
+            .size(14)
+        ]
+        .spacing(7)
+        .align_y(Alignment::Center);
+        let header = button(header)
+            .width(Fill)
+            .padding([6, 2])
+            .style(filter_quiet_style)
+            .on_press(Message::FilterSection(group));
+        let mut section = column![header].spacing(8);
+        if expanded {
+            if group == Group::Tag {
+                section = section.push(
+                    text_input("查找标签…", &app.filter_tag_search)
+                        .id("filter-tag-search")
+                        .size(13)
+                        .padding([10, 12])
+                        .on_input(Message::FilterTagSearch),
+                );
+            }
+            let query = app.filter_tag_search.trim().to_lowercase();
+            let mut options = Row::new().spacing(7);
+            let mut found = false;
+            for &(key, label) in group.options() {
+                if remote && group == Group::Kind && matches!(key, "Image" | "Shader") {
+                    continue;
+                }
+                if group == Group::Tag
+                    && !query.is_empty()
+                    && !label.to_lowercase().contains(&query)
+                    && !key.to_lowercase().contains(&query)
+                {
+                    continue;
+                }
+                found = true;
+                let selected = app.filter_draft.contains(group, key);
+                let mut label_row = Row::new().spacing(5).align_y(Alignment::Center);
+                if selected {
+                    label_row = label_row.push(icon(Icon::Check).size(12));
+                }
+                label_row = label_row.push(text(label).size(13));
+                options = options.push(
+                    button(label_row)
+                        .padding([5, 12])
+                        .style(chip_style(selected))
+                        .on_press(Message::EditFilter(group, key.into(), !selected))
+                        .id(format!("filter-{group:?}-{key}")),
+                );
+            }
+            if !found {
+                section = section.push(muted("没有匹配的标签"));
+            } else {
+                section = section.push(options.wrap());
+            }
+        }
+        sections = sections.push(section);
+    }
+    let mut footer = Column::new().spacing(10);
+    if app.page == Page::Discover
+        && app
+            .filter_draft
+            .tag_groups()
+            .iter()
+            .any(|group| group.len() > 1)
+    {
+        footer = footer.push(muted("多选组合需要连接 Steam"));
+    }
+    footer = footer.push(
+        row![
+            secondary("重置", Message::ResetFilters)
+                .padding([7, 14])
+                .style(filter_quiet_style),
+            Space::new().width(Fill),
+            primary("应用", Message::ApplyFilters, true)
+                .padding([7, 14])
+                .id("apply-filters")
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    );
+    let back = button(icon(Icon::ChevronLeft).size(20))
+        .padding([6, 7])
+        .style(filter_quiet_style)
+        .on_press(Message::ShowNavigation);
+    container(
+        column![
+            row![back, text("筛选").size(16)]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            scrollable(sections).id("filter-panel").height(Fill),
+            container(footer).padding(iced::Padding {
+                top: 6.0,
+                ..Default::default()
+            })
+        ]
+        .spacing(18),
+    )
+    .padding(iced::Padding {
+        top: 16.0,
+        right: 16.0,
+        bottom: 28.0,
+        left: 16.0,
+    })
+    .id("navigation-pane")
+    .width(260)
+    .height(Fill)
+    .style(palette::mica)
+    .into()
+}
+
 fn browser(app: &App) -> Element<'_, Message> {
     let remote = matches!(app.page, Page::Discover | Page::Workshop);
-    let sub = match app.page {
-        Page::Discover => "来自 Wallpaper Engine 的发现与推荐",
-        Page::Workshop => "探索创作者的世界 · Steam 创意工坊",
-        _ => "收藏每一处风景，让喜欢的内容回到桌面",
-    };
-    let title = row![
-        column![text(app.page.title()).size(28), muted(sub)]
-            .spacing(5)
-            .width(Fill),
-        secondary("刷新", Message::Refresh),
-        secondary("导入文件", Message::Import(false)),
-        secondary("导入项目", Message::Import(true))
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center);
-    let search = text_input(
-        if remote {
-            "搜索创意工坊，按 Enter 搜索"
-        } else {
-            "搜索我的壁纸…  Ctrl F"
-        },
-        &app.search,
-    )
-    .id("search")
-    .padding(12)
-    .on_input(Message::Search)
-    .on_submit(Message::SearchNow);
-    let filters = if remote {
-        vec!["全部类型", "场景", "视频", "网页", "应用"]
-    } else {
-        vec!["全部类型", "场景", "视频", "网页", "应用", "图片", "着色器"]
-    }
-    .into_iter()
-    .map(String::from)
-    .collect::<Vec<_>>();
-    let sorts = if remote {
-        vec!["热门", "最新", "评分最高", "订阅最多"]
-    } else {
-        vec!["名称 A–Z", "名称 Z–A", "类型"]
-    }
-    .into_iter()
-    .map(String::from)
-    .collect::<Vec<_>>();
-    let mut controls = row![
-        search,
-        pick_list(filters, Some(app.filter.clone()), Message::Filter).padding(11),
-        pick_list(sorts, Some(app.sort.clone()), Message::Sort).padding(11)
-    ]
-    .spacing(10);
-    if remote {
-        controls = controls.push(primary("搜索", Message::SearchNow, !app.service_busy));
-    } else {
-        controls = controls.push(
-            checkbox(app.favorites_only)
-                .label("本地收藏")
-                .on_toggle(Message::Favorites)
-                .text_size(12),
-        );
-    }
-    let mut body = column![title, Space::new().height(8), controls].spacing(16);
-    if app.page == Page::Workshop {
-        body = body.push(
-            row![
-                pick_list(
-                    vec!["全部作品".to_owned(), "已订阅".into(), "Steam 收藏".into()],
-                    Some(app.scope.clone()),
-                    Message::Scope
-                )
-                .padding(9),
-                muted("Steam 收藏与资源库中的本地收藏分别管理")
-            ]
-            .spacing(12)
-            .align_y(Alignment::Center),
-        );
-    }
-    if app.page == Page::Discover {
-        body = body.push(
-            container(
-                row![
-                    column![
-                        text("为桌面找到下一份心动").size(23),
-                        muted("动态场景、沉浸视频与可交互的网页，来自同一个创作社区。")
-                    ]
-                    .spacing(9)
-                    .width(Fill),
-                    badge("WALLPAPER ENGINE")
-                ]
-                .align_y(Alignment::Center),
-            )
-            .padding(24)
-            .style(box_style(Color::from_rgb8(31, 48, 48))),
-        );
-    }
-    if app.page == Page::Discover && !app.recommendations.is_empty() {
-        let mut recommendations = Row::new().spacing(12);
-        for item in app.recommendations.iter().take(3) {
-            recommendations = recommendations.push(
-                button(column![
-                    preview(item, 76.0),
-                    container(text(truncate(&app.local_title(item), 24)).size(12)).padding([7, 10])
-                ])
-                .padding(0)
-                .width(Fill)
-                .on_press(Message::Select(strv(item, "id").into()))
-                .style(card_style(false)),
-            );
-        }
-        body = body
-            .push(column![muted("本期精选 · Wallpaper Engine 推荐"), recommendations].spacing(8));
-    }
-    if app.loading || (remote && app.service_busy && app.remote.is_empty()) {
-        return container(body.push(empty("正在载入壁纸", "读取真实项目、预览和服务状态…", None)))
-            .padding(28)
-            .height(Fill)
-            .into();
-    }
     let values = if remote {
         app.remote.iter().collect::<Vec<_>>()
     } else {
         app.filtered()
     };
     let count = values.len();
+    let page_size = app.page_size;
+    let pages = if remote {
+        app.remote_pages
+    } else {
+        count.div_ceil(page_size)
+    };
+    let page = if remote {
+        app.displayed_remote_page.saturating_sub(1)
+    } else {
+        app.page_index.min(pages.saturating_sub(1))
+    };
+    let title = row![
+        text(app.page.title()).size(28).width(Fill),
+        icon_button(Icon::Refresh, "刷新", Some(Message::Refresh)),
+        secondary("导入文件", Message::Import(false)),
+        secondary("导入项目", Message::Import(true))
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    let active_count = app.filters.count();
+    let controls = container(widget::responsive(move |size| {
+        let search = text_input(
+            if remote {
+                "搜索创意工坊，按 Enter 搜索"
+            } else {
+                "搜索我的壁纸…  Ctrl F"
+            },
+            &app.search,
+        )
+        .id("search")
+        .padding(12)
+        .on_input(Message::Search)
+        .on_submit(Message::SearchNow);
+        let sorts = if remote {
+            vec!["热门", "最新", "评分最高", "订阅最多"]
+        } else {
+            vec!["名称 A–Z", "名称 Z–A", "类型"]
+        }
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>();
+        let filter_button = button(
+            text(if active_count == 0 {
+                "筛选".to_owned()
+            } else {
+                format!("筛选 · {active_count}")
+            })
+            .size(13),
+        )
+        .padding([12, 14])
+        .on_press(Message::ToggleFilters)
+        .id("toggle-filters")
+        .style(move |theme, status| {
+            let mut style = secondary_style(theme, status);
+            if app.filters_open {
+                style.background = Some(theme.palette().primary.scale_alpha(0.16).into());
+                style.text_color = theme.palette().primary;
+            }
+            style
+        });
+        let mut controls = Row::new().spacing(8).align_y(Alignment::Center);
+        if app.page == Page::Workshop {
+            controls = controls.push(
+                pick_list(
+                    vec!["全部作品".to_owned(), "已订阅".into(), "Steam 收藏".into()],
+                    Some(app.scope.clone()),
+                    Message::Scope,
+                )
+                .padding(11)
+                .width(112),
+            );
+        }
+        controls = controls.push(search).push(filter_button);
+        if remote {
+            controls = controls.push(primary("搜索", Message::SearchNow, !app.service_busy));
+        }
+        let pagination = row![
+            icon_button(
+                Icon::ArrowLeft,
+                "上一页",
+                (page > 0 && !app.loading && !app.service_busy && !app.remote_loading())
+                    .then_some(Message::Page(-1))
+            ),
+            container(muted(format!("{} / {}", page + 1, pages.max(1)))).center_x(76),
+            icon_button(
+                Icon::ArrowRight,
+                "下一页",
+                (page + 1 < pages && !app.loading && !app.service_busy && !app.remote_loading())
+                    .then_some(Message::Page(1))
+            )
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+        controls = controls
+            .push(
+                pick_list(sorts, Some(app.sort.clone()), Message::Sort)
+                    .padding(11)
+                    .width(112),
+            )
+            .push(pagination);
+        let minimum_width = if app.page == Page::Workshop {
+            760.0
+        } else if remote {
+            640.0
+        } else {
+            560.0
+        };
+        widget::scrollable(controls.width(size.width.max(minimum_width)))
+            .direction(widget::scrollable::Direction::Horizontal(
+                widget::scrollable::Scrollbar::hidden(),
+            ))
+            .id("browser-toolbar")
+            .width(Fill)
+            .height(Fill)
+            .into()
+    }))
+    .height(46);
+    let mut body = column![title, controls].spacing(16);
+    if active_count > 0 {
+        let mut chips = Row::new().spacing(6);
+        for (&group, values) in &app.filters.selected {
+            for value in values {
+                chips = chips.push(
+                    button(
+                        row![
+                            text(group.label(value)).size(13),
+                            icon(Icon::Close).size(12)
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                    )
+                    .padding([5, 12])
+                    .style(chip_style(true))
+                    .on_press(Message::RemoveFilter(group, value.clone())),
+                );
+            }
+        }
+        chips = chips.push(
+            button(text("清除全部").size(12))
+                .padding([5, 8])
+                .style(filter_quiet_style)
+                .on_press(Message::ClearFilters),
+        );
+        body = body.push(chips.wrap());
+    }
+    if app.page == Page::Discover
+        && app.filters.count() == 0
+        && app.search.trim().is_empty()
+        && !app.recommendations.is_empty()
+    {
+        let mut recommendations = Row::new().spacing(12);
+        for item in app.recommendations.iter().take(3) {
+            recommendations = recommendations.push(
+                button(column![
+                    preview(app, item, 76.0, true),
+                    container(text(truncate(&app.local_title(item), 24)).size(12)).padding([7, 10])
+                ])
+                .padding(0)
+                .width(Fill)
+                .on_press(Message::Select(strv(item, "id").into()))
+                .card(strv(item, "id"), false)
+                .style(card_style(false)),
+            );
+        }
+        body = body
+            .push(column![muted("本期精选 · Wallpaper Engine 推荐"), recommendations].spacing(8));
+    }
+    if app.loading || (remote && app.remote_loading() && app.remote.is_empty()) {
+        return container(body.push(loading()))
+            .padding(28)
+            .height(Fill)
+            .into();
+    }
     if count == 0 {
         let (title, desc) = if remote {
             (
@@ -489,21 +1146,22 @@ fn browser(app: &App) -> Element<'_, Message> {
                 "会自动找到 Steam 中已下载的壁纸，也可以导入本地项目。",
             )
         } else {
-            (
-                "没有找到匹配的壁纸",
-                "试试其他关键词或类型，或取消「本地收藏」筛选。",
-            )
+            ("没有找到匹配的壁纸", "试试移除部分筛选条件，或更换关键词。")
         };
         return container(body.push(empty(
             title,
             desc,
             Some((
-                if remote {
+                if active_count > 0 {
+                    "清除筛选"
+                } else if remote {
                     "重试搜索"
                 } else {
                     "刷新资源库"
                 },
-                if remote {
+                if active_count > 0 {
+                    Message::ClearFilters
+                } else if remote {
                     Message::SearchNow
                 } else {
                     Message::Refresh
@@ -514,17 +1172,6 @@ fn browser(app: &App) -> Element<'_, Message> {
         .height(Fill)
         .into();
     }
-    let page_size = 12;
-    let pages = if remote {
-        app.remote_pages
-    } else {
-        count.div_ceil(page_size)
-    };
-    let page = if remote {
-        app.remote_page.saturating_sub(1)
-    } else {
-        app.page_index.min(pages.saturating_sub(1))
-    };
     let items: Vec<_> = if remote {
         values
     } else {
@@ -534,28 +1181,9 @@ fn browser(app: &App) -> Element<'_, Message> {
             .take(page_size)
             .collect()
     };
-    body = body.push(row![
-        muted(if remote {
-            format!("第 {} 页 · Steam 状态独立显示", page + 1)
-        } else {
-            format!("{} 个项目 · 本地资源", count)
-        }),
-        Space::new().width(Fill),
-        muted(if app.service_busy {
-            "正在搜索，当前显示上次结果…"
-        } else {
-            "选择壁纸以预览和调整"
-        })
-    ]);
     let grid = widget::responsive(move |size| {
-        let cols = if size.width >= 940.0 {
-            4
-        } else if size.width >= 680.0 {
-            3
-        } else {
-            2
-        };
-        let mut grid = Column::new().spacing(16);
+        let cols = grid_columns(size.width);
+        let mut grid = Column::new().spacing(22);
         for chunk in items.chunks(cols) {
             let mut line = Row::new().spacing(16);
             for item in chunk {
@@ -566,25 +1194,32 @@ fn browser(app: &App) -> Element<'_, Message> {
             }
             grid = grid.push(line);
         }
-        scrollable(grid).height(Fill).into()
+        scrollable(grid.padding(iced::Padding {
+            bottom: 148.0,
+            ..Default::default()
+        }))
+        .id("wallpaper-grid")
+        .on_scroll(|viewport| {
+            Message::GridScrolled((viewport.absolute_offset().y / 242.0) as usize)
+        })
+        .height(Fill)
+        .into()
     });
-    body = body.push(grid).push(
-        row![
-            button("← 上一页")
-                .padding([8, 13])
-                .on_press_maybe((page > 0 && !app.service_busy).then_some(Message::Page(-1)))
-                .style(secondary_style),
-            Space::new().width(Fill),
-            muted(format!("{} / {}", page + 1, pages.max(1))),
-            Space::new().width(Fill),
-            button("下一页 →")
-                .padding([8, 13])
-                .on_press_maybe((page + 1 < pages && !app.service_busy).then_some(Message::Page(1)))
-                .style(secondary_style)
-        ]
-        .align_y(Alignment::Center),
+    body = body.push(
+        widget::sensor(grid)
+            .on_show(Message::GridResized)
+            .on_resize(Message::GridResized),
     );
     container(body).padding(28).height(Fill).into()
+}
+pub fn grid_columns(width: f32) -> usize {
+    let columns = ((width + 16.0) / (220.0 + 16.0)).floor();
+    columns.max(1.0) as usize
+}
+pub fn grid_page_size(size: iced::Size) -> usize {
+    // Include a partial bottom row so the grid fills the available height.
+    let rows = (size.height / 242.0).ceil().max(1.0) as usize;
+    grid_columns(size.width) * rows
 }
 fn wallpaper_card<'a>(app: &'a App, item: &'a Value) -> Element<'a, Message> {
     let id = strv(item, "id");
@@ -593,7 +1228,7 @@ fn wallpaper_card<'a>(app: &'a App, item: &'a Value) -> Element<'a, Message> {
     let remote = !id.starts_with("we:") && !id.starts_with("local:");
     let status = if remote {
         if item["downloaded"] == true {
-            "已下载"
+            ""
         } else if item["subscribed"] == true {
             "已订阅"
         } else {
@@ -605,30 +1240,75 @@ fn wallpaper_card<'a>(app: &'a App, item: &'a Value) -> Element<'a, Message> {
     {
         "正在使用"
     } else if app.favorite(id) {
-        "本地收藏"
+        "已收藏"
     } else {
-        "已下载"
+        ""
     };
     let info = column![
-        text(truncate(&title, 25)).size(13).height(38),
         row![
-            muted(kind_label(strv(item, "kind"))),
-            Space::new().width(Fill),
-            text(status).size(10).color(if status == "正在使用" {
-                ACCENT
+            single_line_title(title, 13),
+            muted(kind_label(strv(item, "kind")))
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .height(22),
+        text(status)
+            .size(10)
+            .height(14)
+            .color(if status == "正在使用" {
+                app.theme.palette().primary
             } else {
                 MUTED
             })
-        ]
     ]
-    .spacing(10)
-    .padding([12, 13]);
-    button(column![preview(item, 142.0), info])
-        .padding(0)
+    .spacing(4)
+    .padding([0, 3]);
+    let mut thumbnail = widget::stack![preview(app, item, 156.0, true)];
+    if selected {
+        let accent = app.theme.palette().primary;
+        thumbnail = thumbnail.push(
+            container(
+                container(icon(Icon::Check).size(12).color(BG))
+                    .center_x(22)
+                    .center_y(22)
+                    .style(move |_| container::Style {
+                        background: Some(accent.into()),
+                        border: iced::border::rounded(11),
+                        ..Default::default()
+                    }),
+            )
+            .align_right(Fill)
+            .height(Fill)
+            .padding(9),
+        );
+    }
+    button(column![thumbnail, info].spacing(10))
+        .padding(5)
         .width(Fill)
         .on_press(Message::Select(id.into()))
+        .card(id, selected)
         .style(card_style(selected))
         .into()
+}
+fn size_label(app: &App, item: &Value) -> (String, &'static str) {
+    if let Some(local) = app.selected_local_asset() {
+        let label = match app.asset_sizes.get(strv(local, "path")) {
+            Some(crate::AssetSize::Loaded(Some(size))) => bytes(*size),
+            Some(crate::AssetSize::Loaded(None)) => "—".into(),
+            _ => "…".into(),
+        };
+        (label, "本地大小")
+    } else {
+        let size = item["size"]
+            .as_u64()
+            .or_else(|| item["size"].as_str()?.parse::<u64>().ok());
+        (
+            size.filter(|size| *size > 0)
+                .map(bytes)
+                .unwrap_or_else(|| "—".into()),
+            "下载大小",
+        )
+    }
 }
 fn detail(app: &App) -> Element<'_, Message> {
     let Some(item) = app.selected_asset() else {
@@ -642,6 +1322,11 @@ fn detail(app: &App) -> Element<'_, Message> {
     };
     let id = strv(item, "id");
     let remote = app.is_remote();
+    let deleting = app
+        .active_command
+        .as_ref()
+        .is_some_and(|(method, params)| *method == "trash_wallpaper" && params["asset_id"] == id);
+    let (size, size_description) = size_label(app, item);
     let mut content = column![
         row![
             muted(if remote {
@@ -650,14 +1335,23 @@ fn detail(app: &App) -> Element<'_, Message> {
                 "壁纸详情"
             }),
             Space::new().width(Fill),
-            button("×")
-                .on_press(Message::CloseDetail)
-                .style(button::text)
+            icon_button(Icon::Close, "关闭详情", Some(Message::CloseDetail))
         ],
-        preview(item, 172.0),
-        text(app.local_title(item)).size(19),
+        preview(app, item, 172.0, false),
+        text(app.local_title(item))
+            .size(19)
+            .width(Fill)
+            .wrapping(widget::text::Wrapping::WordOrGlyph),
         row![
-            badge(kind_label(strv(item, "kind"))),
+            widget::tooltip(
+                badge(format!("{} · {size}", kind_label(strv(item, "kind")))),
+                text(size_description).size(12),
+                widget::tooltip::Position::Top,
+            )
+            .gap(6)
+            .padding(8)
+            .delay(std::time::Duration::from_millis(400))
+            .style(box_style(CARD)),
             Space::new().width(Fill),
             muted(if remote {
                 "STEAM WORKSHOP"
@@ -666,7 +1360,34 @@ fn detail(app: &App) -> Element<'_, Message> {
             })
         ]
     ]
-    .spacing(14);
+    .spacing(18);
+    if app.delete_confirmation.as_deref() == Some(id) || deleting {
+        content = content
+            .push(heading(if deleting { "正在删除…" } else { "删除这张壁纸？" }))
+            .push(muted(if crate::engine::workshop_id(std::path::Path::new(strv(item, "path"))).is_some() {
+                "项目目录将移到系统回收站，并取消 Steam 订阅。正在播放这张壁纸的显示器会停止播放。"
+            } else {
+                "壁纸文件或项目目录将移到系统回收站。正在播放这张壁纸的显示器会停止播放。"
+            }))
+            .push(text(strv(item, "path")).size(12));
+        if !deleting {
+            content = content.push(
+                row![
+                    secondary("取消", Message::CancelDeleteWallpaper),
+                    primary("确认删除", Message::ConfirmDeleteWallpaper, !app.busy)
+                        .style(widget::button::danger)
+                ]
+                .spacing(10),
+            );
+        }
+        return container(scrollable(content).id("wallpaper-detail").height(Fill))
+            .id("detail-pane")
+            .padding(22)
+            .width(340)
+            .height(Fill)
+            .style(palette::mica)
+            .into();
+    }
     if remote {
         let subscribed = item["subscribed"].as_bool().unwrap_or(false);
         let favorite = item["steam_favorite"].as_bool().unwrap_or(false);
@@ -749,11 +1470,12 @@ fn detail(app: &App) -> Element<'_, Message> {
         } else {
             description
         }));
-        return container(scrollable(content).height(Fill))
+        return container(scrollable(content).id("wallpaper-detail").height(Fill))
+            .id("detail-pane")
             .padding(22)
             .width(340)
             .height(Fill)
-            .style(box_style(PANEL))
+            .style(palette::mica)
             .into();
     }
     if let Some(error) = item["error"]["message"].as_str() {
@@ -793,56 +1515,58 @@ fn detail(app: &App) -> Element<'_, Message> {
     );
     content = content.push(
         row![
+            muted("缩放方式"),
+            Space::new().width(Fill),
             pick_list(
                 vec!["填充".to_owned(), "适应".into(), "拉伸".into()],
                 Some(app.fit.clone()),
                 Message::Fit
             )
-            .padding(10),
-            primary(
-                if app.busy {
-                    "正在应用…"
-                } else {
-                    "应用壁纸"
-                },
-                Message::Apply,
-                !app.busy
-                    && item["error"].is_null()
-                    && (!matches!(strv(item, "kind"), "we_application" | "application")
-                        || app.state["backends"]["application"]["available"] == true)
-                    && app.state["outputs"]
-                        .as_object()
-                        .is_some_and(|m| !m.is_empty())
-            )
-            .width(Fill)
+            .padding(10)
         ]
-        .spacing(10),
+        .spacing(10)
+        .align_y(Alignment::Center),
+    );
+    content = content.push(
+        primary(
+            if app.busy {
+                "正在应用…"
+            } else {
+                "应用壁纸"
+            },
+            Message::Apply,
+            !app.busy
+                && item["error"].is_null()
+                && (!matches!(strv(item, "kind"), "we_application" | "application")
+                    || app.state["backends"]["application"]["available"] == true)
+                && app.state["outputs"]
+                    .as_object()
+                    .is_some_and(|m| !m.is_empty()),
+        )
+        .width(Fill),
     );
     content = content.push(
         row![
-            secondary(
+            icon_action(
+                Icon::Star,
                 if app.favorite(id) {
-                    "★ 已收藏到本地"
+                    "取消本地收藏"
                 } else {
-                    "☆ 本地收藏"
+                    "本地收藏"
                 },
-                Message::Favorite
-            )
-            .width(Fill),
-            secondary(
+                Some(Message::Favorite),
+                app.favorite(id)
+            ),
+            icon_button(
+                Icon::Folder,
                 "定位文件",
-                Message::Open(
-                    {
-                        let path = std::path::Path::new(strv(item, "path"));
-                        if path.is_file() {
-                            path.parent().unwrap_or(path)
-                        } else {
-                            path
-                        }
-                    }
-                    .to_string_lossy()
-                    .into_owned()
-                )
+                Some(Message::Open(strv(item, "path").into()))
+            ),
+            Space::new().width(Fill),
+            icon_button(
+                Icon::Trash,
+                "删除壁纸",
+                (!app.busy && !app.loading).then_some(Message::DeleteWallpaper)
             )
         ]
         .spacing(8),
@@ -881,7 +1605,7 @@ fn detail(app: &App) -> Element<'_, Message> {
                     pick_list(options, current, |v| Message::PlaylistSelect(v.id))
                         .padding(9)
                         .width(Fill),
-                    secondary("＋", Message::PlaylistAdd)
+                    icon_button(Icon::Plus, "加入播放列表", Some(Message::PlaylistAdd))
                 ]
                 .spacing(6),
             );
@@ -965,11 +1689,12 @@ fn detail(app: &App) -> Element<'_, Message> {
             }
         }
     }
-    container(scrollable(content).height(Fill))
+    container(scrollable(content).id("wallpaper-detail").height(Fill))
+        .id("detail-pane")
         .padding(22)
         .width(340)
         .height(Fill)
-        .style(box_style(PANEL))
+        .style(palette::mica)
         .into()
 }
 #[derive(Clone, Debug, PartialEq)]
@@ -986,10 +1711,18 @@ impl std::fmt::Display for Choice {
 fn property<'a>(app: &'a App, def: &'a Value) -> Element<'a, Message> {
     let key = strv(def, "key").to_owned();
     let kind = strv(def, "type");
-    let label = plain_label(def["text"].as_str().unwrap_or(&key));
+    let label = property_label(
+        &app.properties["localization"],
+        def["text"].as_str().unwrap_or(&key),
+    );
     let value = app.property_value(&key);
     if kind == "group" {
-        return text(label).size(15).color(ACCENT).into();
+        return container(text(label).size(14).color(TEXT))
+            .padding(iced::Padding {
+                top: 12.0,
+                ..Default::default()
+            })
+            .into();
     }
     if kind == "text" {
         return muted(truncate(&label, 160)).into();
@@ -1006,10 +1739,38 @@ fn property<'a>(app: &'a App, def: &'a Value) -> Element<'a, Message> {
         .spacing(4)
         .into();
     }
+    if kind == "color" {
+        return crate::color_picker::view(
+            key.clone(),
+            label,
+            &value,
+            app.color_editor.as_ref().filter(|editor| editor.key == key),
+            app.can_edit_properties(),
+        );
+    }
     if !app.can_edit_properties() {
+        let display = match kind {
+            "combo" => array(&def["options"])
+                .iter()
+                .find(|option| option["value"] == value)
+                .map(|option| {
+                    property_label(&app.properties["localization"], strv(option, "label"))
+                })
+                .unwrap_or_else(|| "未选择".into()),
+            "bool" => if value == true {
+                "已开启"
+            } else {
+                "已关闭"
+            }
+            .into(),
+            _ => value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string()),
+        };
         return column![
             muted(label),
-            text(truncate(&value.to_string(), 60)).size(12).color(MUTED)
+            text(truncate(&display, 60)).size(12).color(MUTED)
         ]
         .spacing(6)
         .into();
@@ -1054,7 +1815,8 @@ fn property<'a>(app: &'a App, def: &'a Value) -> Element<'a, Message> {
                 .enumerate()
                 .map(|(i, o)| Choice {
                     id: i.to_string(),
-                    label: plain_label(
+                    label: property_label(
+                        &app.properties["localization"],
                         o["label"]
                             .as_str()
                             .unwrap_or_else(|| o["value"].as_str().unwrap_or("选项")),
@@ -1071,65 +1833,6 @@ fn property<'a>(app: &'a App, def: &'a Value) -> Element<'a, Message> {
                 .padding(8)
                 .width(Fill),
             );
-        }
-        "color" => {
-            let channels = if let Some(a) = value.as_array() {
-                a.iter()
-                    .map(|v| v.as_f64().unwrap_or(0.0) as f32)
-                    .collect::<Vec<_>>()
-            } else {
-                value
-                    .as_str()
-                    .unwrap_or("")
-                    .split_whitespace()
-                    .filter_map(|v| v.parse().ok())
-                    .collect()
-            };
-            let c = if channels.len() == 3 {
-                channels
-            } else {
-                vec![0.0; 3]
-            };
-            field = field.push(
-                container(
-                    text(format!(
-                        "#{:02X}{:02X}{:02X}",
-                        (c[0] * 255.0) as u8,
-                        (c[1] * 255.0) as u8,
-                        (c[2] * 255.0) as u8
-                    ))
-                    .size(12)
-                    .color(if c.iter().sum::<f32>() > 1.7 {
-                        BG
-                    } else {
-                        TEXT
-                    }),
-                )
-                .padding(9)
-                .width(Fill)
-                .style(box_style(Color::from_rgb(
-                    c[0].clamp(0.0, 1.0),
-                    c[1].clamp(0.0, 1.0),
-                    c[2].clamp(0.0, 1.0),
-                ))),
-            );
-            for i in 0..3 {
-                let k = key.clone();
-                let c = c.clone();
-                let value = c[i];
-                field = field.push(
-                    row![
-                        muted(["R", "G", "B"][i]),
-                        slider(0.0..=1.0, value, move |v| {
-                            let mut c = c.clone();
-                            c[i] = v;
-                            Message::Property(k.clone(), json!(c))
-                        })
-                        .step(1.0_f32 / 255.0_f32)
-                    ]
-                    .spacing(9),
-                );
-            }
         }
         _ => {
             let k = key.clone();
@@ -1152,11 +1855,29 @@ fn property<'a>(app: &'a App, def: &'a Value) -> Element<'a, Message> {
     }
     field.into()
 }
+fn property_label(localization: &Value, key: &str) -> String {
+    for language in [
+        "zh-chs", "zh-cn", "zh-CN", "schinese", "en-us", "en-US", "english",
+    ] {
+        if let Some(label) = localization[language][key]
+            .as_str()
+            .filter(|label| !label.trim().is_empty() && *label != key)
+        {
+            return plain_label(label);
+        }
+    }
+    plain_label(key)
+}
 fn plain_label(s: &str) -> String {
     if let Some(label) = match s {
         "ui_browse_properties_scheme_color" => Some("配色"),
         "ui_browse_properties_audio_volume" => Some("音量"),
         "ui_browse_properties_playbackrate" => Some("播放速度"),
+        "ui_boot" => Some("启动时播放开场动画"),
+        "ui_language" => Some("界面语言"),
+        "ui_language_0" => Some("简体中文"),
+        "ui_language_1" => Some("English"),
+        "ui_desktopmode" => Some("桌面模式"),
         _ => None,
     } {
         return label.into();
@@ -1172,20 +1893,214 @@ fn plain_label(s: &str) -> String {
             _ => {}
         }
     }
-    result
+    let result = result
         .replace("&nbsp;", " ")
         .replace("&amp;", "&")
         .trim()
-        .to_owned()
+        .to_owned();
+    if let Some(key) = result.strip_prefix("ui_") {
+        if let Some(index) = key
+            .rsplit('_')
+            .next()
+            .and_then(|index| index.parse::<usize>().ok())
+        {
+            return format!("选项 {}", index.saturating_add(1));
+        }
+        return "自定义设置".into();
+    }
+    // Many projects author bilingual headings. Keep the Chinese side compact.
+    if let Some((chinese, _)) = result.split_once(" | ")
+        && chinese
+            .chars()
+            .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+    {
+        return chinese.trim().to_owned();
+    }
+    result
 }
 fn playback(app: &App) -> Element<'_, Message> {
+    widget::responsive(move |bounds| {
+        let mut content = Column::new().spacing(8);
+        if app.queue_open {
+            content = content.push(
+                container(container(playback_queue(app)).width(Fill).max_width(520))
+                    .align_right(Fill),
+            );
+        }
+        content.push(playback_bar(app, bounds.width < 820.0)).into()
+    })
+    .height(Shrink)
+    .into()
+}
+
+fn playback_queue(app: &App) -> Element<'_, Message> {
+    let targets = app.playback_targets();
+    let mut content = column![
+        row![
+            heading("当前播放范围"),
+            Space::new().width(Fill),
+            icon_button(Icon::Close, "关闭播放队列", Some(Message::ToggleQueue))
+        ]
+        .align_y(Alignment::Center)
+    ]
+    .spacing(12);
+    if app.playback_mixed() {
+        let mut outputs = Column::new().spacing(8);
+        for name in targets {
+            let current = strv(&app.state["outputs"][&name], "current");
+            let title = app
+                .catalog
+                .iter()
+                .find(|item| strv(item, "id") == current)
+                .map(|item| app.local_title(item))
+                .unwrap_or_else(|| "未播放".into());
+            outputs = outputs
+                .push(secondary(format!("{name} · {title}"), Message::Output(name)).width(Fill));
+        }
+        return container(
+            content
+                .push(muted("选择显示器以查看它的播放范围与设置"))
+                .push(scrollable(outputs).height(180)),
+        )
+        .padding(18)
+        .style(palette::popover)
+        .into();
+    }
+    let name = targets.first().map(String::as_str).unwrap_or("");
+    let settings = app.playback_settings(name);
+    let source = app.playback_source();
+    let members = app.playback_members(name);
+    let current = strv(app.current_output(), "current");
+    let mut queue = Column::new().spacing(4);
+    for (index, id) in members.iter().enumerate() {
+        let item = app.catalog.iter().find(|item| strv(item, "id") == id);
+        let title = item
+            .map(|item| app.local_title(item))
+            .unwrap_or_else(|| id.clone());
+        let active = id == current;
+        queue = queue.push(
+            button(
+                row![
+                    if active {
+                        icon(if app.current_output()["paused"] == true {
+                            Icon::Pause
+                        } else {
+                            Icon::Play
+                        })
+                    } else {
+                        icon(Icon::Empty).color(Color::TRANSPARENT)
+                    },
+                    muted(format!("{:02}", index + 1)),
+                    single_line_title(title, 13)
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+            )
+            .padding(9)
+            .width(Fill)
+            .style(card_style(active))
+            .on_press_maybe((!app.busy).then_some(Message::PlayQueued(id.clone()))),
+        );
+    }
+    if members.is_empty() {
+        queue = queue.push(muted("当前为单张壁纸，可加入播放列表后继续切换。"));
+    }
+    content = content.push(scrollable(queue).height(180));
+    if !members.is_empty() {
+        let minutes = settings["interval_seconds"].as_u64().unwrap_or(1800) / 60;
+        let mut intervals = vec![1, 5, 15, 30, 60, 120];
+        if !intervals.contains(&minutes) {
+            intervals.push(minutes);
+            intervals.sort_unstable();
+        }
+        content = content.push(
+            row![
+                checkbox(settings["enabled"] == true)
+                    .label("自动轮换")
+                    .on_toggle(Message::AutoRotation)
+                    .text_size(12),
+                Space::new().width(Fill),
+                muted("每隔"),
+                pick_list(intervals, Some(minutes), Message::PlaybackInterval)
+                    .padding(6)
+                    .text_size(12),
+                muted("分钟")
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+    }
+    if !current.is_empty() && strv(app.current_output(), "backend") != "application" {
+        content = content.push(
+            row![
+                muted("音量"),
+                slider(
+                    0..=100,
+                    app.current_output()["volume"].as_u64().unwrap_or(100) as u32,
+                    |volume| Message::Playback(json!({"volume":volume}))
+                )
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center),
+        );
+    }
+    content = content.push(
+        row![
+            secondary(
+                if app.library["playlists"][source].is_object() {
+                    "管理列表"
+                } else {
+                    "查看资源库"
+                },
+                Message::ShowPlaybackSource
+            ),
+            Space::new().width(Fill),
+            icon_button(
+                Icon::Stop,
+                "停止播放",
+                (!current.is_empty() && !app.busy).then_some(Message::Stop)
+            )
+        ]
+        .align_y(Alignment::Center),
+    );
+    container(content)
+        .id("playback-queue")
+        .padding(18)
+        .style(palette::popover)
+        .into()
+}
+
+fn playback_bar(app: &App, compact: bool) -> Element<'_, Message> {
     let output = app.current_output();
+    let mixed = app.playback_mixed();
     let current = strv(output, "current");
-    let item = app.catalog.iter().find(|v| strv(v, "id") == current);
-    let title = item
-        .map(|v| app.local_title(v))
-        .unwrap_or_else(|| "桌面已就绪".into());
-    let paused = output["paused"] == true;
+    let item = app
+        .catalog
+        .iter()
+        .find(|v| !mixed && strv(v, "id") == current);
+    let title = if mixed {
+        "多显示器 · 状态不同".into()
+    } else {
+        item.map(|v| app.local_title(v)).unwrap_or_else(|| {
+            if current.is_empty() {
+                "桌面已就绪".into()
+            } else {
+                "当前壁纸".into()
+            }
+        })
+    };
+    let targets = app.playback_targets();
+    let name = targets.first().map(String::as_str).unwrap_or("");
+    let settings = app.playback_settings(name);
+    let members = app.playback_members(name);
+    let has_current = targets.iter().any(|name| {
+        app.state["outputs"][name]["current"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    });
+    let paused = targets
+        .iter()
+        .all(|name| app.state["outputs"][name]["paused"] == true);
     let reasons = array(&output["pause_reasons"])
         .iter()
         .filter_map(Value::as_str)
@@ -1208,48 +2123,159 @@ fn playback(app: &App) -> Element<'_, Message> {
     } else {
         "正在播放".into()
     };
-    let mut bar = row![];
+    let mut info = Row::new()
+        .spacing(12)
+        .align_y(Alignment::Center)
+        .width(Fill);
     if let Some(item) = item {
-        bar = bar.push(container(preview(item, 48.0)).width(78));
+        info = info.push(container(preview(app, item, 40.0, true)).width(60));
     }
-    bar = bar.push(
-        column![text(truncate(&title, 48)).size(13), muted(status)]
-            .spacing(5)
-            .width(Fill),
+    let source = app.playback_source();
+    let source_title = match source {
+        "library" => "资源库",
+        "favorites" => "收藏",
+        "single" => "单张壁纸",
+        source => app.library["playlists"][source]["name"]
+            .as_str()
+            .unwrap_or("单张壁纸"),
+    };
+    let position = members
+        .iter()
+        .position(|id| id == current)
+        .map(|i| format!(" · {}/{}", i + 1, members.len()))
+        .unwrap_or_default();
+    let summary = if mixed {
+        "点击查看各显示器".into()
+    } else if current.is_empty() {
+        status.clone()
+    } else {
+        format!(
+            "{source_title}{position}{}{}",
+            if settings["enabled"] == true {
+                " · 自动轮换"
+            } else {
+                ""
+            },
+            if output["effective_paused"] == true || paused {
+                format!(" · {status}")
+            } else {
+                String::new()
+            }
+        )
+    };
+    info = info.push(
+        column![
+            single_line_title(title, 13),
+            button(single_line_title(summary, 11))
+                .padding(0)
+                .style(button::text)
+                .on_press(if mixed {
+                    Message::ToggleQueue
+                } else {
+                    Message::ShowPlaybackSource
+                })
+        ]
+        .spacing(5)
+        .width(Fill),
     );
-    bar = bar.push(
-        button(if paused { "▶ 继续" } else { "Ⅱ 暂停" })
-            .padding([9, 15])
-            .on_press_maybe(
-                (!current.is_empty() && !app.busy)
-                    .then_some(Message::Playback(json!({"paused":!paused}))),
+    let toggle = widget::tooltip(
+        button(
+            container(icon(if paused { Icon::Play } else { Icon::Pause }))
+                .center_x(18)
+                .center_y(18),
+        )
+        .padding(11)
+        .id("playback-toggle")
+        .on_press_maybe(
+            (has_current && !app.busy).then_some(Message::Playback(json!({"paused":!paused}))),
+        )
+        .style(|theme, status| {
+            let mut style = secondary_style(theme, status);
+            let disabled = status == button::Status::Disabled;
+            style.background = Some(
+                theme
+                    .palette()
+                    .primary
+                    .scale_alpha(if disabled {
+                        0.08
+                    } else if status == button::Status::Hovered {
+                        0.95
+                    } else {
+                        0.82
+                    })
+                    .into(),
+            );
+            style.text_color = if disabled { MUTED } else { BG };
+            style.border = iced::border::rounded(50);
+            style
+        }),
+        text(if paused { "继续播放" } else { "暂停" }).size(12),
+        widget::tooltip::Position::Top,
+    )
+    .padding(8)
+    .style(palette::glass);
+    let can_step = !app.busy
+        && targets.iter().any(|name| {
+            app.state["outputs"][name]["current"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+                && !app.playback_members(name).is_empty()
+        });
+    let can_previous = can_step
+        && targets
+            .iter()
+            .any(|name| app.state["rotations"][name]["can_previous"] != false);
+    let mut controls = row![
+        icon_button(
+            Icon::ChevronLeft,
+            "上一张",
+            can_previous.then_some(Message::Previous)
+        ),
+        toggle,
+        icon_button(Icon::Next, "下一张", can_step.then_some(Message::Next)),
+        icon_button(
+            Icon::Playlist,
+            "当前播放队列与轮换设置",
+            Some(Message::ToggleQueue)
+        )
+    ]
+    .spacing(if compact { 4 } else { 8 })
+    .align_y(Alignment::Center);
+    if can_step && !mixed {
+        controls = controls.push(
+            pick_list(
+                vec!["顺序切换".to_owned(), "随机挑选".to_owned()],
+                (!mixed).then(|| {
+                    if settings["mode"] == "random" {
+                        "随机挑选".into()
+                    } else {
+                        "顺序切换".into()
+                    }
+                }),
+                Message::PlaybackMode,
             )
-            .style(secondary_style),
-    );
-    bar = bar.push(
-        button("■ 停止")
-            .padding([9, 15])
-            .on_press_maybe((!current.is_empty() && !app.busy).then_some(Message::Stop))
-            .style(secondary_style),
-    );
+            .padding(7)
+            .text_size(12)
+            .width(100),
+        );
+    }
     let audio_available = strv(output, "backend") != "application";
-    let muted = output["mute"] == true;
-    bar = bar.push(
-        button(if muted { "静音" } else { "声音" })
-            .on_press_maybe(
-                (!current.is_empty() && audio_available)
-                    .then_some(Message::Playback(json!({"mute":!muted}))),
-            )
-            .style(button::text),
-    );
-    if audio_available && !current.is_empty() {
-        bar = bar.push(
+    let muted = targets
+        .iter()
+        .all(|name| app.state["outputs"][name]["mute"] == true);
+    controls = controls.push(icon_button(
+        if muted { Icon::Muted } else { Icon::Volume },
+        if muted { "取消静音" } else { "静音" },
+        (has_current && audio_available).then_some(Message::Playback(json!({"mute":!muted}))),
+    ));
+    if audio_available && !current.is_empty() && !mixed && !compact {
+        controls = controls.push(
             slider(
                 0..=100,
                 output["volume"].as_u64().unwrap_or(100) as u32,
                 |v| Message::Playback(json!({"volume":v})),
             )
-            .width(100),
+            .width(if compact { Fill } else { Fixed(84.0) }),
         );
     }
     let outputs = std::iter::once("全部显示器".to_owned())
@@ -1260,23 +2286,50 @@ fn playback(app: &App) -> Element<'_, Message> {
                 .flat_map(|m| m.keys().cloned()),
         )
         .collect::<Vec<_>>();
-    bar = bar.push(
-        pick_list(outputs, Some(app.output.clone()), Message::Output)
-            .padding(8)
-            .text_size(12),
-    );
-    container(bar.spacing(14).align_y(Alignment::Center))
-        .padding([14, 24])
-        .style(box_style(PANEL))
+    let output = pick_list(outputs, Some(app.output.clone()), Message::Output)
+        .padding([9, 10])
+        .text_size(12)
+        .width(if compact { 126 } else { 136 });
+    let content: Element<'_, Message> = if compact {
+        column![
+            row![info, output].spacing(10).align_y(Alignment::Center),
+            controls
+        ]
+        .spacing(10)
         .into()
+    } else {
+        row![info, controls, output]
+            .spacing(14)
+            .align_y(Alignment::Center)
+            .into()
+    };
+    let surface = container(content)
+        .id("playback-bar")
+        .padding([10, 14])
+        .width(Fill)
+        .style(palette::glass);
+    // A cached frosted backdrop keeps sharp gallery images out of the control surface.
+    let backdrop: Element<'_, Message> = if let Some(ambient) = &app.ambient {
+        image(ambient.clone())
+            .width(Fill)
+            .height(Fill)
+            .content_fit(iced::ContentFit::Fill)
+            .border_radius(24)
+            .into()
+    } else {
+        container(Space::new().width(Fill).height(Fill))
+            .style(|_| container::Style {
+                background: Some(PANEL.into()),
+                border: iced::border::rounded(24),
+                ..Default::default()
+            })
+            .into()
+    };
+    widget::stack![surface].push_under(backdrop).into()
 }
+
 fn downloads(app: &App) -> Element<'_, Message> {
-    let mut content = column![
-        text("下载与更新").size(28),
-        muted("Steam 负责内容传输与校验，下载进度来自真实客户端。"),
-        Space::new().height(8)
-    ]
-    .spacing(15);
+    let mut content = column![text("下载").size(28)].spacing(15);
     if let Some(error) = app.service["account"]["error"].as_str() {
         content = content
             .push(text(error).size(13).color(Color::from_rgb8(231, 181, 111)))
@@ -1293,22 +2346,23 @@ fn downloads(app: &App) -> Element<'_, Message> {
             Some(("浏览创意工坊", Message::Navigate(Page::Workshop))),
         ));
     } else {
-        content=content.push(muted("暂停 / 恢复控制全部 Wallpaper Engine 工坊传输。仅等待中的任务可以取消；已开始的传输请到 Steam 管理。"));
         content = content.push(
             row![
-                primary(
-                    "暂停全部",
-                    Message::Service(json!({"action":"pause"})),
-                    !app.service_busy
+                icon_button(
+                    Icon::Pause,
+                    "暂停全部下载",
+                    (!app.service_busy
                         && jobs.iter().any(|j| matches!(
                             strv(j, "status"),
                             "queued" | "downloading" | "updating"
-                        ))
+                        )))
+                    .then_some(Message::Service(json!({"action":"pause"})))
                 ),
-                primary(
-                    "恢复全部",
-                    Message::Service(json!({"action":"resume"})),
-                    !app.service_busy && jobs.iter().any(|j| strv(j, "status") == "paused")
+                icon_button(
+                    Icon::Play,
+                    "恢复全部下载",
+                    (!app.service_busy && jobs.iter().any(|j| strv(j, "status") == "paused"))
+                        .then_some(Message::Service(json!({"action":"resume"})))
                 ),
                 secondary(
                     "在 Steam 管理",
@@ -1366,14 +2420,13 @@ fn downloads(app: &App) -> Element<'_, Message> {
                         }
                     )),
                     Space::new().width(Fill),
-                    button(if status == "update_available" {
-                        "更新"
-                    } else {
-                        "重试"
-                    })
-                    .padding([9, 14])
-                    .style(secondary_style)
-                    .on_press_maybe(
+                    icon_button(
+                        Icon::Refresh,
+                        if status == "update_available" {
+                            "更新"
+                        } else {
+                            "重试"
+                        },
                         (!app.service_busy
                             && matches!(
                                 status,
@@ -1381,13 +2434,12 @@ fn downloads(app: &App) -> Element<'_, Message> {
                             ))
                         .then_some(Message::Service(json!({"action":"retry","id":id})))
                     ),
-                    button("取消排队")
-                        .padding([9, 14])
-                        .style(secondary_style)
-                        .on_press_maybe(
-                            (!app.service_busy && status == "queued")
-                                .then_some(Message::Service(json!({"action":"cancel","id":id})))
-                        )
+                    icon_button(
+                        Icon::Close,
+                        "取消排队",
+                        (!app.service_busy && status == "queued")
+                            .then_some(Message::Service(json!({"action":"cancel","id":id})))
+                    )
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center)
@@ -1403,16 +2455,23 @@ fn downloads(app: &App) -> Element<'_, Message> {
     container(content).padding(32).height(Fill).into()
 }
 fn bytes(v: u64) -> String {
-    if v >= 1024 * 1024 * 1024 {
-        format!("{:.1} GB", v as f64 / (1024.0 * 1024.0 * 1024.0))
+    let units = ["B", "KB", "MB", "GB", "TB", "PB", "EB"];
+    let mut value = v as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < units.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{v} B")
     } else {
-        format!("{:.1} MB", v as f64 / (1024.0 * 1024.0))
+        format!("{value:.1} {}", units[unit])
     }
 }
+
 fn playlists(app: &App) -> Element<'_, Message> {
     let mut content = column![
         text("播放列表").size(28),
-        muted("把喜欢的风景排成一段日常，轮换会在后台继续。"),
         row![
             text_input("输入播放列表名称", &app.playlist_name)
                 .on_input(Message::PlaylistName)
@@ -1463,6 +2522,11 @@ fn playlists(app: &App) -> Element<'_, Message> {
         .spacing(8),
     );
     let members = array(&app.library["playlists"][&app.playlist]["members"]);
+    content = content.push(primary(
+        "播放此列表",
+        Message::PlayPlaylist(None),
+        !members.is_empty() && !app.busy,
+    ));
     let mut list = Column::new().spacing(8);
     for (i, member) in members.iter().enumerate() {
         let id = member.as_str().unwrap_or("");
@@ -1470,26 +2534,47 @@ fn playlists(app: &App) -> Element<'_, Message> {
         let title = item
             .map(|v| app.local_title(v))
             .unwrap_or_else(|| format!("项目暂不可用：{id}"));
+        let playing = !app.playback_mixed()
+            && app.playback_source() == app.playlist
+            && strv(app.current_output(), "current") == id;
         let mut line = row![muted(format!("{:02}", i + 1))]
             .spacing(12)
             .align_y(Alignment::Center);
+        line = line.push(icon_button(
+            if playing && app.current_output()["paused"] != true {
+                Icon::Pause
+            } else {
+                Icon::Play
+            },
+            if playing {
+                "正在播放此项"
+            } else {
+                "从此项播放列表"
+            },
+            (!app.busy && item.is_some()).then_some(if playing {
+                Message::Playback(json!({"paused": app.current_output()["paused"] != true}))
+            } else {
+                Message::PlayPlaylist(Some(id.into()))
+            }),
+        ));
         if let Some(item) = item {
-            line = line.push(container(preview(item, 48.0)).width(76));
+            line = line.push(container(preview(app, item, 48.0, true)).width(76));
         }
         line = line
             .push(
                 button(text(truncate(&title, 38)).size(13))
+                    .id(format!("playlist-item-{i}"))
                     .style(button::text)
                     .on_press(Message::Select(id.into()))
                     .width(Fill),
             )
             .push(
-                button("↑")
+                button(icon(Icon::ArrowUp))
                     .on_press_maybe((i > 0).then_some(Message::PlaylistMove(i, -1)))
                     .style(secondary_style),
             )
             .push(
-                button("↓")
+                button(icon(Icon::ArrowDown))
                     .on_press_maybe((i + 1 < members.len()).then_some(Message::PlaylistMove(i, 1)))
                     .style(secondary_style),
             )
@@ -1498,14 +2583,26 @@ fn playlists(app: &App) -> Element<'_, Message> {
                     .on_press(Message::PlaylistRemove(i))
                     .style(button::text),
             );
-        list = list.push(container(line).padding(12).style(box_style(CARD)));
+        list = list.push(
+            container(line)
+                .padding(12)
+                .style(move |theme| container::Style {
+                    background: Some(CARD.into()),
+                    border: Border {
+                        radius: 12.0.into(),
+                        width: if playing { 1.0 } else { 0.0 },
+                        color: theme.palette().primary,
+                    },
+                    ..Default::default()
+                }),
+        );
     }
     if members.is_empty() {
         list = list.push(muted(
             "列表还是空的。去资源库选择壁纸，在详情面板加入这个列表。",
         ));
     }
-    content = content.push(scrollable(list).height(Fill));
+    content = content.push(list);
     let outputs = std::iter::once("全部显示器".to_owned())
         .chain(
             app.state["outputs"]
@@ -1566,23 +2663,35 @@ fn playlists(app: &App) -> Element<'_, Message> {
     rotation = rotation.push(
         row![
             primary(
-                "保存并开始轮播",
+                "保存并启用自动轮换",
                 Message::StartRotation(true),
                 !members.is_empty() && !app.busy
             ),
-            secondary("停止轮播", Message::StartRotation(false)),
-            secondary("下一张", Message::Next),
+            icon_button(
+                Icon::Stop,
+                "关闭此列表的自动轮换",
+                app.playback_targets()
+                    .iter()
+                    .any(|name| {
+                        let settings = app.playback_settings(name);
+                        settings["source"] == app.playlist && settings["enabled"] == true
+                    })
+                    .then_some(Message::StartRotation(false))
+            ),
             Space::new().width(Fill),
             secondary("添加壁纸", Message::Navigate(Page::Library))
         ]
         .spacing(8),
     );
     content = content.push(container(rotation).padding(22).style(box_style(PANEL)));
-    container(content).padding(32).height(Fill).into()
+    container(scrollable(content))
+        .padding(32)
+        .height(Fill)
+        .into()
 }
 fn displays(app: &App) -> Element<'_, Message> {
     let mut content = column![
-        text("每一块屏幕，都有自己的风景").size(28),
+        text("显示器").size(28),
         muted("独立选择壁纸，或应用到全部显示器。相同视频和场景共享播放时钟；网页与应用暂不支持帧同步。")
     ]
     .spacing(20);
@@ -1604,7 +2713,7 @@ fn displays(app: &App) -> Element<'_, Message> {
                 .unwrap_or_else(|| "尚未设置壁纸".into());
             let screen = container(
                 column![
-                    text("▣").size(44).color(ACCENT),
+                    icon(Icon::Monitor).size(44).color(MUTED),
                     text(name).size(18),
                     muted(geometry)
                 ]
@@ -1624,18 +2733,27 @@ fn displays(app: &App) -> Element<'_, Message> {
                 text(title).size(14),
                 row![
                     secondary("选择此显示器", Message::Output(name.clone())),
-                    secondary(
+                    icon_button(
                         if output["paused"] == true {
-                            "继续"
+                            Icon::Play
+                        } else {
+                            Icon::Pause
+                        },
+                        if output["paused"] == true {
+                            "继续播放"
                         } else {
                             "暂停"
                         },
-                        Message::Command(
+                        Some(Message::Command(
                             "set_playback",
                             json!({"output":name,"paused":output["paused"]!=true})
-                        )
+                        ))
                     ),
-                    secondary("停止", Message::Command("release", json!({"output":name})))
+                    icon_button(
+                        Icon::Stop,
+                        "停止",
+                        Some(Message::Command("release", json!({"output":name})))
+                    )
                 ]
                 .spacing(8)
             ]
@@ -1667,7 +2785,6 @@ fn displays(app: &App) -> Element<'_, Message> {
 fn settings(app: &App) -> Element<'_, Message> {
     let mut content = column![
         text("设置").size(28),
-        muted("安静地运行，在需要时让出资源。"),
         Space::new().height(8),
         heading("播放与性能")
     ]
@@ -1798,14 +2915,4 @@ Ctrl 1–7 切换页面 · Ctrl F 搜索 · Ctrl R 刷新 · Ctrl I 导入 · Ct
     .padding(32)
     .height(Fill)
     .into()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn authored_labels_are_plain_text() {
-        assert_eq!(plain_label("<b>颜色</b> &amp; 光线"), "颜色 & 光线");
-        assert_eq!(truncate("你好世界", 2), "你好…");
-    }
 }

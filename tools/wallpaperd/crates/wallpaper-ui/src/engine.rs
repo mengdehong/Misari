@@ -297,7 +297,12 @@ fn exchange(method: &str, params: Value, start: bool) -> Result<Value, String> {
 
 pub fn load() -> Result<Value, String> {
     let state = request("get", json!({}))?;
-    let catalog = request("catalog", json!({}))?;
+    let mut catalog = request("catalog", json!({}))?;
+    if let Some(assets) = catalog["assets"].as_array_mut() {
+        for asset in assets {
+            enrich_filter_metadata(asset);
+        }
+    }
     let library = request("get_library", json!({}))?;
     let displays = capture(
         Command::new("niri").args(["msg", "--json", "outputs"]),
@@ -310,84 +315,247 @@ pub fn load() -> Result<Value, String> {
     )
 }
 
-pub fn open(target: &str) -> Result<(), String> {
+/// Read metadata once on the loading worker, never while building the grid.
+fn enrich_filter_metadata(asset: &mut Value) {
+    let path = Path::new(crate::strv(asset, "path"));
+    if path.is_dir() {
+        let project = fs::File::open(path.join("project.json"))
+            .ok()
+            .and_then(|file| {
+                let mut bytes = Vec::new();
+                file.take(1024 * 1024 + 1).read_to_end(&mut bytes).ok()?;
+                (bytes.len() <= 1024 * 1024).then_some(())?;
+                serde_json::from_slice::<Value>(
+                    bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes),
+                )
+                .ok()
+            });
+        if let Some(project) = project {
+            let metadata = json!({"kind":asset["kind"],"project":project});
+            asset["tags"] = json!(crate::filters::metadata_tags(&metadata));
+        }
+    } else if asset["kind"] == "image"
+        && let Ok((width, height)) = image::image_dimensions(path)
+    {
+        asset["tags"] = json!([crate::filters::resolution_tag(width, height)]);
+    }
+}
+
+/// Keep project translations at the presentation boundary; property keys and values stay intact.
+pub fn properties(params: Value) -> Result<Value, String> {
+    let mut snapshot = request("get_properties", params.clone())?;
+    if let Some(path) = params["asset_id"]
+        .as_str()
+        .and_then(|id| id.strip_prefix("we:"))
+    {
+        let path = Path::new(path).join("project.json");
+        if fs::metadata(&path).is_ok_and(|metadata| metadata.len() <= 8 * 1024 * 1024)
+            && let Ok(bytes) = fs::read(path)
+            && let Ok(project) = serde_json::from_slice::<Value>(&bytes)
+        {
+            snapshot["localization"] = project["general"]["localization"].clone();
+        }
+    }
+    Ok(snapshot)
+}
+
+/// Sum regular file sizes without following symlinks outside the project.
+pub fn asset_size(path: &Path) -> Option<u64> {
+    let mut pending = vec![path.to_owned()];
+    let mut total = 0_u64;
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path).ok()?;
+        if metadata.is_file() {
+            total = total.checked_add(metadata.len())?;
+        } else if metadata.is_dir() {
+            for entry in fs::read_dir(&path).ok()? {
+                pending.push(entry.ok()?.path());
+            }
+        }
+    }
+    Some(total)
+}
+
+/// Only a catalog asset's canonical file or complete WE project can be trashed.
+pub fn wallpaper_path(asset: &Value) -> Result<&Path, String> {
+    let id = asset["id"].as_str().ok_or("壁纸编号无效。")?;
+    let path = Path::new(asset["path"].as_str().ok_or("壁纸路径无效。")?);
+    let valid = if let Some(source) = id.strip_prefix("local:") {
+        Path::new(source) == path && path.is_file()
+    } else if let Some(source) = id.strip_prefix("we:") {
+        Path::new(source) == path && path.is_dir() && path.join("project.json").is_file()
+    } else {
+        false
+    };
+    if !valid
+        || !path.is_absolute()
+        || path.parent().is_none()
+        || path.canonicalize().map_err(|e| e.to_string())? != path
+    {
+        return Err("壁纸路径已变化，请刷新资源库后重试。".into());
+    }
+    Ok(path)
+}
+
+pub fn workshop_id(path: &Path) -> Option<&str> {
+    let id = path.file_name()?.to_str()?;
+    if !id.bytes().all(|byte| byte.is_ascii_digit()) || id.parse::<u64>().ok()? == 0 {
+        return None;
+    }
+    let app = path.parent()?;
+    let content = app.parent()?;
+    let workshop = content.parent()?;
+    let steamapps = workshop.parent()?;
+    (app.file_name()? == "431960"
+        && content.file_name()? == "content"
+        && workshop.file_name()? == "workshop"
+        && steamapps.file_name()? == "steamapps")
+        .then_some(id)
+}
+
+fn trash_command(path: &Path) -> Command {
+    let mut command = Command::new("gio");
+    command.args(["trash", "--"]).arg(path);
+    command
+}
+
+pub fn move_to_trash(path: &Path) -> Result<(), String> {
+    capture(&mut trash_command(path), Duration::from_secs(30))
+        .map(|_| ())
+        .map_err(|error| format!("无法移到系统回收站，请检查 gio 和文件权限：{error}"))
+}
+
+pub fn trash_wallpaper(asset_id: &str) -> Result<Value, String> {
+    trash_wallpaper_with(asset_id, request, crate::services::execute)
+}
+
+fn trash_wallpaper_with(
+    asset_id: &str,
+    mut request: impl FnMut(&str, Value) -> Result<Value, String>,
+    trash: impl FnOnce(Value) -> Result<Value, String>,
+) -> Result<Value, String> {
+    let catalog = request("catalog", json!({}))?;
+    let asset = crate::array(&catalog["assets"])
+        .iter()
+        .find(|item| item["id"] == asset_id)
+        .ok_or("壁纸已不在资源库中，请刷新后重试。")?;
+    let path = wallpaper_path(asset)?;
+    let state = request("get", json!({}))?;
+    let hidden = crate::array(&state["state"]["library"]["hidden"])
+        .iter()
+        .any(|id| id == asset_id);
+    // Exclude it from every rotation before stopping playback or moving files.
+    let mut reply = request(
+        "edit_library",
+        json!({"action":"hide","asset_id":asset_id,"hidden":true}),
+    )?;
+    let result = (|| {
+        let state = request("get", json!({}))?;
+        if let Some(outputs) = state["state"]["outputs"].as_object() {
+            for (name, output) in outputs {
+                if output["current"] == asset_id || output["pending"] == asset_id {
+                    request("release", json!({"output":name}))?;
+                }
+            }
+        }
+        trash(json!({"action":"trash_wallpaper","id":asset_id,"path":path}))
+    })();
+    match result {
+        Ok(service) => {
+            // Refresh rotation candidates before restoring visibility. Restored
+            // files and future subscriptions should appear in the library again.
+            let refreshed = request("catalog", json!({})).and_then(|_| {
+                request(
+                    "edit_library",
+                    json!({"action":"hide","asset_id":asset_id,"hidden":hidden}),
+                )
+            });
+            match refreshed {
+                Ok(value) => reply = value,
+                Err(error) => {
+                    reply["warning"] = json!(format!("壁纸已移到回收站，但刷新资源库失败：{error}"))
+                }
+            }
+            reply["message"] = service["message"].clone();
+            if let Some(warning) = service.get("warning") {
+                reply["warning"] = json!(match reply["warning"].as_str() {
+                    Some(previous) =>
+                        format!("{}；{previous}", warning.as_str().unwrap_or_default()),
+                    None => warning.as_str().unwrap_or_default().into(),
+                });
+            }
+            if service.get("account").is_some() {
+                reply["service"] = service;
+            }
+            Ok(reply)
+        }
+        Err(error) => {
+            if !hidden
+                && let Err(rollback) = request(
+                    "edit_library",
+                    json!({"action":"hide","asset_id":asset_id,"hidden":false}),
+                )
+            {
+                return Err(format!("{error}；恢复资源库显示失败：{rollback}"));
+            }
+            Err(error)
+        }
+    }
+}
+
+pub async fn open(target: &str) -> Result<(), String> {
     if target.is_empty() || target.chars().any(char::is_control) {
         return Err("无法打开空白或包含控制字符的位置。".into());
     }
-    // Never pass user text to a shell, and never let it become an option.
-    let argument = if target.starts_with('-') {
-        std::env::current_dir()
-            .map_err(|error| error.to_string())?
-            .join(target)
-            .to_string_lossy()
-            .into_owned()
+    use ashpd::desktop::open_uri::{OpenDirectoryRequest, OpenFileRequest};
+    let uri = url::Url::parse(target).ok();
+    let result = if let Some(uri) = uri.as_ref().filter(|uri| uri.scheme() != "file") {
+        OpenFileRequest::default().send_uri(uri).await
     } else {
-        target.to_owned()
+        let path = match uri {
+            Some(uri) => uri.to_file_path().map_err(|_| "无法识别本地文件位置。")?,
+            None => PathBuf::from(target),
+        };
+        let file = fs::File::open(&path).map_err(|error| format!("无法定位文件：{error}"))?;
+        // OpenDirectory reveals this item in its parent through FileManager1,
+        // with the desktop portal providing a fallback for other file managers.
+        OpenDirectoryRequest::default().send(&file).await
     };
-    let mut child = Command::new("xdg-open")
-        .arg(argument)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| format!("无法打开系统应用：{error}"))?;
-    thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(())
+    portal_response(result.and_then(|request| request.response())).map(|_| ())
 }
 
-pub fn pick(directory: bool) -> Result<Option<String>, String> {
-    let mut zenity = Command::new("zenity");
-    zenity.args(["--file-selection", "--title=导入壁纸"]);
-    if directory {
-        zenity.arg("--directory");
+pub async fn pick(directory: bool) -> Result<Option<String>, String> {
+    let result = ashpd::desktop::file_chooser::SelectedFiles::open_file()
+        .title("导入壁纸")
+        .accept_label("选择")
+        .directory(directory)
+        .multiple(false)
+        .current_folder(home())
+        .map_err(|error| format!("无法设置文件选择位置：{error}"))?
+        .send()
+        .await
+        .and_then(|request| request.response());
+    portal_response(result)?
+        .map(|selected| {
+            selected
+                .uris()
+                .first()
+                .ok_or("文件选择器未返回所选路径。")?
+                .to_file_path()
+                .map_err(|_| "所选位置不是本地文件。")?
+                .into_os_string()
+                .into_string()
+                .map_err(|_| "所选路径包含无法识别的字符。".to_owned())
+        })
+        .transpose()
+}
+
+fn portal_response<T>(result: Result<T, ashpd::Error>) -> Result<Option<T>, String> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(ashpd::Error::Response(ashpd::desktop::ResponseError::Cancelled)) => Ok(None),
+        Err(error) => Err(format!("无法调用系统文件服务：{error}")),
     }
-    let output = match zenity.output() {
-        Ok(output) => output,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut kdialog = Command::new("kdialog");
-            kdialog
-                .arg(if directory {
-                    "--getexistingdirectory"
-                } else {
-                    "--getopenfilename"
-                })
-                .arg(home());
-            match kdialog.output() {
-                Ok(output) => output,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    let dialog = rfd::FileDialog::new()
-                        .set_title("导入壁纸")
-                        .set_directory(home());
-                    let selected = if directory {
-                        dialog.pick_folder()
-                    } else {
-                        dialog.pick_file()
-                    };
-                    return selected
-                        .map(|path| {
-                            path.into_os_string()
-                                .into_string()
-                                .map_err(|_| "所选路径包含无法识别的字符。".to_string())
-                        })
-                        .transpose();
-                }
-                Err(error) => return Err(format!("无法打开系统文件选择器：{error}")),
-            }
-        }
-        Err(error) => return Err(format!("无法打开文件选择器：{error}")),
-    };
-    if output.status.code() == Some(1) {
-        return Ok(None);
-    }
-    if !output.status.success() {
-        return Err("文件选择器未能打开，请检查桌面会话。".into());
-    }
-    let path =
-        String::from_utf8(output.stdout).map_err(|_| "所选路径不是有效的 UTF-8".to_string())?;
-    let path = path.trim_end_matches(['\r', '\n']);
-    Ok((!path.is_empty()).then(|| path.to_owned()))
 }
 
 fn capture(command: &mut Command, timeout: Duration) -> Result<Vec<u8>, String> {
@@ -431,9 +599,39 @@ fn capture(command: &mut Command, timeout: Duration) -> Result<Vec<u8>, String> 
     Ok(bytes)
 }
 
+pub fn reduced_motion() -> bool {
+    if let Ok(value) = std::env::var("MISARI_REDUCED_MOTION") {
+        return matches!(value.as_str(), "1" | "true");
+    }
+    capture(
+        Command::new("gsettings").args(["get", "org.gnome.desktop.interface", "enable-animations"]),
+        Duration::from_millis(200),
+    )
+    .is_ok_and(|output| output.trim_ascii() == b"false")
+}
+
 /// Cache a bounded first frame, including animated GIF previews.
 pub fn thumbnail(path: &str) -> Option<PathBuf> {
     prepare_thumbnail(Path::new(path)).ok()
+}
+
+/// Iced can lay out decoded handles without opening or decoding files itself.
+pub fn thumbnail_handle(path: &Path) -> Option<iced::widget::image::Handle> {
+    let mut reader = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(480);
+    limits.max_image_height = Some(320);
+    limits.max_alloc = Some(4 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader.decode().ok()?.into_rgba8();
+    Some(iced::widget::image::Handle::from_rgba(
+        image.width(),
+        image.height(),
+        image.into_raw(),
+    ))
 }
 
 fn prepare_thumbnail(path: &Path) -> Result<PathBuf, String> {
@@ -504,6 +702,175 @@ pub fn diagnose() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_filter_metadata_comes_from_project_files_and_image_headers() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("project.json"), r#"{"tags":["Landscape"],"contentrating":"Everyone","general":{"supportsaudioprocessing":true,"properties":{"speed":{}}}}"#).unwrap();
+        let mut asset = json!({"path":directory.path(),"kind":"we_scene"});
+        enrich_filter_metadata(&mut asset);
+        let tags = crate::filters::metadata_tags(&asset);
+        for tag in [
+            "Scene",
+            "Landscape",
+            "Everyone",
+            "Audio responsive",
+            "Customizable",
+        ] {
+            assert!(tags.contains(tag));
+        }
+        let path = directory.path().join("image.png");
+        image::RgbaImage::new(16, 9).save(&path).unwrap();
+        let mut asset = json!({"path":path,"kind":"image"});
+        enrich_filter_metadata(&mut asset);
+        assert_eq!(asset["tags"], json!(["Other resolution"]));
+        fs::write(directory.path().join("project.json"), "invalid json").unwrap();
+        let mut asset = json!({"path":directory.path(),"kind":"we_scene"});
+        enrich_filter_metadata(&mut asset);
+        assert!(!crate::filters::metadata_tags(&asset).contains("Everyone"));
+    }
+
+    #[test]
+    fn asset_sizes_cover_files_and_complete_projects_without_symlink_loops() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("project");
+        fs::create_dir_all(project.join("assets")).unwrap();
+        fs::write(project.join("project.json"), b"{}").unwrap();
+        let file = project.join("assets/video.mp4");
+        fs::write(&file, b"video").unwrap();
+        fs::write(directory.path().join("outside"), b"not part of the project").unwrap();
+        std::os::unix::fs::symlink(directory.path(), project.join("assets/link")).unwrap();
+        assert_eq!(asset_size(&file), Some(5));
+        assert_eq!(asset_size(&project), Some(7));
+        assert_eq!(asset_size(&project.join("missing")), None);
+        fs::write(project.join("empty"), b"").unwrap();
+        assert_eq!(asset_size(&project.join("empty")), Some(0));
+    }
+
+    #[test]
+    fn trash_preserves_wallpaper_files_and_complete_projects() {
+        // /tmp can be an internal tmpfs mount that GIO deliberately cannot trash.
+        let root = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let data = root.join("data");
+        let file = root.join("壁纸 ' $(echo unsafe).jpg");
+        let sibling = root.join("keep.jpg");
+        fs::write(&file, b"wallpaper").unwrap();
+        fs::write(&sibling, b"keep").unwrap();
+        let asset = json!({"id":format!("local:{}", file.display()),"path":file});
+        assert_eq!(wallpaper_path(&asset).unwrap(), file);
+        assert!(wallpaper_path(&json!({"id":"42","path":file})).is_err());
+        assert!(wallpaper_path(&json!({"id":asset["id"],"path":sibling})).is_err());
+        let project = root.join("project");
+        fs::create_dir_all(project.join("assets")).unwrap();
+        fs::write(project.join("project.json"), b"{}").unwrap();
+        fs::write(project.join("assets/scene.pkg"), b"scene").unwrap();
+        assert!(
+            wallpaper_path(&json!({"id":format!("we:{}", project.display()),"path":project}))
+                .is_ok()
+        );
+        assert!(
+            wallpaper_path(&json!({"id":format!("we:{}", root.display()),"path":root})).is_err()
+        );
+
+        for path in [&file, &project] {
+            capture(
+                trash_command(path)
+                    .env("XDG_DATA_HOME", &data)
+                    .env("GIO_USE_VFS", "local"),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            assert!(!path.exists());
+        }
+        let trashed = data.join("Trash/files");
+        assert_eq!(
+            fs::read(trashed.join(file.file_name().unwrap())).unwrap(),
+            b"wallpaper"
+        );
+        assert_eq!(
+            fs::read(trashed.join("project/assets/scene.pkg")).unwrap(),
+            b"scene"
+        );
+        assert_eq!(fs::read(sibling).unwrap(), b"keep");
+        assert_eq!(fs::read_dir(data.join("Trash/info")).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn workshop_ids_only_match_wallpaper_engine_installations() {
+        assert_eq!(
+            workshop_id(Path::new("/Steam/steamapps/workshop/content/431960/42")),
+            Some("42")
+        );
+        for path in [
+            "/Pictures/42",
+            "/Steam/steamapps/workshop/content/123/42",
+            "/Steam/steamapps/workshop/content/431960/0",
+            "/Steam/steamapps/workshop/content/431960/+42",
+            "/Steam/steamapps/workshop/content/431960/42/scene.pkg",
+        ] {
+            assert_eq!(workshop_id(Path::new(path)), None);
+        }
+    }
+
+    #[test]
+    fn deletion_stops_affected_outputs_and_restores_visibility_on_success_or_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("wallpaper.jpg");
+        fs::write(&path, b"wallpaper").unwrap();
+        let id = format!("local:{}", path.display());
+        for fails in [false, true] {
+            let mut calls = Vec::new();
+            let reply = trash_wallpaper_with(
+                &id,
+                |method, params| {
+                    calls.push((method.to_owned(), params.clone()));
+                    Ok(match method {
+                        "catalog" => json!({"assets":[{"id":id,"path":path}]}),
+                        "get" => json!({"state":{"library":{"hidden":[]},"outputs":{
+                            "A":{"current":id},"B":{"pending":id},"C":{"current":"local:/other"}
+                        }}}),
+                        "edit_library" => {
+                            json!({"library":{"hidden":if params["hidden"] == true {vec![id.clone()]} else {vec![]}}})
+                        }
+                        "release" => json!({}),
+                        _ => panic!("unexpected request: {method}"),
+                    })
+                },
+                |action| {
+                    assert_eq!(action["action"], "trash_wallpaper");
+                    assert_eq!(action["id"], id);
+                    if fails {
+                        Err("trash unavailable".into())
+                    } else {
+                        Ok(json!({"message":"deleted"}))
+                    }
+                },
+            );
+            assert_eq!(reply.is_err(), fails);
+            assert_eq!(calls[2].1["hidden"], true, "hide before stopping playback");
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|(method, _)| method == "release")
+                    .map(|(_, params)| crate::strv(params, "output"))
+                    .collect::<Vec<_>>(),
+                ["A", "B"]
+            );
+            assert_eq!(calls.last().unwrap().1["hidden"], false);
+            if !fails {
+                assert_eq!(
+                    calls[calls.len() - 2].0,
+                    "catalog",
+                    "refresh rotations before unhiding"
+                );
+            }
+        }
+    }
 
     #[test]
     fn protocol_boundaries_and_errors() {

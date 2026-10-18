@@ -11,7 +11,7 @@ import sys
 import tempfile
 
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "tools/wallpaperd/Cargo.toml"
 
 
@@ -103,6 +103,7 @@ def main():
     for name, source in binaries.items():
         atomic_copy(source, app / name, 0o755)
     atomic_copy(library, app / "libsteam_api.so", 0o755)
+    atomic_copy(ROOT / "tools/wallpaperd/crates/wallpaper-ui/assets/lucide/LICENSE", app / "LICENSE.lucide", 0o644)
     script = (
         "#!/bin/sh\n"
         f"MISARI_APP_DIR={shlex.quote(str(app))}\n"

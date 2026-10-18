@@ -1,4 +1,5 @@
 //! Steam owns authentication and content transfer; discovery metadata has its own adapter.
+use crate::filters::Filters;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -7,11 +8,7 @@ use std::{
     hash::{Hash, Hasher},
     io::Read,
     path::PathBuf,
-    sync::{
-        OnceLock,
-        atomic::{AtomicUsize, Ordering},
-        mpsc,
-    },
+    sync::{OnceLock, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -25,6 +22,7 @@ const WAIT: Duration = Duration::from_secs(20);
 type Reply = Result<Value, String>;
 struct Message {
     action: Value,
+    discovery: Option<Value>,
     reply: mpsc::Sender<Reply>,
 }
 static WORKER: OnceLock<mpsc::Sender<Message>> = OnceLock::new();
@@ -32,6 +30,13 @@ static WORKER: OnceLock<mpsc::Sender<Message>> = OnceLock::new();
 /// All SDK calls stay on one worker. Call from an asynchronous UI task.
 pub fn execute(action: Value) -> Reply {
     validate_action(&action)?;
+    // HTTP does not use the Steam SDK. Keep slow discovery requests off its
+    // serialized worker so callbacks and download progress keep running.
+    let discovery = match action["action"].as_str() {
+        Some("search") if action["source"] == "discover" => Some(Discovery::search(&action)?),
+        Some("explore") => Some(Discovery::explore()?),
+        _ => None,
+    };
     let worker = WORKER.get_or_init(|| {
         let (tx, rx) = mpsc::channel::<Message>();
         thread::spawn(move || {
@@ -39,7 +44,9 @@ pub fn execute(action: Value) -> Reply {
             loop {
                 match rx.recv_timeout(Duration::from_millis(250)) {
                     Ok(message) => {
-                        let _ = message.reply.send(service.execute(message.action));
+                        let _ = message
+                            .reply
+                            .send(service.execute(message.action, message.discovery));
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(mpsc::RecvTimeoutError::Timeout) => (),
@@ -51,13 +58,18 @@ pub fn execute(action: Value) -> Reply {
     });
     let (tx, rx) = mpsc::channel();
     worker
-        .send(Message { action, reply: tx })
+        .send(Message {
+            action,
+            discovery,
+            reply: tx,
+        })
         .map_err(|_| "Steam 服务已停止，请重新打开应用。".to_string())?;
     rx.recv_timeout(Duration::from_secs(90))
         .map_err(|_| "Steam 响应超时，请检查 Steam 客户端连接后重试。".to_string())?
 }
 
 fn validate_action(action: &Value) -> Result<(), String> {
+    Filters::from_action(action)?;
     if action["text"]
         .as_str()
         .is_some_and(|text| text.len() > 1024 || text.contains('\0'))
@@ -264,7 +276,7 @@ impl Steam {
         Ok(client)
     }
 
-    fn execute(&mut self, action: Value) -> Reply {
+    fn execute(&mut self, action: Value, discovery: Option<Value>) -> Reply {
         if self.read_only
             && !matches!(
                 action["action"].as_str().unwrap_or("status"),
@@ -285,10 +297,10 @@ impl Steam {
         }
         match action["action"].as_str().unwrap_or("status") {
             "status" => self.status(),
-            "explore" => self.explore(),
+            "explore" => self.explore(discovery.ok_or("推荐数据未载入")?),
             "search" => {
                 let mut result = if action["source"] == "discover" {
-                    Discovery::search(&action)?
+                    discovery.ok_or("发现数据未载入")?
                 } else {
                     self.search(&action)?
                 };
@@ -350,6 +362,38 @@ impl Steam {
                     "已订阅，Steam 将下载内容并保持更新。"
                 } else {
                     "已取消 Steam 订阅，本地已有文件保留。"
+                });
+                Ok(status)
+            }
+            "trash_wallpaper" => {
+                let path = crate::engine::wallpaper_path(&action)?;
+                let workshop = crate::engine::workshop_id(path);
+                if let Some(id) = workshop {
+                    let client = self.sdk()?;
+                    let state = client.ugc().item_state(item_id(&json!({"id":id}))?);
+                    if state.intersects(ItemState::DOWNLOADING | ItemState::DOWNLOAD_PENDING) {
+                        return Err("这张壁纸正在下载或更新，请等待完成后再删除。".into());
+                    }
+                }
+                // Steam removes unsubscribed files when the app exits, so preserve
+                // them in the trash before changing the subscription.
+                crate::engine::move_to_trash(path)?;
+                let mut status = if let Some(id) = workshop {
+                    match self.execute(json!({"action":"subscribe","id":id,"value":false}), None) {
+                        Ok(status) => status,
+                        Err(error) => {
+                            return Ok(json!({"warning":format!(
+                                "壁纸已移到回收站，但取消 Steam 订阅失败：{error}。请在 Steam 中取消订阅，以免重新下载。"
+                            )}));
+                        }
+                    }
+                } else {
+                    json!({})
+                };
+                status["message"] = json!(if workshop.is_some() {
+                    "壁纸已移到回收站，并已取消 Steam 订阅。"
+                } else {
+                    "壁纸已移到回收站。"
                 });
                 Ok(status)
             }
@@ -619,9 +663,6 @@ impl Steam {
         item["downloaded"] = json!(state.contains(ItemState::INSTALLED));
         item["needs_update"] = json!(state.contains(ItemState::NEEDS_UPDATE));
         item["steam_favorite"] = json!(self.favorites.contains(&id.to_string()));
-        if let Some(url) = item["preview_url"].as_str() {
-            item["thumbnail"] = json!(cached_preview(id, url));
-        }
     }
 
     fn status(&mut self) -> Reply {
@@ -747,11 +788,20 @@ impl Steam {
             "relevance" => UGCQueryType::RankedByTextSearch,
             _ => UGCQueryType::RankedByTrend,
         };
+        let filters = Filters::from_action(action)?;
+        let days = match sort_name {
+            "trend_day" => 1,
+            "trend_month" => 30,
+            "trend_year" => 365,
+            _ => 7,
+        };
+        if filters.tag_groups().iter().any(|group| group.len() > 1) {
+            return grouped_search(&client, action, &filters, sort, days, page);
+        }
         let mut query = client
             .ugc()
             .query_all(sort, UGCType::Items, AppIDs::ConsumerAppId(APP), page)
             .map_err(|e| e.to_string())?
-            .set_return_long_description(true)
             .set_allow_cached_response(60);
         if let Some(text) = action["text"].as_str().filter(|s| !s.is_empty()) {
             query = query.set_search_text(text);
@@ -759,19 +809,16 @@ impl Steam {
         if let Some(kind) = tag(action["kind"].as_str().unwrap_or("all")) {
             query = query.add_required_tag(kind);
         }
+        for group in filters.tag_groups() {
+            query = query.add_required_tag(group[0]);
+        }
         if sort == UGCQueryType::RankedByTrend {
-            query = query.set_ranked_by_trend_days(match sort_name {
-                "trend_day" => 1,
-                "trend_month" => 30,
-                "trend_year" => 365,
-                _ => 7,
-            });
+            query = query.set_ranked_by_trend_days(days);
         }
         fetch(&client, query, page)
     }
 
-    fn explore(&mut self) -> Reply {
-        let mut response = Discovery::explore()?;
+    fn explore(&mut self, mut response: Value) -> Reply {
         response["items"] = json!([]);
         let mut ids = BTreeSet::new();
         let covers = response["collections"]
@@ -884,9 +931,145 @@ impl Steam {
     }
 }
 
+/// The typed wrapper lacks AddRequiredTagGroup. Query IDs through the flat SDK,
+/// then reuse the normal details reader; keep Steam's order, total and paging.
+fn grouped_search(
+    client: &Client,
+    action: &Value,
+    filters: &Filters,
+    sort: UGCQueryType,
+    days: u32,
+    page: u32,
+) -> Reply {
+    use std::{ffi::CString, mem::MaybeUninit};
+    use steamworks::sys;
+    // SAFETY: called only on the initialized Steam worker. Strings and their
+    // pointer arrays live through each SDK call, and every query is released.
+    let (ids, total) = unsafe {
+        let ugc = sys::SteamAPI_SteamUGC_v021();
+        let utils = sys::SteamAPI_SteamUtils_v010();
+        if ugc.is_null() || utils.is_null() {
+            return Err("Steam 筛选接口不可用。".into());
+        }
+        let handle = sys::SteamAPI_ISteamUGC_CreateQueryAllUGCRequestPage(
+            ugc,
+            sort.into(),
+            sys::EUGCMatchingUGCType::k_EUGCMatchingUGCType_Items,
+            0,
+            APP.0,
+            page,
+        );
+        if handle == u64::MAX {
+            return Err("无法创建 Steam 筛选查询。".into());
+        }
+        let result = (|| -> Result<(Vec<PublishedFileId>, u32), String> {
+            for group in filters.tag_groups() {
+                let strings = group
+                    .iter()
+                    .map(|tag| CString::new(*tag).map_err(|_| "筛选标签无效。".to_owned()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut pointers = strings.iter().map(|s| s.as_ptr()).collect::<Vec<_>>();
+                let tags = sys::SteamParamStringArray_t {
+                    m_ppStrings: pointers.as_mut_ptr(),
+                    m_nNumStrings: pointers.len() as i32,
+                };
+                if !sys::SteamAPI_ISteamUGC_AddRequiredTagGroup(ugc, handle, &tags) {
+                    return Err("Steam 未接受筛选条件。".into());
+                }
+            }
+            if let Some(text) = action["text"].as_str().filter(|text| !text.is_empty()) {
+                let text = CString::new(text).map_err(|_| "搜索文字无效。")?;
+                if !sys::SteamAPI_ISteamUGC_SetSearchText(ugc, handle, text.as_ptr()) {
+                    return Err("Steam 未接受搜索文字。".into());
+                }
+            }
+            if let Some(kind) = tag(action["kind"].as_str().unwrap_or("all")) {
+                let kind = CString::new(kind).unwrap();
+                if !sys::SteamAPI_ISteamUGC_AddRequiredTag(ugc, handle, kind.as_ptr()) {
+                    return Err("Steam 未接受类型筛选。".into());
+                }
+            }
+            sys::SteamAPI_ISteamUGC_SetAllowCachedResponse(ugc, handle, 60);
+            if sort == UGCQueryType::RankedByTrend {
+                sys::SteamAPI_ISteamUGC_SetRankedByTrendDays(ugc, handle, days);
+            }
+            let call = sys::SteamAPI_ISteamUGC_SendQueryUGCRequest(ugc, handle);
+            if call == 0 {
+                return Err("Steam 未接受筛选查询。".into());
+            }
+            let deadline = Instant::now() + WAIT;
+            let completed = loop {
+                let mut failed = false;
+                if sys::SteamAPI_ISteamUtils_IsAPICallCompleted(utils, call, &mut failed) {
+                    if failed {
+                        return Err("Steam 筛选查询失败，请重试。".into());
+                    }
+                    let mut result = MaybeUninit::<sys::SteamUGCQueryCompleted_t>::uninit();
+                    let ok = sys::SteamAPI_ISteamUtils_GetAPICallResult(
+                        utils,
+                        call,
+                        result.as_mut_ptr().cast(),
+                        std::mem::size_of::<sys::SteamUGCQueryCompleted_t>() as i32,
+                        sys::SteamUGCQueryCompleted_t_k_iCallback as i32,
+                        &mut failed,
+                    );
+                    if !ok || failed {
+                        return Err("无法读取 Steam 筛选结果。".into());
+                    }
+                    break result.assume_init();
+                }
+                if Instant::now() >= deadline {
+                    return Err("Steam 筛选查询超时，请重试。".into());
+                }
+                client.run_callbacks();
+                thread::sleep(Duration::from_millis(10));
+            };
+            if completed.m_eResult != sys::EResult::k_EResultOK {
+                return Err(format!("Steam 筛选查询失败：{:?}", completed.m_eResult));
+            }
+            let mut ids = Vec::new();
+            for index in 0..completed.m_unNumResultsReturned {
+                let mut details = MaybeUninit::<sys::SteamUGCDetails_t>::uninit();
+                if !sys::SteamAPI_ISteamUGC_GetQueryUGCResult(
+                    ugc,
+                    handle,
+                    index,
+                    details.as_mut_ptr(),
+                ) {
+                    return Err("Steam 筛选结果不完整，请重试。".into());
+                }
+                ids.push(PublishedFileId(details.assume_init().m_nPublishedFileId));
+            }
+            Ok((ids, completed.m_unTotalMatchingResults))
+        })();
+        sys::SteamAPI_ISteamUGC_ReleaseQueryUGCRequest(ugc, handle);
+        result?
+    };
+    let mut response = if ids.is_empty() {
+        json!({"items":[],"source":"steam","page":page})
+    } else {
+        let query = client
+            .ugc()
+            .query_items(ids.clone())
+            .map_err(|error| error.to_string())?;
+        fetch(client, query, page)?
+    };
+    if let Some(items) = response["items"].as_array_mut() {
+        items.sort_by_key(|item| {
+            ids.iter().position(|id| {
+                item["id"].as_str().and_then(|id| id.parse::<u64>().ok()) == Some(id.0)
+            })
+        });
+    }
+    response["total"] = json!(total);
+    response["total_pages"] = json!(total.div_ceil(50).max(1));
+    Ok(response)
+}
+
 fn user_page(items: &[Value], action: &Value) -> Value {
     let text = action["text"].as_str().unwrap_or_default().to_lowercase();
     let required_kind = tag(action["kind"].as_str().unwrap_or_default());
+    let filters = Filters::from_action(action).expect("validated search filters");
     let mut items = items
         .iter()
         .filter(|item| {
@@ -907,7 +1090,7 @@ fn user_page(items: &[Value], action: &Value) -> Value {
                         .is_some_and(|tag| tag.eq_ignore_ascii_case(required))
                 })
             });
-            matches_text && matches_kind
+            matches_text && matches_kind && filters.matches(item)
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -1075,21 +1258,7 @@ impl Discovery {
 
     fn search(action: &Value) -> Reply {
         let page = action["page"].as_u64().unwrap_or(1);
-        let mut url =
-            url::Url::parse("https://www.wallpaperengineapi.com/api/backupquery/v1").unwrap();
-        {
-            let mut query = url.query_pairs_mut();
-            query.append_pair("page", &page.to_string()).append_pair(
-                "sort",
-                sort_name(action["sort"].as_str().unwrap_or("top_rated")),
-            );
-            if let Some(text) = action["text"].as_str().filter(|s| !s.is_empty()) {
-                query.append_pair("text", text);
-            }
-            if let Some(kind) = tag(action["kind"].as_str().unwrap_or("all")) {
-                query.append_pair("requiredTags", kind);
-            }
-        }
+        let url = discovery_search_url(action)?;
         let response = http_json(url.as_str())?;
         let items=response["response"]["items"].as_array().ok_or("Wallpaper Engine 发现服务返回了无法识别的数据。")?
             .iter().filter_map(|item|{
@@ -1105,28 +1274,62 @@ impl Discovery {
     }
 }
 
+fn discovery_search_url(action: &Value) -> Result<url::Url, String> {
+    let filters = Filters::from_action(action)?;
+    let groups = filters.tag_groups();
+    if groups.iter().any(|group| group.len() > 1) {
+        return Err("发现服务的多选组合筛选需要通过 Steam 查询。".into());
+    }
+    let mut url = url::Url::parse("https://www.wallpaperengineapi.com/api/backupquery/v1").unwrap();
+    {
+        let mut query = url.query_pairs_mut();
+        query
+            .append_pair("page", &action["page"].as_u64().unwrap_or(1).to_string())
+            .append_pair(
+                "sort",
+                sort_name(action["sort"].as_str().unwrap_or("top_rated")),
+            );
+        if let Some(text) = action["text"].as_str().filter(|text| !text.is_empty()) {
+            query.append_pair("text", text);
+        }
+        if let Some(kind) = tag(action["kind"].as_str().unwrap_or("all")) {
+            query.append_pair("requiredTags", kind);
+        }
+        for group in groups {
+            query.append_pair("requiredTags", group[0]);
+        }
+    }
+    Ok(url)
+}
+
+fn http_agent() -> &'static ureq::Agent {
+    static HTTP: OnceLock<ureq::Agent> = OnceLock::new();
+    HTTP.get_or_init(|| {
+        // Honor HTTPS-specific proxy settings before a generic ALL_PROXY. In
+        // particular this avoids selecting an unsupported SOCKS transport when the
+        // desktop already exposes an HTTP CONNECT proxy for HTTPS requests.
+        let proxy = ["https_proxy", "HTTPS_PROXY"]
+            .into_iter()
+            .find_map(|key| {
+                std::env::var(key)
+                    .ok()
+                    .and_then(|value| ureq::Proxy::new(&value).ok())
+            })
+            .or_else(ureq::Proxy::try_from_env);
+        ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(12)))
+            .proxy(proxy)
+            .build()
+            .into()
+    })
+}
+
 fn http_bytes(url: &str, limit: u64) -> Result<Vec<u8>, String> {
     let parsed = url::Url::parse(url).map_err(|e| e.to_string())?;
     if parsed.scheme() != "https" {
         return Err("预览链接必须使用 HTTPS。".into());
     }
-    // Honor HTTPS-specific proxy settings before a generic ALL_PROXY. In
-    // particular this avoids selecting an unsupported SOCKS transport when the
-    // desktop already exposes an HTTP CONNECT proxy for HTTPS requests.
-    let proxy = ["https_proxy", "HTTPS_PROXY"]
-        .into_iter()
-        .find_map(|key| {
-            std::env::var(key)
-                .ok()
-                .and_then(|value| ureq::Proxy::new(&value).ok())
-        })
-        .or_else(ureq::Proxy::try_from_env);
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(12)))
-        .proxy(proxy)
-        .build()
-        .into();
-    agent
+    http_agent()
         .get(url)
         .call()
         .map_err(|e| format!("在线服务暂时不可用：{e}"))?
@@ -1147,89 +1350,320 @@ fn preview_path(id: u64, url: &str) -> PathBuf {
     cache_dir().join(format!("{id}-{:016x}.img", hash.finish()))
 }
 
-fn cached_preview(id: u64, url: &str) -> Option<PathBuf> {
-    let output = preview_path(id, url);
-    output
-        .is_file()
-        .then(|| crate::engine::thumbnail(output.to_str()?))
-        .flatten()
+/// Load disk caches before waiting for a network slot.
+pub fn cached_thumbnail(item: &Value) -> Option<iced::widget::image::Handle> {
+    let path = if let (Some(id), Some(url)) = (
+        item["id"].as_str().and_then(|id| id.parse::<u64>().ok()),
+        item["preview_url"].as_str().filter(|url| !url.is_empty()),
+    ) {
+        let path = preview_path(id, url);
+        crate::engine::thumbnail(path.to_str()?)?
+    } else {
+        crate::engine::thumbnail(item["thumbnail"].as_str()?)?
+    };
+    crate::engine::thumbnail_handle(&path)
 }
 
-/// Download previews outside the serialized Steam SDK worker. The UI merges
-/// only thumbnail fields, since subscription/favorite state may have changed.
-pub fn hydrate_thumbnails(mut items: Vec<Value>) -> Vec<Value> {
-    prefetch(&items);
-    for item in &mut items {
-        if let (Some(id), Some(url)) = (
-            item["id"].as_str().and_then(|id| id.parse::<u64>().ok()),
-            item["preview_url"].as_str(),
-        ) {
-            item["thumbnail"] = json!(cached_preview(id, url));
+fn preview_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        let mut builder = reqwest::Client::builder()
+            .https_only(true)
+            .timeout(Duration::from_secs(12))
+            .pool_max_idle_per_host(8);
+        if let Some(proxy) = ["https_proxy", "HTTPS_PROXY"].into_iter().find_map(|key| {
+            std::env::var(key)
+                .ok()
+                .and_then(|value| reqwest::Proxy::https(value).ok())
+        }) {
+            builder = builder.proxy(proxy);
         }
-    }
-    items
+        builder.build().expect("HTTPS preview client")
+    })
 }
 
-fn prefetch(items: &[Value]) {
-    let work = items
-        .iter()
-        .take(100)
-        .filter_map(|item| {
-            Some((
-                item["id"].as_str()?.parse::<u64>().ok()?,
-                item["preview_url"].as_str()?.to_owned(),
-            ))
-        })
-        .collect::<Vec<_>>();
-    let cursor = AtomicUsize::new(0);
-    let deadline = Instant::now() + Duration::from_secs(15);
-    thread::scope(|scope| {
-        for _ in 0..8.min(work.len()) {
-            scope.spawn(|| {
-                loop {
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                    let index = cursor.fetch_add(1, Ordering::Relaxed);
-                    let Some((id, url)) = work.get(index) else {
-                        break;
-                    };
-                    let _ = preview(*id, url);
-                }
-            });
-        }
-    });
-}
-
-fn preview(id: u64, url: &str) -> Option<PathBuf> {
-    // A workshop id is numeric; untrusted URLs never become filesystem names.
-    let output = preview_path(id, url);
-    if output.is_file() {
-        return crate::engine::thumbnail(output.to_str()?);
-    }
-    let parsed = url::Url::parse(url).ok()?;
-    let host = parsed.host_str()?;
-    if ![
-        "steamusercontent.com",
-        "steamuserimages-a.akamaihd.net",
-        "steamstatic.com",
-    ]
-    .iter()
-    .any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}")))
-    {
+fn preview_request_url(original: &str) -> Option<url::Url> {
+    let mut url = url::Url::parse(original).ok()?;
+    let host = url.host_str()?;
+    let steam_image = host == "steamusercontent.com"
+        || host.ends_with(".steamusercontent.com")
+        || host == "steamuserimages-a.akamaihd.net";
+    let steam_static = host == "steamstatic.com" || host.ends_with(".steamstatic.com");
+    if url.scheme() != "https" || !(steam_image || steam_static) {
         return None;
     }
-    let bytes = http_bytes(url, 8 * 1024 * 1024).ok()?;
-    fs::create_dir_all(output.parent()?).ok()?;
-    let temporary = output.with_extension("tmp");
-    fs::write(&temporary, bytes).ok()?;
-    fs::rename(&temporary, &output).ok()?;
-    crate::engine::thumbnail(output.to_str()?)
+    if steam_image {
+        let pairs: Vec<_> = url
+            .query_pairs()
+            .filter(|(key, _)| {
+                !matches!(
+                    key.as_ref(),
+                    "imw" | "imh" | "ima" | "impolicy" | "imcolor" | "letterbox" | "imf"
+                )
+            })
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        url.set_query(None);
+        url.query_pairs_mut().extend_pairs(pairs).extend_pairs([
+            ("imw", "480"),
+            ("imh", "320"),
+            ("ima", "fit"),
+            ("impolicy", "Letterbox"),
+            ("imcolor", "#000000"),
+            ("letterbox", "false"),
+        ]);
+    }
+    Some(url)
+}
+
+fn gif_first_frame(bytes: &[u8]) -> Option<Vec<u8>> {
+    use image::{AnimationDecoder, ImageDecoder};
+    let mut decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes)).ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(4096);
+    limits.max_image_height = Some(4096);
+    limits.max_alloc = Some(64 * 1024 * 1024);
+    decoder.set_limits(limits).ok()?;
+    let frame = decoder.into_frames().next()?.ok()?.into_buffer();
+    let image = image::DynamicImage::ImageRgba8(frame).thumbnail(480, 320);
+    let mut output = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut output, image::ImageFormat::Png).ok()?;
+    Some(output.into_inner())
+}
+
+async fn preview_bytes(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
+    const LIMIT: usize = 8 * 1024 * 1024;
+    let mut response = client.get(url).send().await.ok()?.error_for_status().ok()?;
+    let large = response
+        .content_length()
+        .is_some_and(|length| length > LIMIT as u64);
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if bytes.len() + chunk.len() > LIMIT {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+        let gif = bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a");
+        if large && bytes.len() >= 6 && !gif {
+            return None;
+        }
+        // A chunk can complete the first frame below any byte-count threshold.
+        // Probe on arrival so a slow animation tail cannot hide a ready preview.
+        if gif {
+            let prefix = bytes.clone();
+            if let Some(frame) = crate::blocking(move || gif_first_frame(&prefix)).await {
+                // Dropping the response stops downloading the unused animation frames.
+                return Some(frame);
+            }
+        }
+    }
+    Some(bytes)
+}
+
+pub async fn download_thumbnail(item: Value) -> Option<iced::widget::image::Handle> {
+    let id = item["id"].as_str()?.parse::<u64>().ok()?;
+    let url = item["preview_url"].as_str()?;
+    let requested = preview_request_url(url)?;
+    let output = preview_path(id, url);
+    let bytes = preview_bytes(preview_client(), requested.as_str()).await?;
+    crate::blocking(move || {
+        fs::create_dir_all(output.parent()?).ok()?;
+        let temporary = output.with_extension(format!(
+            "{}-{:?}.tmp",
+            std::process::id(),
+            thread::current().id()
+        ));
+        fs::write(&temporary, bytes).ok()?;
+        if fs::rename(&temporary, &output).is_err() {
+            let _ = fs::remove_file(&temporary);
+            return None;
+        }
+        let path = crate::engine::thumbnail(output.to_str()?)?;
+        crate::engine::thumbnail_handle(&path)
+    })
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_sends_each_condition_to_the_server_before_pagination() {
+        use crate::filters::Group;
+        let mut filters = Filters::default();
+        for (group, value) in [
+            (Group::Kind, "Scene"),
+            (Group::Tag, "Landscape"),
+            (Group::Feature, "Audio responsive"),
+            (Group::Rating, "Everyone"),
+        ] {
+            filters.set(group, value.into(), true);
+        }
+        let url = discovery_search_url(
+            &json!({"filters":filters,"text":"海 & 风","page":3,"sort":"最新"}),
+        )
+        .unwrap();
+        let pairs = url.query_pairs().collect::<Vec<_>>();
+        assert!(
+            pairs
+                .iter()
+                .any(|(key, value)| key == "page" && value == "3")
+        );
+        assert!(
+            pairs
+                .iter()
+                .any(|(key, value)| key == "text" && value == "海 & 风")
+        );
+        let tags = pairs
+            .iter()
+            .filter(|(key, _)| key == "requiredTags")
+            .map(|(_, value)| value.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(tags.len(), 4);
+        assert!(tags.contains(&"Landscape") && tags.contains(&"Audio responsive"));
+        filters.set(Group::Kind, "Video".into(), true);
+        assert!(discovery_search_url(&json!({"filters":filters})).is_err());
+    }
+
+    #[test]
+    fn personal_scope_filters_the_full_collection_before_pagination() {
+        use crate::filters::Group;
+        let mut filters = Filters::default();
+        filters.set(Group::Kind, "Scene".into(), true);
+        filters.set(Group::Kind, "Video".into(), true);
+        filters.set(Group::Tag, "Nature".into(), true);
+        filters.set(Group::Rating, "Everyone".into(), true);
+        let items=(0..150).map(|index| json!({"id":index.to_string(),"kind":if index%2==0 {"we_scene"} else {"video"},"tags":[if index<60 {"Landscape"} else {"Nature"},if index%3==0 {"Mature"}else{"Everyone"}]})).collect::<Vec<_>>();
+        let result = user_page(&items, &json!({"filters":filters,"page":2}));
+        assert_eq!(result["total"], 60);
+        assert_eq!(result["total_pages"], 2);
+        assert_eq!(result["items"].as_array().unwrap().len(), 10);
+        assert!(
+            result["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| filters.matches(item))
+        );
+    }
+
+    #[test]
+    fn preview_url_requests_a_bounded_cdn_image() {
+        let url = preview_request_url("https://images.steamusercontent.com/ugc/1/2/?imw=4096&v=3")
+            .unwrap();
+        let query: BTreeMap<_, _> = url.query_pairs().collect();
+        assert_eq!(query["imw"], "480");
+        assert_eq!(query["imh"], "320");
+        assert_eq!(query["impolicy"], "Letterbox");
+        assert_eq!(query["v"], "3");
+        assert!(preview_request_url("http://images.steamusercontent.com/a").is_none());
+        assert!(preview_request_url("https://steamusercontent.com.evil.invalid/a").is_none());
+    }
+
+    #[test]
+    fn aborting_a_preview_closes_the_pending_http_body() {
+        use std::{io::Write, net::TcpListener};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/preview", listener.local_addr().unwrap());
+        let (sent, headers) = tokio::sync::oneshot::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\nx")
+                .unwrap();
+            let _ = sent.send(());
+            let mut byte = [0];
+            matches!(stream.read(&mut byte), Ok(0))
+        });
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let client = reqwest::Client::builder().no_proxy().build().unwrap();
+                let request = tokio::spawn(async move { preview_bytes(&client, &url).await });
+                tokio::time::timeout(Duration::from_secs(2), headers)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                request.abort();
+                let _ = request.await;
+            });
+        assert!(
+            server.join().unwrap(),
+            "aborted requests must release the connection immediately"
+        );
+    }
+
+    #[test]
+    fn animated_preview_returns_the_first_frame_without_downloading_the_tail() {
+        use std::{io::Write, net::TcpListener};
+        let mut gif = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut gif);
+            encoder
+                .encode_frame(image::Frame::new(image::RgbaImage::from_pixel(
+                    32,
+                    32,
+                    image::Rgba([20, 40, 60, 255]),
+                )))
+                .unwrap();
+        }
+        gif.pop(); // The rest of the animation, including its trailer, has not arrived.
+        assert!(
+            gif.len() < 8192,
+            "the complete first frame is a small prefix"
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/animation", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 16777216\r\n\r\n")
+                .unwrap();
+            stream.write_all(&gif).unwrap();
+            let mut byte = [0];
+            matches!(stream.read(&mut byte), Ok(0))
+        });
+        let png = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let client = reqwest::Client::builder().no_proxy().build().unwrap();
+                tokio::time::timeout(Duration::from_secs(1), preview_bytes(&client, &url))
+                    .await
+                    .unwrap()
+                    .unwrap()
+            });
+        assert!(png.starts_with(b"\x89PNG"));
+        let image = image::load_from_memory(&png).unwrap();
+        assert!(image.width() <= 480 && image.height() <= 320);
+        assert!(
+            server.join().unwrap(),
+            "the unused animation must stop downloading"
+        );
+    }
+
     #[test]
     fn ids_and_search_boundaries() {
         assert_eq!(item_id(&json!({"id":"3582127204"})).unwrap().0, 3582127204);

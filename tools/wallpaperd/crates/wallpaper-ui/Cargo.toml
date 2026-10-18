@@ -8,17 +8,21 @@ name = "misari-wallpaper"
 path = "src/main.rs"
 
 [dependencies]
-iced = { version = "0.14", default-features = false, features = ["tiny-skia", "wayland", "image-without-codecs", "tokio", "advanced-shaping", "advanced"] }
+# Use GPU rasterization for scrolling previews; tiny-skia remains a fallback.
+iced = { version = "0.14", default-features = false, features = ["wgpu", "tiny-skia", "wayland", "image-without-codecs", "tokio", "advanced-shaping", "advanced"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+material-colors = "0.4.2"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "system-proxy", "socks"] }
 url = "2"
 libloading = "0.8"
 steamworks = { version = "0.13.1", features = ["raw-bindings"] }
-rfd = "0.16"
+rfd = { version = "0.16", default-features = false, features = ["xdg-portal", "tokio", "wayland"] }
+ashpd = { version = "0.11", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
 tempfile = "3"
