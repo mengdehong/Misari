@@ -246,6 +246,51 @@ mod scene_tests {
 
         #[test]
         #[ignore = "requires EGL/GLES, system fonts and WE common assets"]
+        fn text_effect_alpha_growth_does_not_reveal_transparent_glyph_color() {
+            let (gpu, target) = canvas(400, 160);
+            for blend in [0, 9] {
+                let text = json!({"id":1,"origin":"200 80 0","size":"400 160",
+                    "text":{"value":"6 OCT 2026","script":"export function update(){return engine.runtime>0.5?'12:34':'6 OCT 2026';}"},
+                    "font":"sans-serif","pointsize":36,"scale":"0.27716 0.27019 1",
+                    "padding":32,"alpha":0.5,"colorBlendMode":blend});
+                let mut scenes = Vec::new();
+                let mut roots = Vec::new();
+                for effect in [false, true] {
+                    let mut text = text.clone();
+                    if effect {
+                        text["effects"] = json!([{"file":"effects/expand.json"}]);
+                    }
+                    let root = fixture(json!({
+                        "scene.json": {"general":{"orthogonalprojection":{"width":400,"height":160},"clearcolor":"0 0 0"},"objects":[text]},
+                        "effects/expand.json": {"passes":[{"material":"materials/expand.json"}]},
+                        "materials/expand.json": {"passes":[{"shader":"expand","blending":"normal","textures":["previous"]}]},
+                    }));
+                    // Like Shine's combine pass, grow alpha beyond the glyph.
+                    // Invisible padding must contribute no RGB when it becomes visible.
+                    std::fs::create_dir_all(root.path().join("shaders")).unwrap();
+                    std::fs::write(root.path().join("shaders/expand.vert"),
+                        "attribute vec3 a_Position;attribute vec2 a_TexCoord;varying vec2 uv;void main(){uv=a_TexCoord;gl_Position=vec4(a_Position,1.0);}").unwrap();
+                    std::fs::write(root.path().join("shaders/expand.frag"),
+                        "varying vec2 uv;uniform sampler2D g_Texture0;void main(){vec4 src=texSample2D(g_Texture0,uv);gl_FragColor=vec4(src.rgb,max(src.a,0.25));}").unwrap();
+                    scenes.push(renderer(&root, &gpu));
+                    roots.push(root);
+                }
+                for time in [0., 1.] {
+                    let plain = frame(&mut scenes[0], &gpu, &target, time);
+                    let expanded = frame(&mut scenes[1], &gpu, &target, time);
+                    assert!(plain.pixels().filter(|p| p[0] > 20).count() > 100);
+                    let halos = plain.pixels().zip(expanded.pixels())
+                        .filter(|(a, b)| b[0] > a[0].saturating_add(1)).count();
+                    assert_eq!(halos, 0, "transparent glyph RGB became visible: blend={blend}, time={time}");
+                }
+                assert!(scenes.iter().all(|s| s.errors().is_empty()));
+                drop(scenes);
+                drop(roots);
+            }
+        }
+
+        #[test]
+        #[ignore = "requires EGL/GLES, system fonts and WE common assets"]
         fn scaled_white_text_has_no_dark_fringes_with_or_without_blur() {
             let (gpu, target) = canvas(400, 160);
             for blurred in [false, true] {

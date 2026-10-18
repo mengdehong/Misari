@@ -139,7 +139,14 @@ impl Renderer {
                 1.,
             );
             self.bind(&buffers[0], true);
-            self.blend("normal");
+            // Text effects must see coverage-weighted RGB, including black at
+            // zero alpha. Otherwise effects that grow alpha reveal the glyph
+            // color across its transparent padding as a bright halo.
+            self.blend(if layer.text.is_some() {
+                "translucent"
+            } else {
+                "normal"
+            });
             if composed {
                 let mut inputs = [None; 8];
                 inputs[0] = Some(layer.compose_target.as_ref().unwrap().texture.as_ref());
@@ -394,6 +401,16 @@ impl Renderer {
             self.gl
                 .color_mask(true, true, true, surface.group.is_some());
             let pass = if layer.state.blend_mode == 0 {
+                // Surface blending expects straight alpha; convert after
+                // filtering so small/blurred glyphs do not acquire dark edges.
+                self.copy.vector4(
+                    "g_Compose",
+                    if layer.text.is_some() {
+                        Vec4::X
+                    } else {
+                        Vec4::ZERO
+                    },
+                );
                 &self.copy
             } else {
                 self.capture_material_backdrop(std::iter::once("_rt_FullFrameBuffer"), surface);
@@ -403,6 +420,14 @@ impl Renderer {
                     .color_blend
                     .as_ref()
                     .context("missing layer blending program")?;
+                pass.vector4(
+                    "g_Unpremultiply",
+                    if layer.text.is_some() {
+                        Vec4::X
+                    } else {
+                        Vec4::ZERO
+                    },
+                );
                 pass.vector4(
                     "g_Compose",
                     Vec4::new(
@@ -425,6 +450,7 @@ impl Renderer {
                     Vec4::ONE
                 },
             );
+            self.copy.vector4("g_Compose", Vec4::ZERO);
             self.gl.color_mask(true, true, true, true);
             self.gl.disable(glow::SCISSOR_TEST);
         }
@@ -1109,7 +1135,7 @@ pub(crate) fn load(gl: Rc<glow::Context>, assets: &Assets) -> Result<Pass> {
         "unsupported WE blending header branches"
     );
     fragment.push_str(
-        "\nin vec2 uv;\nuniform sampler2D g_Texture0;\nuniform sampler2D g_Texture1;\nuniform vec4 g_Color4;\nuniform vec4 g_Compose;\nout vec4 color;\nvoid main(){\nvec4 src=texture(g_Texture0,uv)*g_Color4;\nvec4 dst=texture(g_Texture1,gl_FragCoord.xy/g_Compose.zw);\nint mode=int(g_Compose.x);\nfloat a=clamp(src.a,0.0,1.0);\nif(g_Compose.y<0.5){color=vec4(ApplyBlending(mode,dst.rgb,src.rgb,a),dst.a);}\nelse{\nvec3 base=dst.a>0.000001?dst.rgb/dst.a:vec3(0.0);\nvec3 blended=ApplyBlending(mode,base,src.rgb,1.0);\ncolor=vec4((1.0-a)*dst.rgb+a*(1.0-dst.a)*src.rgb+a*dst.a*blended,a+dst.a*(1.0-a));\n}\n}\n",
+        "\nin vec2 uv;\nuniform sampler2D g_Texture0;\nuniform sampler2D g_Texture1;\nuniform vec4 g_Color4;\nuniform vec4 g_Compose;\nuniform vec4 g_Unpremultiply;\nout vec4 color;\nvoid main(){\nvec4 src=texture(g_Texture0,uv);\nif(g_Unpremultiply.x>0.5)src.rgb=src.a>0.000001?src.rgb/src.a:vec3(0.0);\nsrc*=g_Color4;\nvec4 dst=texture(g_Texture1,gl_FragCoord.xy/g_Compose.zw);\nint mode=int(g_Compose.x);\nfloat a=clamp(src.a,0.0,1.0);\nif(g_Compose.y<0.5){color=vec4(ApplyBlending(mode,dst.rgb,src.rgb,a),dst.a);}\nelse{\nvec3 base=dst.a>0.000001?dst.rgb/dst.a:vec3(0.0);\nvec3 blended=ApplyBlending(mode,base,src.rgb,1.0);\ncolor=vec4((1.0-a)*dst.rgb+a*(1.0-dst.a)*src.rgb+a*dst.a*blended,a+dst.a*(1.0-a));\n}\n}\n",
     );
     Pass::compile(gl, COPY_VERTEX, &fragment)
 }

@@ -955,6 +955,7 @@ impl Pass {
                 "g_NativeReflectionClipPlane",
                 "g_RenderVar0",
                 "g_Compose",
+                "g_Unpremultiply",
                 "g_RenderVar1",
                 "g_Brightness",
                 "g_UserAlpha",
