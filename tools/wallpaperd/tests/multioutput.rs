@@ -130,8 +130,11 @@ impl Rig {
         );
         serde_json::from_slice(&o.stdout).unwrap()
     }
-    fn wait<T>(&self, mut condition: impl FnMut() -> Option<T>) -> T {
-        let deadline = Instant::now() + Duration::from_secs(15);
+    fn wait<T>(&self, condition: impl FnMut() -> Option<T>) -> T {
+        self.wait_for(Duration::from_secs(15), condition)
+    }
+    fn wait_for<T>(&self, timeout: Duration, mut condition: impl FnMut() -> Option<T>) -> T {
+        let deadline = Instant::now() + timeout;
         loop {
             if let Some(value) = condition() {
                 return value;
@@ -160,18 +163,18 @@ impl Rig {
         });
     }
     fn worker(&self, output: &str) -> u32 {
+        self.worker_opt(output).expect("output worker not found")
+    }
+    fn worker_opt(&self, output: &str) -> Option<u32> {
         let daemon = self.daemon.as_ref().unwrap().0.id();
         let children =
             fs::read_to_string(format!("/proc/{daemon}/task/{daemon}/children")).unwrap();
-        children
-            .split_whitespace()
-            .find_map(|id| {
-                let args = fs::read(format!("/proc/{id}/cmdline")).ok()?;
-                let args: Vec<_> = args.split(|b| *b == 0).collect();
-                (args.contains(&b"render-worker".as_slice()) && args.contains(&output.as_bytes()))
-                    .then(|| id.parse().unwrap())
-            })
-            .expect("output worker not found")
+        children.split_whitespace().find_map(|id| {
+            let args = fs::read(format!("/proc/{id}/cmdline")).ok()?;
+            let args: Vec<_> = args.split(|b| *b == 0).collect();
+            (args.contains(&b"render-worker".as_slice()) && args.contains(&output.as_bytes()))
+                .then(|| id.parse().unwrap())
+        })
     }
 }
 impl Drop for Rig {
@@ -332,13 +335,67 @@ fn shared_monitor_two_outputs_pause_slow_worker_reconnect_errors_and_release() {
     let _playback = server.play(&first);
     rig.channel("HEADLESS-2", 0);
     let shader = project.join("shaders/probe.frag");
-    fs::write(shader, b"#error broken candidate").unwrap();
+    let shader_source = fs::read(&shader).unwrap();
+    fs::write(&shader, b"#error broken candidate").unwrap();
     assert!(
         !rig.cli(&["set", asset, "--output", "HEADLESS-2"])
             .status
             .success()
     );
     rig.channel("HEADLESS-2", 0);
+    fs::write(&shader, shader_source).unwrap();
+
+    rig.ok(&[
+        "set-properties",
+        asset,
+        r#"{"fault":false}"#,
+        "--output",
+        "HEADLESS-1",
+    ]);
+    rig.ok(&[
+        "set",
+        asset,
+        "--fit",
+        "stretch",
+        "--fps",
+        "30",
+        "--mute",
+        "true",
+        "--output",
+        "HEADLESS-1",
+    ]);
+    rig.channel("HEADLESS-1", 0);
+    let stalled_state = rig.ok(&["status"])["state"].clone();
+    assert_eq!(
+        stalled_state["outputs"]["HEADLESS-1"]["recovery_attempts"],
+        0
+    );
+    let stalled_current = stalled_state["outputs"]["HEADLESS-1"]["current"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    rig.ok(&["pause", "--output", "HEADLESS-2"]);
+    let healthy_pid = rig.worker("HEADLESS-2");
+    let healthy_pixel = rig.pixel("HEADLESS-2");
+    let stalled_pid = rig.worker("HEADLESS-1");
+    assert_eq!(unsafe { libc::kill(stalled_pid as i32, libc::SIGSTOP) }, 0);
+    let recovered_pid = rig.wait_for(Duration::from_secs(35), || {
+        let pid = rig.worker_opt("HEADLESS-1")?;
+        let state = rig.ok(&["status"])["state"].clone();
+        let output = &state["outputs"]["HEADLESS-1"];
+        (pid != stalled_pid
+            && output["recovery_attempts"]
+                .as_u64()
+                .is_some_and(|attempts| attempts > 0)
+            && output["pending"].is_null()
+            && output["current"] == stalled_current)
+            .then_some(pid)
+    });
+    rig.channel("HEADLESS-1", 0);
+    assert_ne!(recovered_pid, stalled_pid);
+    assert_eq!(rig.worker("HEADLESS-2"), healthy_pid);
+    assert_eq!(rig.pixel("HEADLESS-2"), healthy_pixel);
+
     let pids = [rig.worker("HEADLESS-1"), rig.worker("HEADLESS-2")];
     rig.ok(&["release"]);
     rig.spectrum(|s| s["capturing"] == false);

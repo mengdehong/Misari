@@ -160,12 +160,16 @@ mod compositing_tests {
             let (gpu, target) = canvas(16, 8);
             let mut scene = rendered(&root, &gpu, &target);
             assert_eq!(scene.frame(0.).get_pixel(4, 4).0, [255; 4]);
-            scene.set_media(
+            assert!(scene.set_media(
                 json!({"enabled":true,"artwork":{"path":red},"previous_artwork":{"path":blue}}),
-            );
+            ));
             let first = scene.frame(0.1);
             assert_eq!(first.get_pixel(4, 4).0, [255, 0, 0, 255]);
             assert_eq!(first.get_pixel(12, 4).0, [0, 0, 255, 255]);
+            assert!(!scene.set_media(json!({
+                "enabled":true,"artwork":{"path":red},"previous_artwork":{"path":blue},
+                "title":"metadata without a scene handler must not request a redraw"
+            })));
             scene.pause(true);
             scene.set_media(
                 json!({"enabled":true,"artwork":{"path":blue},"previous_artwork":{"path":red}}),

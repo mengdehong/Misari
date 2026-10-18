@@ -14,6 +14,7 @@ use crate::{
 };
 
 enum Engine {
+    Application(Box<crate::application::Application>),
     Image,
     Video(wallpaper_media::Player),
     Web(Box<crate::web::Web>),
@@ -94,6 +95,16 @@ impl Content {
         output: Option<&str>,
     ) -> Result<Self> {
         let engine = match catalog::kind(catalog::path(selection)) {
+            Some(Kind::WeApplication) => {
+                let source = catalog::source(selection).map_err(|e| anyhow::anyhow!(e.message))?;
+                Engine::Application(Box::new(crate::application::Application::load(
+                    &source,
+                    gpu,
+                    playback,
+                    wake,
+                    selection.fit,
+                )?))
+            }
             Some(Kind::WeWeb) => {
                 let source = catalog::source(selection).map_err(|e| anyhow::anyhow!(e.message))?;
                 Engine::Web(Box::new(crate::web::Web::load(
@@ -244,8 +255,7 @@ impl Content {
             web.media(media);
         }
         if let Engine::RustScene { renderer, .. } = &mut self.engine {
-            renderer.set_media(serde_json::to_value(media).unwrap_or_default());
-            self.dirty |= !self.paused;
+            self.dirty |= renderer.set_media(serde_json::to_value(media).unwrap_or_default());
         }
     }
 
@@ -265,6 +275,7 @@ impl Content {
         use crate::domain::Backend;
         match self.engine {
             Engine::Image => Backend::Image,
+            Engine::Application(_) => Backend::Application,
             Engine::Video(_) => Backend::Libmpv,
             Engine::Web(_) => Backend::Cef,
             Engine::RustScene { .. } => Backend::RustScene,
@@ -278,6 +289,7 @@ impl Content {
             self.pointer(None, None)?;
         }
         match &mut self.engine {
+            Engine::Application(app) => app.playback(playback)?,
             Engine::Web(web) => web.playback(playback)?,
             Engine::Video(video) => video.playback(mpv_playback(playback))?,
             Engine::Shader { clock, .. } => clock.pause(playback.paused),
@@ -307,7 +319,7 @@ impl Content {
                 clock.synchronize(timeline);
                 Ok(())
             }
-            Engine::Image | Engine::Web(_) => Ok(()),
+            Engine::Image | Engine::Web(_) | Engine::Application(_) => Ok(()),
         }
     }
 
@@ -371,6 +383,7 @@ impl Content {
             return Ok(());
         }
         match &mut self.engine {
+            Engine::Application(app) => app.poll()?,
             Engine::Web(web) => web.poll()?,
             Engine::Video(video) => video.poll()?,
             Engine::RustScene { renderer, .. } => {
@@ -393,29 +406,8 @@ impl Content {
     pub fn prepare_frame(&mut self, gpu: Option<&Gpu>) -> Result<()> {
         if let (Some(gpu), Engine::Web(web)) = (gpu, &mut self.engine) {
             web.prepare_gpu(gpu)?;
-            #[cfg(feature = "web")]
-            if web.direct_frame().is_some() {
-                self.ready = true;
-            }
         }
         Ok(())
-    }
-
-    #[cfg(feature = "web")]
-    pub fn direct_frame(&self) -> Option<&crate::web::frames::Frame> {
-        match &self.engine {
-            Engine::Web(web) => web.direct_frame(),
-            _ => None,
-        }
-    }
-
-    #[cfg(feature = "web")]
-    pub fn direct_presented(&mut self) {
-        if let Engine::Web(web) = &mut self.engine {
-            web.direct_presented();
-            self.target = None;
-            self.dirty = false;
-        }
     }
 
     pub fn animated(&self) -> bool {
@@ -423,6 +415,9 @@ impl Content {
             && match &self.engine {
                 Engine::Image => false,
                 Engine::RustScene { renderer, .. } => renderer.animated(),
+                Engine::Shader { program, .. } => {
+                    program.uniform(0).is_some() || program.uniform(2).is_some()
+                }
                 _ => true,
             }
     }
@@ -436,9 +431,10 @@ impl Content {
         }
         match &self.engine {
             Engine::Image => false,
+            Engine::Application(app) => app.needs_render() || self.dirty,
             Engine::Video(video) => video.needs_render(self.dirty),
             Engine::Web(web) => self.dirty || web.needs_render(),
-            Engine::Shader { .. } => self.dirty || !self.paused,
+            Engine::Shader { .. } => self.dirty || self.animated(),
             Engine::RustScene { renderer, .. } => {
                 self.dirty || (!self.paused && renderer.animated())
             }
@@ -449,6 +445,7 @@ impl Content {
             && match &self.engine {
                 Engine::Video(video) => video.ready(),
                 Engine::Web(web) => web.ready(),
+                Engine::Application(app) => app.ready(),
                 _ => true,
             }
     }
@@ -462,6 +459,10 @@ impl Content {
     }
 
     pub fn snapshot(&mut self, gpu: &Gpu) -> Result<()> {
+        anyhow::ensure!(
+            !self.failed || self.target.is_some(),
+            "failed engine has no owned snapshot"
+        );
         if self.dynamic() && self.target.is_none() {
             self.render_to(gpu, false, true)?;
         }
@@ -469,6 +470,10 @@ impl Content {
     }
 
     pub fn export_frame(&mut self, gpu: &Gpu) -> Result<image::RgbaImage> {
+        anyhow::ensure!(
+            !self.failed || self.target.is_some(),
+            "failed engine has no owned snapshot"
+        );
         let transient = self.dynamic() && self.target.is_none();
         if self.dynamic() {
             self.poll()?;
@@ -507,6 +512,9 @@ impl Content {
     }
 
     fn render_to(&mut self, gpu: &Gpu, direct: bool, force: bool) -> Result<bool> {
+        if self.failed {
+            return Ok(false);
+        }
         if !direct && self.target.is_none() {
             self.target = Some(Target::new(gpu.gl.clone(), gpu.size)?);
         }
@@ -517,6 +525,7 @@ impl Content {
         };
         let changed = match &mut self.engine {
             Engine::Image => false,
+            Engine::Application(app) => app.draw(gpu, fbo, self.dirty || force)?,
             Engine::Web(web) => web.draw(gpu, fbo, self.dirty || force)?,
             Engine::Video(video) => video.render(
                 fbo.map_or(0, |fbo| fbo.0.get()),
@@ -579,6 +588,7 @@ impl Content {
                 Engine::RustScene { renderer, .. } => renderer.ready(),
                 Engine::Video(video) => video.ready(),
                 Engine::Web(web) => web.ready(),
+                Engine::Application(app) => app.ready(),
                 _ => true,
             };
             self.dirty = !self.ready;
@@ -744,5 +754,61 @@ mod mouse_tests {
         );
         assert!(normalized_pointer((f64::NAN, 0.0), (100, 100)).is_none());
         assert!(normalized_pointer((0.0, 0.0), (0, 100)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod selected_file_tests {
+    #[test]
+    #[ignore = "requires EGL/GLES and WE common assets; renders only generated local images"]
+    fn selected_scene_file_properties_change_pixels_transactionally() {
+        use serde_json::json;
+        let root = super::test_support::fixture(json!({
+            "project.json":{"general":{"properties":{"file":{"type":"file","value":""}}}},
+            "scene.json":{"general":{"orthogonalprojection":{"width":8,"height":8}},"objects":[{"id":1,"image":"image.json","size":"8 8","origin":"4 4 0"}]},
+            "image.json":{"material":"material.json"},
+            "material.json":{"passes":[{"shader":"genericimage","textures":[{"user":"file","value":"util/white"}]}]}
+        }));
+        let outside = tempfile::tempdir().unwrap();
+        let first = outside.path().join("first.png");
+        let second = outside.path().join("second.png");
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255]))
+            .save(&first)
+            .unwrap();
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([0, 255, 0, 255]))
+            .save(&second)
+            .unwrap();
+        let (gpu, target) = super::test_support::canvas(8, 8);
+        let common = crate::catalog::we_assets(&crate::store::WallpaperEngine::default()).unwrap();
+        let values = |path: &std::path::Path| serde_json::from_value(json!({"file":path})).unwrap();
+        let mut renderer = we_scene::Renderer::load_with_properties(
+            gpu.gl.clone(),
+            root.path(),
+            &root.path().join("scene.pkg"),
+            Some(&common),
+            &values(&first),
+        )
+        .unwrap();
+        let color = super::test_support::frame(&mut renderer, &gpu, &target, 0.)
+            .get_pixel(4, 4)
+            .0;
+        assert!(color[0] > 240 && color[1] < 10, "{color:?}");
+        renderer.set_properties(&values(&second)).unwrap();
+        let color = super::test_support::frame(&mut renderer, &gpu, &target, 0.)
+            .get_pixel(4, 4)
+            .0;
+        assert!(color[1] > 240 && color[0] < 10, "{color:?}");
+        assert!(
+            renderer
+                .set_properties(&values(&outside.path().join("missing.png")))
+                .is_err()
+        );
+        let color = super::test_support::frame(&mut renderer, &gpu, &target, 0.)
+            .get_pixel(4, 4)
+            .0;
+        assert!(
+            color[1] > 240 && color[0] < 10,
+            "failed selection changed accepted pixels: {color:?}"
+        );
     }
 }

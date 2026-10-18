@@ -768,9 +768,23 @@ fn infinite_loop_exceptions_destroyed_handles_and_scene_isolation() {
             .any(|e| e[1] == json!(["visible"]) && e[2] == false)
     );
     destroyed.context.with(|ctx| {
+        assert_eq!(ctx.eval::<usize, _>("__wePendingDestroy.size").unwrap(), 0);
         assert!(ctx.eval::<(), _>("thisLayer.origin.x=1").is_err());
         let _ = ctx.catch();
     });
+}
+
+#[test]
+fn unchanged_script_results_do_not_cross_the_host_boundary() {
+    let (_temp, assets) = assets();
+    let mut scripts = load(
+        &assets,
+        &[object("export function update(value){return value;}")],
+        &Properties::new(),
+        [1.0; 2],
+    );
+    assert_eq!(scripts.frame(&frame(1.0, 0.016)).unwrap(), json!([]));
+    assert_clean(&scripts);
 }
 
 #[test]

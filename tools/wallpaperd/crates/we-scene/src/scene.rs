@@ -1350,6 +1350,7 @@ pub(crate) mod runtime {
         pub camera: crate::camera::Controller,
         pub created: Vec<usize>,
         pub structure_dirty: bool,
+        materials_dirty: bool,
         changes: HashMap<(usize, Vec<String>), Value>,
         validated: Vec<u8>,
         errors: VecDeque<String>,
@@ -1443,6 +1444,7 @@ pub(crate) mod runtime {
                 camera,
                 created: Vec::new(),
                 structure_dirty: false,
+                materials_dirty: false,
                 changes: HashMap::new(),
                 errors: VecDeque::new(),
                 error_generation: 0,
@@ -1532,6 +1534,7 @@ pub(crate) mod runtime {
             for patch in &patches {
                 if let (Some(node), Some(key)) = (patch[0].as_u64(), patch[1][0].as_str()) {
                     self.validated[node as usize] &= !control_checks(key, patch[1][1].as_str());
+                    self.materials_dirty |= matches!(key, "effects" | "__materials");
                 }
             }
             let changed = patches
@@ -1544,6 +1547,12 @@ pub(crate) mod runtime {
                     scene::Node::decode(&self.objects[node as usize], self.size)?;
             }
             Ok(patches)
+        }
+        pub fn materials_dirty(&self) -> bool {
+            self.materials_dirty
+        }
+        pub fn materials_updated(&mut self) {
+            self.materials_dirty = false;
         }
         pub fn properties(&mut self, properties: &Properties) -> Result<()> {
             let values = self.resolve_properties(properties)?;
@@ -1569,15 +1578,18 @@ pub(crate) mod runtime {
             }
             Ok(())
         }
-        pub fn event(&mut self, name: &str, value: &Value) {
+        pub fn event(&mut self, name: &str, value: &Value) -> bool {
             if let Some(scripts) = &mut self.scripts {
-                let result = scripts
-                    .event(name, value)
-                    .and_then(|patch| self.apply(&patch));
-                if let Err(error) = result {
-                    self.error(format!("{error:#}"));
+                let result = scripts.event(name, value).and_then(|patch| {
+                    let changed = patch.as_array().is_some_and(|patch| !patch.is_empty());
+                    self.apply(&patch).map(|_| changed)
+                });
+                match result {
+                    Ok(changed) => return changed,
+                    Err(error) => self.error(format!("{error:#}")),
                 }
             }
+            false
         }
         pub fn diagnostics(&self) -> Vec<String> {
             self.errors
@@ -1683,6 +1695,7 @@ pub(crate) mod runtime {
             let mut previous_states = BTreeMap::new();
             let mut topology_changed = false;
             let mut skeletons_changed = false;
+            let mut materials_changed = false;
             let initial_length = self.objects.len();
             let mut length = initial_length;
             let mut changes = Vec::new();
@@ -1741,6 +1754,7 @@ pub(crate) mod runtime {
                     );
                     skeletons_changed |=
                         matches!(key, "animationlayers" | "__boneOverrides" | "__bonePhysics");
+                    materials_changed |= matches!(key, "effects" | "__materials");
                     if node < initial_length
                         && state_field(key)
                         && !previous_states.contains_key(&node)
@@ -1841,6 +1855,7 @@ pub(crate) mod runtime {
                     .retain(|(owner, child), _| *owner != node || !child.starts_with(&path));
                 self.changes.insert((node, path), value);
             }
+            self.materials_dirty |= materials_changed;
             Ok(impact)
         }
     }
@@ -1929,6 +1944,86 @@ pub(crate) mod runtime {
             std::fs::write(&package, bytes).unwrap();
             let assets = Assets::open(root.path(), &package, None).unwrap();
             Runtime::new(&assets, objects, &Properties::new(), [10.; 2], None, false).unwrap()
+        }
+
+        fn scripted_runtime(source: &str) -> Runtime {
+            let root = tempfile::tempdir().unwrap();
+            let package = root.path().join("scene.pkg");
+            let mut bytes = 8u32.to_le_bytes().to_vec();
+            bytes.extend(b"PKGV0001");
+            bytes.extend(0u32.to_le_bytes());
+            std::fs::write(&package, bytes).unwrap();
+            let assets = Assets::open(root.path(), &package, None).unwrap();
+            Runtime::new(
+                &assets,
+                &[json!({
+                    "id": 1,
+                    "origin": {"value": "1 2 3", "script": source},
+                    "scale": "1 1 1",
+                    "angles": "0 0 0"
+                })],
+                &Properties::new(),
+                [10.; 2],
+                None,
+                true,
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn media_events_report_only_applied_script_changes() {
+            let mut idle = scripted_runtime("export function init(v){return v;}");
+            assert!(!idle.event("mediaPlaybackChanged", &json!({"state": 1})));
+
+            let mut reactive = scripted_runtime(
+                "export function mediaPlaybackChanged(e){thisLayer.origin.x=e.state;}",
+            );
+            assert!(reactive.event("mediaPlaybackChanged", &json!({"state": 7})));
+            assert_eq!(reactive.objects[0]["origin"][0], 7);
+            assert!(!reactive.event("mediaPropertiesChanged", &json!({"title": "ignored"})));
+        }
+
+        #[test]
+        fn material_updates_are_tracked_only_after_a_changed_patch_commits() {
+            let mut runtime = runtime(&[json!({
+                "id": 1,
+                "origin": [0, 0, 0],
+                "effects": [{"visible": true}],
+                "__materials": [[{"constantshadervalues": {"gain": 1}}]]
+            })]);
+            assert!(!runtime.materials_dirty());
+
+            runtime
+                .apply(&json!([[
+                    0,
+                    ["__materials", "0", "0", "constantshadervalues", "gain"],
+                    1
+                ]]))
+                .unwrap();
+            assert!(!runtime.materials_dirty());
+            runtime
+                .apply(&json!([[0, ["effects", "0", "visible"], false]]))
+                .unwrap();
+            assert!(runtime.materials_dirty());
+            runtime.materials_updated();
+
+            assert!(
+                runtime
+                    .apply(&json!([
+                        [
+                            0,
+                            ["__materials", "0", "0", "constantshadervalues", "gain"],
+                            2
+                        ],
+                        [0, ["scale"], "invalid"]
+                    ]))
+                    .is_err()
+            );
+            assert!(!runtime.materials_dirty());
+            assert_eq!(
+                runtime.objects[0]["__materials"][0][0]["constantshadervalues"]["gain"],
+                1
+            );
         }
 
         #[test]

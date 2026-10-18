@@ -59,6 +59,18 @@ pub struct Store {
     pub outputs: BTreeMap<String, SavedOutput>,
     #[serde(default)]
     pub library: crate::library::Library,
+    #[serde(default)]
+    pub policy: RuntimePolicy,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RuntimePolicy {
+    pub allow_applications: Option<bool>,
+    pub pause_on_battery: Option<bool>,
+    pub pause_on_session: Option<bool>,
+    pub pause_on_fullscreen: Option<bool>,
+    pub mute_on_other_audio: Option<bool>,
 }
 
 #[derive(Default, Deserialize)]

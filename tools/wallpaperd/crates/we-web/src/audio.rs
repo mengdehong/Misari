@@ -20,6 +20,7 @@ struct Packet {
 struct Queue {
     packets: VecDeque<Packet>,
     spec: Spec,
+    playback_revision: u64,
     stopped: bool,
 }
 struct Output {
@@ -30,7 +31,7 @@ struct Output {
 }
 pub struct Audio {
     output: Arc<Output>,
-    thread: Option<JoinHandle<()>>,
+    thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Audio {
@@ -43,23 +44,27 @@ impl Audio {
                     channels: 2,
                     rate: 48000,
                 },
+                playback_revision: 0,
                 stopped: false,
             }),
             wake: Condvar::new(),
             mute: AtomicBool::new(true),
             volume: AtomicU32::new(1f32.to_bits()),
         });
-        let thread = {
-            let output = output.clone();
-            thread::spawn(move || output.run())
-        };
         Self {
             output,
-            thread: Some(thread),
+            thread: Mutex::new(None),
         }
     }
     pub fn playback(&self, mute: bool, volume: f32) {
-        self.output.mute.store(mute, Ordering::Relaxed);
+        if self.output.mute.swap(mute, Ordering::Relaxed) != mute {
+            let mut queue = self.output.queue.lock().unwrap();
+            if mute {
+                queue.packets.clear();
+            }
+            queue.playback_revision = queue.playback_revision.wrapping_add(1);
+            self.output.wake.notify_one();
+        }
         self.output
             .volume
             .store(volume.to_bits(), Ordering::Relaxed);
@@ -87,6 +92,12 @@ impl Audio {
         if channels.iter().any(|channel| channel.is_null()) {
             return;
         }
+        let mut thread = self.thread.lock().unwrap();
+        if thread.is_none() {
+            let output = self.output.clone();
+            *thread = Some(thread::spawn(move || output.run()));
+        }
+        drop(thread);
         let mut samples = Vec::with_capacity(frames as usize * channels.len());
         for frame in 0..frames as usize {
             for &channel in channels {
@@ -106,7 +117,7 @@ impl Drop for Audio {
     fn drop(&mut self) {
         self.output.queue.lock().unwrap().stopped = true;
         self.output.wake.notify_one();
-        if let Some(thread) = self.thread.take() {
+        if let Some(thread) = self.thread.get_mut().unwrap().take() {
             let _ = thread.join();
         }
     }
@@ -116,16 +127,32 @@ impl Output {
     fn run(&self) {
         let mut stream: Option<Simple> = None;
         let mut spec = None;
+        let mut playback_revision = 0;
         loop {
-            let mut packet = {
+            let (packet, reset) = {
                 let mut queue = self.queue.lock().unwrap();
-                while !queue.stopped && queue.packets.is_empty() {
+                while !queue.stopped
+                    && queue.packets.is_empty()
+                    && queue.playback_revision == playback_revision
+                {
                     queue = self.wake.wait(queue).unwrap();
                 }
                 if queue.stopped {
                     break;
                 }
-                queue.packets.pop_front().unwrap()
+                let mut reset = false;
+                if queue.playback_revision != playback_revision {
+                    playback_revision = queue.playback_revision;
+                    reset = self.mute.load(Ordering::Relaxed);
+                }
+                (queue.packets.pop_front(), reset)
+            };
+            if reset {
+                stream = None;
+                spec = None;
+            }
+            let Some(mut packet) = packet else {
+                continue;
             };
             if self.mute.load(Ordering::Relaxed) {
                 if let Some(stream) = &stream {

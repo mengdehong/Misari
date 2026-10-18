@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.96"
 
 [workspace]
-members = ["crates/wallpaper-media", "crates/we-scene", "crates/we-web"]
+members = ["crates/wallpaper-media", "crates/we-scene", "crates/we-web", "crates/wallpaper-ui"]
 resolver = "3"
 
 [features]
@@ -15,6 +15,7 @@ web = ["dep:we-web"]
 anyhow = "1"
 clap = { version = "4.6", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
 fast_image_resize = { version = "6.1", default-features = false, features = ["std", "only_u8x4"] }
+futures-lite = "2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif"] }
 glow = "0.17"
 khronos-egl = { version = "6", features = ["dynamic"] }

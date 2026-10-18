@@ -157,7 +157,7 @@ mod tests {
         );
         assert!((max_scale(matrix) - 2.).abs() < 1e-6);
         let shear = Mat4::from_cols(Vec4::X, Vec4::new(1., 1., 0., 0.), Vec4::Z, Vec4::W);
-        assert!((max_scale(shear) - 1.618034).abs() < 1e-6);
+        assert!((max_scale(shear) - (1.0 + 5.0_f32.sqrt()) / 2.0).abs() < 1e-6);
         assert!(fit(&[]).is_none());
     }
     #[test]

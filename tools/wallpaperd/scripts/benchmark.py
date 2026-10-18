@@ -263,6 +263,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("scheme", nargs="?", choices=BINARIES)
     parser.add_argument("project", nargs="?", help="Workshop ID or project directory")
+    parser.add_argument("--binary", type=Path, help="executable for the selected scheme")
     parser.add_argument("--bench", action="store_true", help="measure all three projects and five schemes")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--duration", type=float, help="sampling seconds, or smoke check wait")
@@ -272,6 +273,10 @@ def main():
     parser.add_argument("--wine-config", type=Path,
                         help="override Wine configuration; default: GE for scene/video, system Wine for web")
     args = parser.parse_args()
+    if args.binary:
+        if not args.scheme:
+            parser.error("--binary requires a scheme")
+        BINARIES[args.scheme] = args.binary.expanduser().resolve()
     args.duration = args.duration if args.duration is not None else (30.0 if args.bench else 0.0)
     if not 1 <= args.fps <= 240 or not math.isfinite(args.duration) or args.duration < 0:
         parser.error("fps must be 1..240; duration must be nonnegative")

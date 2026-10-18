@@ -8,7 +8,6 @@ use crate::{
     scene::bindings::Properties,
 };
 use anyhow::{Context, Result, ensure};
-use glam::Mat3;
 use glow::HasContext;
 use serde_json::Value;
 use std::{
@@ -336,28 +335,7 @@ impl Renderer {
                 "g_NativeReflectionClipPlane",
                 clip_plane.unwrap_or(Vec4::ZERO),
             );
-            draw.pass.matrix4("g_ModelMatrix", model);
-            draw.pass.matrix4(
-                "g_ModelMatrixInverse",
-                if model.determinant().abs() > 1e-12 {
-                    model.inverse()
-                } else {
-                    Mat4::IDENTITY
-                },
-            );
-            draw.pass.matrix4("g_ViewProjectionMatrix", view);
-            let normal = Mat3::from_mat4(model);
-            draw.pass.matrix3(
-                "g_NormalModelMatrix",
-                if normal.determinant().abs() > 1e-12 {
-                    normal.inverse().transpose()
-                } else {
-                    normal
-                },
-            );
-            draw.pass.vector3("g_EyePosition", eye);
-            draw.pass.vector3("g_LightAmbientColor", frame.ambient);
-            draw.pass.vector3("g_LightSkylightColor", frame.skylight);
+            draw.pass.transforms(model, Some(view), eye, None);
             let mut inputs = [None; 8];
             for (slot, name) in draw.pass.references.iter().enumerate() {
                 if let Some(name) = name {

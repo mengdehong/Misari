@@ -1498,18 +1498,8 @@ impl Draw {
                 );
             }
         }
-        self.pass.vector3("g_ViewRight", view.basis.x_axis);
-        self.pass.vector3("g_ViewUp", view.basis.y_axis);
-        self.pass.vector3("g_EyePosition", view.eye);
-        self.pass.matrix4(
-            "g_ModelMatrixInverse",
-            if model.determinant().abs() > 1e-12 {
-                model.inverse()
-            } else {
-                Mat4::IDENTITY
-            },
-        );
-        self.pass.matrix4("g_ModelMatrix", model);
+        self.pass
+            .transforms(model, None, view.eye, Some(view.basis));
         self.pass
             .vector4("g_RenderVar1", Vec4::new(1.0, 1.0, 1.0, 1.0));
         if let Some(texture) = &self.pass.textures[0]

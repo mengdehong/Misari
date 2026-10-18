@@ -2,23 +2,24 @@
 //! the caller retains its event loop and GL context.
 mod audio;
 mod browser;
+mod client;
 pub mod frames;
+mod host;
 mod loader;
 mod renderer;
+mod wire;
+
+pub use client::{Renderer, cleanup_pending};
 
 use anyhow::{Context, Result, bail, ensure};
 use cef::*;
-use memmap2::{Mmap, MmapOptions};
 use serde_json::Value;
 use std::{
     cell::RefCell,
     collections::VecDeque,
     fs::{File, OpenOptions},
     io::{self, Write},
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::net::UnixStream,
-    },
+    os::{fd::AsRawFd, unix::net::UnixStream},
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, OnceLock,
@@ -39,8 +40,26 @@ thread_local! {
 
 /// Call before the application's argument parser. Chromium reuses this executable.
 pub fn execute_process() -> Option<i32> {
-    if !std::env::args_os().any(|arg| arg.as_encoded_bytes().starts_with(b"--type=")) {
-        return None;
+    let cef_child = std::env::args_os().any(|arg| arg.as_encoded_bytes().starts_with(b"--type="));
+    if !cef_child {
+        if let Some((fd, group)) = host::guardian_argument() {
+            return Some(host::guard(fd, group).map_or_else(
+                |error| {
+                    eprintln!("we-web guardian: {error:#}");
+                    1
+                },
+                |()| 0,
+            ));
+        }
+        return host::argument().map(|fd| {
+            host::run(fd).map_or_else(
+                |error| {
+                    eprintln!("we-web host: {error:#}");
+                    1
+                },
+                |()| 0,
+            )
+        });
     }
     if let Err(error) = loader::ensure_loaded() {
         eprintln!("we-web: {error}");
@@ -209,27 +228,27 @@ impl Shared {
     }
 }
 
-/// One browser. Creating/dropping a renderer does not initialize/shut down CEF again.
-pub struct Renderer {
+/// Browser implementation owned by the disposable CEF host process.
+pub(crate) struct HostRenderer {
     id: u64,
     shared: Arc<Shared>,
-    frames: File,
-    mapping: Mmap,
-    reading: Mutex<()>,
 }
 pub struct Pixels<'a> {
     pub sequence: u64,
     pub size: [u32; 2],
     pub data: &'a [u8],
 }
-impl Renderer {
-    pub fn load(
+impl HostRenderer {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn load(
         root: &Path,
         entry: &Path,
         size: [u32; 2],
+        frame_rate: u16,
         accelerated: bool,
         platform: &str,
         wake: &UnixStream,
+        frames: File,
     ) -> Result<Self> {
         ensure!(
             browser::valid_size(size[0] as i32, size[1] as i32),
@@ -246,20 +265,7 @@ impl Renderer {
         let browsers = Runtime::ensure(platform)?;
         // Keep the existing mmap path and its dirty-region copies. The producer
         // opens a separate file description so flock also synchronizes threads.
-        let name = if accelerated {
-            c"we-web-frame-dmabuf"
-        } else {
-            c"we-web-frame-mmap"
-        };
-        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
-        ensure!(
-            fd >= 0,
-            "creating browser frame: {}",
-            io::Error::last_os_error()
-        );
-        let frames = unsafe { File::from_raw_fd(fd) };
-        frames.set_len(16 + size[0] as u64 * size[1] as u64 * 4)?;
-        let mapping = unsafe { MmapOptions::new().map(&frames) }?;
+        let fd = frames.as_raw_fd();
         let producer = OpenOptions::new()
             .read(true)
             .write(true)
@@ -285,6 +291,7 @@ impl Renderer {
             root,
             url.to_string(),
             size,
+            frame_rate,
             accelerated,
             shared.clone(),
         );
@@ -296,15 +303,9 @@ impl Renderer {
             let mut timeout = browser::GpuTimeout::new(Arc::downgrade(&shared));
             post_delayed_task(ThreadId::UI, Some(&mut timeout), 8_000);
         }
-        Ok(Self {
-            id,
-            shared,
-            frames,
-            mapping,
-            reading: Mutex::new(()),
-        })
+        Ok(Self { id, shared })
     }
-    pub fn send(&self, value: Value, edge: bool) -> Result<()> {
+    pub(crate) fn send(&self, value: Value, edge: bool) -> Result<()> {
         ensure!(
             !SHUT_DOWN.load(Ordering::Acquire),
             "CEF has already shut down"
@@ -319,7 +320,17 @@ impl Renderer {
         );
         let mut controls = self.shared.controls.lock().unwrap();
         if !edge && controls.queue.back().is_some_and(|(_, edge)| !edge) {
-            controls.queue.back_mut().unwrap().0 = value;
+            let queued = &mut controls.queue.back_mut().unwrap().0;
+            let mut merged = queued.clone();
+            merged
+                .as_object_mut()
+                .unwrap()
+                .extend(value.as_object().unwrap().clone());
+            ensure!(
+                serde_json::to_vec(&merged)?.len() <= MAX_LINE,
+                "coalesced CEF control message is oversized"
+            );
+            *queued = merged;
         } else {
             ensure!(controls.queue.len() < 64, "CEF control queue is full");
             controls.queue.push_back((value, edge));
@@ -334,51 +345,11 @@ impl Renderer {
         }
         Ok(())
     }
-    pub fn poll(&self) -> Update {
+    pub(crate) fn poll(&self) -> Update {
         std::mem::take(&mut *self.shared.update.lock().unwrap())
     }
-    pub fn resize(&mut self, size: [u32; 2]) -> Result<()> {
-        ensure!(
-            browser::valid_size(size[0] as i32, size[1] as i32),
-            "invalid browser dimensions"
-        );
-        self.frames.set_len(
-            self.frames
-                .metadata()?
-                .len()
-                .max(16 + size[0] as u64 * size[1] as u64 * 4),
-        )?;
-        self.mapping = unsafe { MmapOptions::new().map(&self.frames) }?;
-        Ok(())
-    }
-    pub fn with_pixels<T>(&self, read: impl FnOnce(Pixels<'_>) -> T) -> io::Result<Option<T>> {
-        // flock is per file description. Serialize readers so one read guard
-        // cannot unlock the producer while another thread still holds a slice.
-        let _reading = self.reading.lock().unwrap();
-        let Some(_lock) = FrameLock::try_read(&self.frames)? else {
-            return Ok(None);
-        };
-        let sequence = u64::from_ne_bytes(self.mapping[..8].try_into().unwrap());
-        let size = [
-            u32::from_ne_bytes(self.mapping[8..12].try_into().unwrap()),
-            u32::from_ne_bytes(self.mapping[12..16].try_into().unwrap()),
-        ];
-        if sequence == 0 {
-            return Ok(None);
-        }
-        let bytes = size[0] as usize * size[1] as usize * 4;
-        let data = self
-            .mapping
-            .get(16..16 + bytes)
-            .ok_or_else(|| io::Error::other("invalid browser frame size"))?;
-        Ok(Some(read(Pixels {
-            sequence,
-            size,
-            data,
-        })))
-    }
 }
-impl Drop for Renderer {
+impl Drop for HostRenderer {
     fn drop(&mut self) {
         self.shared.closing.store(true, Ordering::Release);
         // This releases any GPU slot still in the mailbox before posting Close.
@@ -398,12 +369,14 @@ impl Profile {
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(io::Error::other)?
             .as_nanos();
-        let path = std::env::var_os("WALLPAPERD_WEB_PROFILE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                std::env::temp_dir().join(format!("we-web-{}-{nonce}", std::process::id()))
-            });
-        std::fs::DirBuilder::new().mode(0o700).create(&path)?;
+        let configured = std::env::var_os("WALLPAPERD_WEB_PROFILE").map(PathBuf::from);
+        let path = configured.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("we-web-{}-{nonce}", std::process::id()))
+        });
+        std::fs::DirBuilder::new()
+            .recursive(configured.is_some())
+            .mode(0o700)
+            .create(&path)?;
         Ok(Self(path))
     }
 }

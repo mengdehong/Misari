@@ -21,13 +21,18 @@ pub struct Info {
 pub struct Frame {
     pub info: Info,
     pub fds: Vec<OwnedFd>,
-    pub(crate) ack: Option<SyncSender<bool>>,
+    pub(crate) ack: Option<Ack>,
+}
+
+pub(crate) enum Ack {
+    Local(SyncSender<bool>),
+    Remote(Box<dyn FnOnce(bool) + Send>),
 }
 
 impl Frame {
     pub fn complete(mut self, accepted: bool) {
         if let Some(ack) = self.ack.take() {
-            let _ = ack.send(accepted);
+            ack.complete(accepted);
         }
     }
 }
@@ -37,7 +42,18 @@ impl Drop for Frame {
         // Releasing content, a superseded candidate or an invalid frame must
         // also unblock CEF. Never leave the UI thread waiting for a dead consumer.
         if let Some(ack) = self.ack.take() {
-            let _ = ack.send(false);
+            ack.complete(false);
+        }
+    }
+}
+
+impl Ack {
+    fn complete(self, accepted: bool) {
+        match self {
+            Self::Local(sender) => {
+                let _ = sender.send(accepted);
+            }
+            Self::Remote(send) => send(accepted),
         }
     }
 }
@@ -60,7 +76,28 @@ mod tests {
                 planes: vec![],
             },
             fds: vec![],
-            ack: Some(ack),
+            ack: Some(Ack::Local(ack)),
+        };
+        drop(frame);
+        assert!(!receipt.recv().unwrap());
+    }
+
+    #[test]
+    fn abandoned_remote_frame_nacks_the_host_lease() {
+        let (ack, receipt) = mpsc::sync_channel(1);
+        let frame = Frame {
+            info: Info {
+                sequence: 2,
+                size: [1, 1],
+                visible: [0, 0, 1, 1],
+                format: ARGB8888,
+                modifier: 0,
+                planes: vec![],
+            },
+            fds: vec![],
+            ack: Some(Ack::Remote(Box::new(move |accepted| {
+                ack.send(accepted).unwrap()
+            }))),
         };
         drop(frame);
         assert!(!receipt.recv().unwrap());

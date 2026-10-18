@@ -47,6 +47,30 @@ fn shader_clock_stops_and_resumes_without_including_pause_time() {
 }
 
 #[test]
+#[ignore = "requires EGL/GLES 3"]
+fn static_shaders_sleep_until_input_or_geometry_changes() {
+    let gpu = Gpu::headless(Size::new(32, 32).unwrap()).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("static.frag");
+    std::fs::write(
+        &path,
+        "void mainImage(out vec4 c,in vec2 p){c=vec4(iMouse.x/iResolution.x,0.,0.,1.);}",
+    )
+    .unwrap();
+    let (wake, _reader) = UnixStream::pair().unwrap();
+    let mut content = Content::load(&gpu, &selection(&path), Playback::default(), &wake).unwrap();
+    assert!(!content.animated());
+    assert!(content.render(&gpu).unwrap());
+    assert!(!content.needs_render());
+    content.pointer(Some([0.75, 0.5]), None).unwrap();
+    assert!(content.render(&gpu).unwrap());
+    assert!((pixel(&gpu, content.target(), 16, 16)[0] as i32 - 191).abs() <= 1);
+    assert!(!content.needs_render());
+    content.resized();
+    assert!(content.needs_render());
+}
+
+#[test]
 #[ignore = "requires EGL/GLES 3, libmpv and ffmpeg"]
 fn shared_playback_shader_and_video_late_join_pause_resume_and_loop() {
     let gpu = Gpu::headless(Size::new(32, 32).unwrap()).unwrap();

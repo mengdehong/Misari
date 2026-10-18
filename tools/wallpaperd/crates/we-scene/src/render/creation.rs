@@ -462,6 +462,16 @@ impl Renderer {
         Ok(())
     }
     pub(crate) fn update_order(&mut self) {
+        self.rig_objects.clear();
+        self.rig_objects.resize(self.runtime.nodes.len(), None);
+        for (index, (spec, layer)) in self.scene.layers.iter().zip(&self.layers).enumerate() {
+            if layer.puppet.is_some() {
+                self.rig_objects[spec.node] = Some(RenderObject::Image(index));
+            }
+        }
+        for (index, model) in self.models.iter().enumerate() {
+            self.rig_objects[model.index] = Some(RenderObject::Model(index));
+        }
         let rank = self.runtime.nodes[self.scene.settings_node]
             .layer_order
             .iter()

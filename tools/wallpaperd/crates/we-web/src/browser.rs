@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use crate::{MAX_PIXELS, Shared, audio::Audio, frames};
 use cef::*;
 use memmap2::{MmapMut, MmapOptions};
@@ -6,10 +8,12 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     fs::File,
+    io::Read,
     os::fd::{AsRawFd, BorrowedFd},
     path::PathBuf,
     rc::Rc as StateRc,
     sync::{Arc, Weak, atomic::Ordering, mpsc},
+    time::Duration,
 };
 
 // Each CEF handler identifies its own browser; old and candidate content coexist.
@@ -30,6 +34,7 @@ wrap_task! {
         root: PathBuf,
         url: String,
         size: [u32; 2],
+        frame_rate: u16,
         accelerated: bool,
         shared: Arc<Shared>,
     }
@@ -40,7 +45,7 @@ wrap_task! {
                 return;
             }
             let started = self.frame.try_clone().is_ok_and(|frame| start(self.id,
-                frame, self.root.clone(), &self.url, self.size, self.accelerated, self.shared.clone()));
+                frame, self.root.clone(), &self.url, self.size, self.frame_rate, self.accelerated, self.shared.clone()));
             if !started {
                 STATES.with(|states| states.borrow_mut().remove(&self.id));
                 self.shared.error("creating offscreen browser failed".into());
@@ -49,6 +54,15 @@ wrap_task! {
         }
     }
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VisibilityBarrier {
+    Idle,
+    Hiding,
+    Showing,
+    Visible,
+}
+
 wrap_task! {
     pub(crate) struct Control { id: u64, shared: Arc<Shared> }
     impl Task {
@@ -77,6 +91,66 @@ wrap_task! {
         }
     }
 }
+wrap_task! {
+    struct PublishPaint { id: u64, revision: i32 }
+    impl Task {
+        fn execute(&self) {
+            if let Some(state) = current(self.id)
+                && state.revision.get() == self.revision {
+                state.paint_retry.set(false);
+                state.publish_pending(self.id);
+            }
+        }
+    }
+}
+wrap_task! {
+    struct PublishReady { id: u64, revision: i32 }
+    impl Task {
+        fn execute(&self) {
+            if let Some(state) = current(self.id)
+                && state.loaded.get()
+                && state.revision.get() == self.revision
+            {
+                match state.visibility_barrier.get() {
+                    VisibilityBarrier::Idle if state.freeze_after_frame.get() => {
+                        state.visibility_barrier.set(VisibilityBarrier::Hiding);
+                        if let Some(host) = state.host() {
+                            host.was_hidden(1);
+                        }
+                        return;
+                    }
+                    VisibilityBarrier::Visible => {
+                        state.visibility_barrier.set(VisibilityBarrier::Idle)
+                    }
+                    VisibilityBarrier::Idle => {}
+                    _ => return,
+                }
+                state.ready.set(true);
+                if state.pending_paint.borrow().is_some() {
+                    state.publish_pending(self.id);
+                } else if let Some(host) = state.host() {
+                    host.invalidate(PaintElementType::VIEW);
+                }
+            }
+        }
+    }
+}
+
+wrap_task! {
+    struct RevisionTimeout { id: u64, revision: i32 }
+    impl Task {
+        fn execute(&self) {
+            if let Some(state) = current(self.id)
+                && state.loaded.get()
+                && state.revision.get() == self.revision
+                && (!state.ready.get() || state.freeze_after_frame.get())
+                && !state.closing.get()
+            {
+                state.error("browser revision did not become ready".into());
+            }
+        }
+    }
+}
 
 wrap_task! {
     pub(crate) struct GpuTimeout { shared: Weak<Shared> }
@@ -89,13 +163,13 @@ wrap_task! {
         }
     }
 }
-
 fn start(
     id: u64,
     frame: File,
     root: PathBuf,
     url: &str,
     size: [u32; 2],
+    frame_rate: u16,
     accelerated: bool,
     shared: Arc<Shared>,
 ) -> bool {
@@ -110,18 +184,23 @@ fn start(
         }
     };
     let audio = Arc::new(Audio::new());
+    let resources = Arc::new(Resources::new(root, url.to_owned()));
     let state = StateRc::new(BrowserState {
+        id,
         frame,
         mapping: RefCell::new(mapping),
+        pending_paint: RefCell::new(None),
+        paint_retry: Cell::new(false),
         accelerated,
-        direct: accelerated && std::env::var("WALLPAPERD_WEB_DIRECT").as_deref() == Ok("1"),
         shared: shared.clone(),
+        resources: resources.clone(),
         painted_size: Cell::new((0, 0)),
         capture_counter: Cell::new(None),
         full_frame: Cell::new(true),
         width: Cell::new(width),
         height: Cell::new(height),
-        frame_rate: Cell::new(30),
+        frame_rate: Cell::new(frame_rate.into()),
+        rate_boosted: Cell::new(false),
         browser: RefCell::new(None),
         registration: RefCell::new(None),
         audio: audio.clone(),
@@ -132,26 +211,21 @@ fn start(
         loaded: Cell::new(false),
         ready: Cell::new(false),
         freeze_after_frame: Cell::new(false),
+        visibility_barrier: Cell::new(VisibilityBarrier::Idle),
         frozen: Cell::new(false),
+        lifecycle_message: Cell::new(0),
+        thaw_request: Cell::new(None),
         closing: Cell::new(false),
         mouse_down: Cell::new(false),
         mouse_focused: Cell::new(false),
         mouse: RefCell::new(MouseEvent::default()),
     });
     STATES.with(|states| states.borrow_mut().insert(id, state));
-    let mut client = WebClient::new(
-        id,
-        Arc::new(Resources {
-            root,
-            url: url.to_owned(),
-        }),
-        audio,
-        shared,
-    );
+    let mut client = WebClient::new(id, resources, audio, shared);
     let mut window = WindowInfo::default().set_as_windowless(0);
     window.shared_texture_enabled = accelerated.into();
     let settings = BrowserSettings {
-        windowless_frame_rate: 30,
+        windowless_frame_rate: frame_rate.into(),
         background_color: 0xff000000,
         ..Default::default()
     };
@@ -169,17 +243,21 @@ fn start(
 }
 
 pub struct BrowserState {
+    id: u64,
     frame: File,
     mapping: RefCell<MmapMut>,
+    pending_paint: RefCell<Option<(MmapMut, [i32; 2])>>,
+    paint_retry: Cell<bool>,
     accelerated: bool,
-    direct: bool,
     shared: Arc<Shared>,
+    resources: Arc<Resources>,
     painted_size: Cell<(i32, i32)>,
     capture_counter: Cell<Option<u64>>,
     full_frame: Cell<bool>,
     width: Cell<i32>,
     height: Cell<i32>,
     frame_rate: Cell<i32>,
+    rate_boosted: Cell<bool>,
     browser: RefCell<Option<Browser>>,
     registration: RefCell<Option<Registration>>,
     audio: Arc<Audio>,
@@ -190,7 +268,10 @@ pub struct BrowserState {
     loaded: Cell<bool>,
     ready: Cell<bool>,
     freeze_after_frame: Cell<bool>,
+    visibility_barrier: Cell<VisibilityBarrier>,
     frozen: Cell<bool>,
+    lifecycle_message: Cell<i32>,
+    thaw_request: Cell<Option<i32>>,
     closing: Cell<bool>,
     mouse_down: Cell<bool>,
     mouse_focused: Cell<bool>,
@@ -211,12 +292,19 @@ impl BrowserState {
         }
     }
     pub fn receive(&self, incoming: &Value) {
+        let mut prepared = incoming.clone();
+        if let Some(properties) = incoming.get("properties") {
+            self.resources.select(properties);
+            prepared["directories"] = self.resources.directories(properties);
+        }
+        let incoming = &prepared;
         let repaint = {
             let mut value = self.value.borrow_mut();
-            let repaint = value.get("properties").is_none()
-                || value.get("size").is_none()
-                || value.get("properties") != incoming.get("properties")
-                || value.get("size") != incoming.get("size");
+            let repaint = ["properties", "size"].into_iter().any(|key| {
+                incoming
+                    .get(key)
+                    .is_some_and(|item| value.get(key) != Some(item))
+            });
             for (key, item) in incoming.as_object().unwrap() {
                 value[key] = item.clone();
             }
@@ -225,10 +313,11 @@ impl BrowserState {
         if repaint {
             self.full_frame.set(true);
         }
-        self.apply(repaint);
+        self.apply(repaint, Some(incoming));
     }
     pub fn close(&self) {
         self.closing.set(true);
+        self.restore_frame_rate();
         if let Some(host) = self.host() {
             host.close_browser(1);
         }
@@ -240,39 +329,67 @@ impl BrowserState {
         if self.frozen.replace(frozen) == frozen {
             return;
         }
-        host.was_hidden(frozen.into());
-        if let Some(mut params) = dictionary_value_create() {
-            params.set_string(
-                Some(&"state".into()),
-                Some(&if frozen { "frozen" } else { "active" }.into()),
-            );
-            host.execute_dev_tools_method(
-                0,
-                Some(&"Page.setWebLifecycleState".into()),
-                Some(&mut params),
-            );
+        let message_id = if self.lifecycle_message.get() == i32::MAX {
+            1
+        } else {
+            self.lifecycle_message.get() + 1
+        };
+        self.lifecycle_message.set(message_id);
+        self.thaw_request.set((!frozen).then_some(message_id));
+        if frozen {
+            host.was_hidden(1);
+        }
+        let Some(mut params) = dictionary_value_create() else {
+            self.error("creating CEF lifecycle request failed".into());
+            return;
+        };
+        params.set_string(
+            Some(&"state".into()),
+            Some(&if frozen { "frozen" } else { "active" }.into()),
+        );
+        if host.execute_dev_tools_method(
+            message_id,
+            Some(&"Page.setWebLifecycleState".into()),
+            Some(&mut params),
+        ) == 0
+        {
+            self.thaw_request.set(None);
+            self.error("submitting CEF lifecycle request failed".into());
         }
     }
-    fn apply(&self, repaint: bool) {
+    fn restore_frame_rate(&self) {
+        if self.rate_boosted.replace(false)
+            && let Some(host) = self.host()
+        {
+            host.set_windowless_frame_rate(self.frame_rate.get());
+        }
+    }
+    fn apply(&self, repaint: bool, incoming: Option<&Value>) {
         let Some(host) = self.host() else {
             return;
         };
         // CEF can call us again during these calls; release RefCell borrows first.
-        let mut value = self.value.borrow().clone();
-        let playback = &value["playback"];
+        let (playback, size, pointer, initialized) = {
+            let value = self.value.borrow();
+            (
+                value["playback"].clone(),
+                value["size"].clone(),
+                value["pointer"].clone(),
+                value.get("playback").is_some() && value.get("properties").is_some(),
+            )
+        };
         let paused = playback["paused"].as_bool().unwrap_or(false);
+        let fps = playback["fps"].as_i64().unwrap_or(1).clamp(1, 240) as i32;
         if playback.is_object() {
             self.audio.playback(
                 paused || playback["mute"].as_bool().unwrap_or(false),
                 playback["volume"].as_i64().unwrap_or(0).clamp(0, 100) as f32 / 100.0,
             );
-            let fps = playback["fps"].as_i64().unwrap_or(1).clamp(1, 240) as i32;
             // CEF resets its VSync phase even when the requested rate is unchanged.
             if self.frame_rate.replace(fps) != fps {
                 host.set_windowless_frame_rate(fps);
             }
         }
-        let size = &value["size"];
         if let (Some(w), Some(h)) = (
             size["width"].as_i64().and_then(|n| i32::try_from(n).ok()),
             size["height"].as_i64().and_then(|n| i32::try_from(n).ok()),
@@ -284,30 +401,58 @@ impl BrowserState {
             host.was_resized();
         }
         // Thaw to apply properties; freeze again after the acknowledged frame.
-        if self.loaded.get()
-            && value.get("playback").is_some()
-            && value.get("properties").is_some()
-            && (!paused || !self.frozen.get() || repaint)
-        {
-            if repaint || self.revision.get() == 0 || paused != self.sent_paused.get() {
+        if self.loaded.get() && initialized && (!paused || !self.frozen.get() || repaint) {
+            let revision_changed =
+                repaint || self.revision.get() == 0 || paused != self.sent_paused.get();
+            let mut outgoing = match incoming {
+                Some(incoming) if !revision_changed => incoming.clone(),
+                _ => self.value.borrow().clone(),
+            };
+            if revision_changed {
+                self.freeze_after_frame.set(false);
                 self.ready.set(false);
+                self.pending_paint.borrow_mut().take();
+                self.paint_retry.set(false);
+                if self.visibility_barrier.replace(VisibilityBarrier::Idle)
+                    != VisibilityBarrier::Idle
+                {
+                    // A superseded hide/show handshake must not strand the next
+                    // revision in a hidden renderer where its rAF cannot run.
+                    host.was_hidden(0);
+                }
                 self.revision.set(self.revision.get().wrapping_add(1));
-                value["frame_revision"] = self.revision.get().into();
-                self.value.borrow_mut()["frame_revision"] = value["frame_revision"].clone();
+                outgoing["frame_revision"] = self.revision.get().into();
+                self.value.borrow_mut()["frame_revision"] = outgoing["frame_revision"].clone();
+                let mut timeout = RevisionTimeout::new(self.id, self.revision.get());
+                if post_delayed_task(ThreadId::UI, Some(&mut timeout), 5_000) == 0 {
+                    self.error("scheduling browser revision deadline failed".into());
+                }
+                if paused && fps < 60 {
+                    host.set_windowless_frame_rate(60);
+                    self.rate_boosted.set(true);
+                } else {
+                    self.restore_frame_rate();
+                }
             }
             self.sent_paused.set(paused);
             self.lifecycle(false);
             self.freeze_after_frame.set(paused);
-            let browser = self.browser.borrow().clone();
+            let renderer_update = outgoing.as_object().is_some_and(|value| {
+                ["playback", "properties", "audio", "media", "frame_revision"]
+                    .into_iter()
+                    .any(|key| value.contains_key(key))
+            });
+            let browser = renderer_update
+                .then(|| self.browser.borrow().clone())
+                .flatten();
             if let Some(frame) = browser.and_then(|browser| browser.main_frame())
                 && let Some(mut message) = process_message_create(Some(&"wallpaperd-state".into()))
                 && let Some(arguments) = message.argument_list()
             {
-                arguments.set_string(0, Some(&value.to_string().as_str().into()));
+                arguments.set_string(0, Some(&outgoing.to_string().as_str().into()));
                 frame.send_process_message(ProcessId::RENDERER, Some(&mut message));
             }
         }
-        let pointer = &value["pointer"];
         let mut mouse = self.mouse.borrow().clone();
         if pointer.is_object() && !paused {
             let previous = mouse.clone();
@@ -340,8 +485,55 @@ impl BrowserState {
         }
     }
     fn error(&self, message: String) {
+        self.restore_frame_rate();
         self.shared.error(message);
     }
+    unsafe fn stage_paint(&self, buffer: *const u8, width: i32, height: i32) {
+        let bytes = width as usize * height as usize * 4;
+        let mut pending = self.pending_paint.borrow_mut();
+        if pending
+            .as_ref()
+            .is_none_or(|(pixels, _)| pixels.len() != bytes)
+        {
+            match MmapMut::map_anon(bytes) {
+                Ok(pixels) => *pending = Some((pixels, [width, height])),
+                Err(error) => {
+                    self.error(format!("staging browser frame: {error}"));
+                    return;
+                }
+            }
+        }
+        let (pixels, size) = pending.as_mut().unwrap();
+        pixels.copy_from_slice(unsafe { std::slice::from_raw_parts(buffer, bytes) });
+        *size = [width, height];
+    }
+    fn publish_pending(&self, id: u64) {
+        if !self.ready.get() || self.shared.closing.load(Ordering::Acquire) {
+            return;
+        }
+        let pending = self.pending_paint.borrow_mut().take();
+        if let Some((pixels, [width, height])) = pending {
+            self.full_frame.set(true);
+            // The mapping owns a complete frame, including all skipped damage.
+            if !unsafe { self.paint(PaintElementType::VIEW, None, pixels.as_ptr(), width, height) }
+            {
+                *self.pending_paint.borrow_mut() = Some((pixels, [width, height]));
+                self.retry_paint(id);
+            }
+        }
+    }
+    fn retry_paint(&self, id: u64) {
+        if !self.paint_retry.replace(true) {
+            let mut task = PublishPaint::new(id, self.revision.get());
+            // Only a busy reader needs a retry; a published or paused frame
+            // leaves no timer behind. Retain the mapping without recopying it.
+            if post_delayed_task(ThreadId::UI, Some(&mut task), 1) == 0 {
+                self.paint_retry.set(false);
+                self.error("scheduling browser frame publication failed".into());
+            }
+        }
+    }
+    // False means the reader owns the shared mapping and this frame must be retried.
     unsafe fn paint(
         &self,
         kind: PaintElementType,
@@ -349,30 +541,39 @@ impl BrowserState {
         buffer: *const u8,
         width: i32,
         height: i32,
-    ) {
+    ) -> bool {
         if kind != PaintElementType::VIEW
-            || !self.ready.get()
             || self.shared.closing.load(Ordering::Acquire)
             || width != self.width.get()
             || height != self.height.get()
             || buffer.is_null()
         {
-            return;
+            return true;
         }
         let bytes = width as usize * height as usize * 4;
         if bytes as u64 > MAX_PIXELS {
-            return;
+            return true;
+        }
+        if !self.ready.get() {
+            // The final paint can precede the renderer's ready message. Static
+            // pages need not paint again after Invalidate, so retain owned pixels
+            // until that message instead of discarding the only updated frame.
+            unsafe { self.stage_paint(buffer, width, height) };
+            return true;
         }
         let fd = self.frame.as_raw_fd();
         if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            // CEF's next damage list does not include this dropped paint.
-            self.full_frame.set(true);
-            if let Some(host) = self.host() {
-                host.invalidate(PaintElementType::VIEW);
+            let error = std::io::Error::last_os_error();
+            if !matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ) {
+                self.error(format!("locking browser frame: {error}"));
+                return true;
             }
-            return;
+            return false;
         }
-        let result = (|| -> std::io::Result<[u32; 4]> {
+        let result = (|| -> std::io::Result<Option<[u32; 4]>> {
             let mut mapping = self.mapping.borrow_mut();
             if mapping.len() < bytes + 16 {
                 if self.frame.metadata()?.len() < (bytes + 16) as u64 {
@@ -390,6 +591,17 @@ impl BrowserState {
             let pixels = unsafe { std::slice::from_raw_parts(buffer, bytes) };
             let [x, y, w, h] = damage.map(|value| value as usize);
             let stride = width as usize * 4;
+            let unchanged = !self.freeze_after_frame.get()
+                && self.painted_size.get() == (width, height)
+                && (y..y + h).all(|row| {
+                    let start = row * stride + x * 4;
+                    let end = start + w * 4;
+                    mapping[16 + start..16 + end] == pixels[start..end]
+                });
+            if unchanged {
+                self.full_frame.set(false);
+                return Ok(None);
+            }
             if w == width as usize {
                 let start = y * stride;
                 let end = start + h * stride;
@@ -425,16 +637,19 @@ impl BrowserState {
             self.sequence.set(sequence);
             self.painted_size.set((width, height));
             self.full_frame.set(false);
-            Ok(damage)
+            Ok(Some(damage))
         })();
         unsafe {
             libc::flock(fd, libc::LOCK_UN);
         }
+        // A newer successful CEF paint supersedes a queued retry of older pixels.
+        self.pending_paint.borrow_mut().take();
         let damage = match result {
-            Ok(damage) => damage,
+            Ok(Some(damage)) => damage,
+            Ok(None) => return true,
             Err(error) => {
                 self.error(format!("writing browser frame: {error}"));
-                return;
+                return true;
             }
         };
         {
@@ -444,8 +659,10 @@ impl BrowserState {
         }
         self.shared.notify();
         if self.freeze_after_frame.replace(false) {
+            self.restore_frame_rate();
             self.lifecycle(true);
         }
+        true
     }
 
     fn paint_gpu(
@@ -533,23 +750,33 @@ impl BrowserState {
                 update.gpu = Some(frames::Frame {
                     info: frame,
                     fds,
-                    ack: (!self.direct).then_some(ack),
+                    ack: Some(frames::Ack::Local(ack)),
                 });
                 update.damage = Some((sequence, damage));
                 self.shared.gpu_seen.store(true, Ordering::Release);
             }
             self.shared.notify();
             // Retain CEF's pool slot until the GL thread completes its copy.
-            // Dropping a renderer or an unconsumed frame also releases this wait.
-            // The direct experiment returns immediately, like we-layerd. Duplicated
-            // descriptors retain the allocation, but do not reserve CEF's pool slot.
-            if !self.direct && receipt.recv() != Ok(true) {
-                if self.shared.closing.load(Ordering::Acquire) {
-                    return Ok(());
+            match receipt.recv_timeout(Duration::from_secs(5)) {
+                Ok(true) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // The consumer may still have a GPU read in flight. Terminate
+                    // this disposable host so CEF cannot recycle the DMA-BUF.
+                    eprintln!("we-web: accelerated frame lease timed out");
+                    // This code only runs in the disposable web host, which is
+                    // its own process-group leader. Stop CEF's whole process
+                    // tree before its buffer pool can reuse this timed-out slot.
+                    unsafe {
+                        libc::kill(0, libc::SIGKILL);
+                        libc::_exit(1);
+                    }
                 }
-                return Err(std::io::Error::other(
-                    "worker rejected accelerated browser frame",
-                ));
+                _ if self.shared.closing.load(Ordering::Acquire) => return Ok(()),
+                _ => {
+                    return Err(std::io::Error::other(
+                        "worker rejected accelerated browser frame",
+                    ));
+                }
             }
             self.sequence.set(sequence);
             self.painted_size.set((rect.width, rect.height));
@@ -569,6 +796,7 @@ impl BrowserState {
                 }
             }
             if self.freeze_after_frame.replace(false) {
+                self.restore_frame_rate();
                 self.lifecycle(true);
             }
             Ok(())
@@ -712,9 +940,28 @@ wrap_client! {
             if let (Some(state), Some(arguments)) = (current(self.id), message.argument_list()) {
                 match CefString::from(&arguments.string(0)).to_string().as_str() {
                     "ready" if state.loaded.get() && arguments.int(1) == state.revision.get() => {
-                        state.ready.set(true);
+                        let mut task = PublishReady::new(self.id, state.revision.get());
+                        if post_task(ThreadId::UI, Some(&mut task)) == 0 {
+                            state.error("scheduling browser frame publication failed".into());
+                        }
+                    }
+                    "hidden"
+                        if state.visibility_barrier.get() == VisibilityBarrier::Hiding
+                            && arguments.int(1) == state.revision.get() =>
+                    {
+                        state.visibility_barrier.set(VisibilityBarrier::Showing);
                         if let Some(host) = state.host() {
-                            host.invalidate(PaintElementType::VIEW);
+                            host.was_hidden(0);
+                        }
+                    }
+                    "visible"
+                        if state.visibility_barrier.get() == VisibilityBarrier::Showing
+                            && arguments.int(1) == state.revision.get() =>
+                    {
+                        state.visibility_barrier.set(VisibilityBarrier::Visible);
+                        let mut task = PublishReady::new(self.id, state.revision.get());
+                        if post_task(ThreadId::UI, Some(&mut task)) == 0 {
+                            state.error("scheduling browser frame publication failed".into());
                         }
                     }
                     "audio" => {
@@ -761,7 +1008,10 @@ wrap_render_handler! {
         ) {
             if let Some(state) = current(self.id) {
                 unsafe {
-                    state.paint(kind, dirty_rects, buffer, width, height);
+                    if !state.paint(kind, dirty_rects, buffer, width, height) {
+                        state.stage_paint(buffer, width, height);
+                        state.retry_paint(self.id);
+                    }
                 }
             }
         }
@@ -782,7 +1032,7 @@ wrap_life_span_handler! {
                 if state.closing.get() {
                     state.close();
                 } else {
-                    state.apply(false);
+                    state.apply(false, None);
                 }
             }
         }
@@ -818,7 +1068,7 @@ wrap_life_span_handler! {
 wrap_load_handler! {
     struct Loading { id: u64 }
     impl LoadHandler {
-        fn on_load_start(
+    fn on_load_start(
             &self,
             _browser: Option<&mut Browser>,
             frame: Option<&mut Frame>,
@@ -841,7 +1091,7 @@ wrap_load_handler! {
                 && let Some(state) = current(self.id)
             {
                 state.loaded.set(true);
-                state.apply(true);
+                state.apply(true, None);
             }
         }
         fn on_load_error(
@@ -863,8 +1113,82 @@ wrap_load_handler! {
 struct Resources {
     root: PathBuf,
     url: String,
+    selectors: HashMap<String, bool>,
+    directory_definitions: HashMap<String, Value>,
+    selected: std::sync::Mutex<Vec<(PathBuf, bool)>>,
 }
 impl Resources {
+    fn new(root: PathBuf, url: String) -> Self {
+        let project: Value = File::open(root.join("project.json"))
+            .ok()
+            .and_then(|file| serde_json::from_reader(file.take(1024 * 1024 + 1)).ok())
+            .unwrap_or_default();
+        let selectors = project["general"]["properties"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(key, value)| match value["type"].as_str() {
+                Some("file") => Some((key.clone(), false)),
+                Some("directory") => Some((key.clone(), true)),
+                _ => None,
+            })
+            .collect();
+        let directory_definitions = project["general"]["properties"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(_, definition)| definition["type"] == "directory")
+            .map(|(key, definition)| (key.clone(), definition.clone()))
+            .collect();
+        Self {
+            root,
+            url,
+            selectors,
+            directory_definitions,
+            selected: Default::default(),
+        }
+    }
+    fn directories(&self, properties: &Value) -> Value {
+        self.directory_definitions.iter().map(|(key, definition)| {
+            let mut files = Vec::new();
+            let mut bytes = 0;
+            if let Some(directory) = properties[key].as_str().and_then(|path| std::path::Path::new(path).canonicalize().ok())
+                && self.selected.lock().unwrap().iter().any(|(selected, is_dir)| *is_dir && *selected == directory)
+                && let Ok(entries) = std::fs::read_dir(&directory) {
+                let video = definition.get("fileType").or_else(|| definition.get("filetype")).and_then(Value::as_str) == Some("video");
+                for entry in entries.take(4096).flatten() {
+                    let Ok(path) = entry.path().canonicalize() else { continue; };
+                    if !path.is_file() || !path.starts_with(&directory) { continue; }
+                    let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
+                    let accepted = if video { ["webm", "ogg", "ogv", "mp4"].contains(&extension.as_str()) }
+                        else { ["jpeg", "jpg", "png", "pnga", "bmp", "gif", "svg", "webp"].contains(&extension.as_str()) };
+                    if !accepted { continue; }
+                    let Some(path) = path.to_str() else { continue; };
+                    if files.len() >= 512 || bytes + path.len() > 32 * 1024 { break; }
+                    bytes += path.len(); files.push(path.to_owned());
+                }
+            }
+            files.sort(); files.dedup();
+            (key.clone(), serde_json::json!({"mode":definition["mode"].as_str().unwrap_or("ondemand"),"files":files}))
+        }).collect::<serde_json::Map<_, _>>().into()
+    }
+    fn select(&self, properties: &Value) {
+        // Only the host's typed file selectors grant access. A wallpaper cannot
+        // broaden this list through URLs, text fields or renderer JavaScript.
+        *self.selected.lock().unwrap() = self
+            .selectors
+            .iter()
+            .filter_map(|(key, directory)| {
+                let path = std::path::Path::new(properties[key].as_str()?);
+                if !path.is_absolute() {
+                    return None;
+                }
+                let path = path.canonicalize().ok()?;
+                ((*directory && path.is_dir()) || (!directory && path.is_file()))
+                    .then_some((path, *directory))
+            })
+            .collect();
+    }
     fn allows(&self, url: &str) -> bool {
         let Ok(url) = url::Url::parse(url) else {
             return false;
@@ -874,10 +1198,94 @@ impl Resources {
                 .to_file_path()
                 .ok()
                 .and_then(|path| path.canonicalize().ok())
-                .is_some_and(|path| path.starts_with(&self.root)),
+                .is_some_and(|path| {
+                    path.starts_with(&self.root)
+                        || self
+                            .selected
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|(selected, directory)| {
+                                path == *selected || *directory && path.starts_with(selected)
+                            })
+                }),
             "http" | "https" | "data" | "blob" | "about" => true,
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    #[ignore = "requires Node.js; exercises bridge callbacks against a mocked browser"]
+    fn directory_bridge_delivers_fetchall_random_and_reset_events() {
+        let script = r#"
+const assert = require('assert');
+const vm = require('vm');
+const changes = [], removals = [], random = [];
+const window = {__wallpaperdHost() {}, wallpaperPropertyListener:{
+    applyUserProperties() {},
+    userDirectoryFilesAddedOrChanged(name, files) { changes.push([name, ...files]); },
+    userDirectoryFilesRemoved(name, files) { removals.push([name, ...files]); }
+}};
+vm.runInNewContext(process.argv[1], {window, document:{addEventListener() {}}, console});
+window.__wallpaperdReceive({properties:{folder:'/selected'}, directories:{folder:{mode:'fetchall',files:['/selected/a.png']}}});
+assert.deepStrictEqual(changes, [['folder','/selected/a.png']]);
+window.wallpaperRequestRandomFileForProperty('folder', (name, file) => random.push([name,file]));
+assert.deepStrictEqual(random, [['folder','/selected/a.png']]);
+window.__wallpaperdReceive({directories:{folder:{mode:'fetchall',files:[]}}});
+assert.deepStrictEqual(removals, [['folder','/selected/a.png']]);
+window.wallpaperRequestRandomFileForProperty('folder', (name, file) => assert.strictEqual(file,''));
+"#;
+        assert!(
+            std::process::Command::new("node")
+                .args(["-e", script, include_str!("bridge.js")])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[test]
+    fn selected_files_and_directories_are_scoped_revocable_and_symlink_safe() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let file = outside.path().join("selected image.png");
+        let other = outside.path().join("other.txt");
+        let folder = outside.path().join("photos");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(&file, []).unwrap();
+        std::fs::write(&other, []).unwrap();
+        std::fs::write(folder.join("image.png"), []).unwrap();
+        std::fs::write(project.path().join("project.json"), json!({"general":{"properties":{
+            "file":{"type":"file","value":file},"folder":{"type":"directory","value":folder},"text":{"type":"textinput"}
+        }}}).to_string()).unwrap();
+        let resources = Resources::new(project.path().to_owned(), String::new());
+        let url = |path: &std::path::Path| url::Url::from_file_path(path).unwrap().to_string();
+        assert!(
+            !resources.allows(&url(&file)),
+            "authored defaults grant nothing"
+        );
+        resources.select(&json!({"file":file,"folder":folder,"text":other}));
+        assert!(resources.allows(&url(&file)));
+        assert!(resources.allows(&url(&folder.join("image.png"))));
+        assert_eq!(
+            resources.directories(&json!({"folder":folder}))["folder"]["files"],
+            json!([folder.join("image.png")])
+        );
+        assert!(!resources.allows(&url(&other)));
+        let link = folder.join("escape.txt");
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        assert!(!resources.allows(&url(&link)));
+        resources.select(&json!({"file":"","folder":""}));
+        assert!(!resources.allows(&url(&file)));
+        assert!(!resources.allows(&url(&folder.join("image.png"))));
+        assert!(resources.allows(&url(&project.path().join("project.json"))));
+        assert!(!resources.allows("file://remote.example/etc/passwd"));
     }
 }
 
@@ -912,6 +1320,17 @@ wrap_request_handler! {
             _disable_default_handling: Option<&mut i32>,
         ) -> Option<ResourceRequestHandler> {
             Some(ResourceRequests::new(self.resources.clone()))
+        }
+        fn on_render_process_unresponsive(
+            &self,
+            _browser: Option<&mut Browser>,
+            callback: Option<&mut UnresponsiveProcessCallback>,
+        ) -> i32 {
+            self.shared.error("Chromium renderer became unresponsive".into());
+            if let Some(callback) = callback {
+                callback.terminate();
+            }
+            1
         }
         fn on_render_process_terminated(
             &self,
@@ -1004,12 +1423,26 @@ wrap_dev_tools_message_observer! {
         fn on_dev_tools_method_result(
             &self,
             _browser: Option<&mut Browser>,
-            _message_id: i32,
+            message_id: i32,
             success: i32,
             result: Option<&[u8]>,
         ) {
-            if success == 0 && let Some(state) = current(self.id) {
-                state.error(format!("CEF lifecycle: {}", String::from_utf8_lossy(result.unwrap_or_default())));
+            if let Some(state) = current(self.id) {
+                if success == 0 {
+                    state.error(format!(
+                        "CEF lifecycle: {}",
+                        String::from_utf8_lossy(result.unwrap_or_default())
+                    ));
+                } else if state.thaw_request.get() == Some(message_id) && !state.frozen.get() {
+                    state.thaw_request.set(None);
+                    if let Some(host) = state.host() {
+                        // Page.setWebLifecycleState(active) must complete before WasShown.
+                        // Showing a still-frozen WebContents can lose the only OSR capture for
+                        // a static page, leaving the pre-property frame visible indefinitely.
+                        host.was_hidden(0);
+                        host.invalidate(PaintElementType::VIEW);
+                    }
+                }
             }
         }
     }

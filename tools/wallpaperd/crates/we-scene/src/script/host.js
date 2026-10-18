@@ -2,7 +2,7 @@
 let __weNodes=[], __weScripts=[], __weCurrent=-1, __weOverrides={};
 let __weCurrentEvent='load';
 globalThis.thisLayer=undefined;globalThis.thisObject=undefined;
-const __weDirty=new Map(), __weTimers=new Set(), __weAudioViews=new Map();
+const __weDirty=new Map(), __weTimers=new Set(), __weAudioViews=new Map(), __wePendingDestroy=new Set();
 const __weTracked=new WeakMap();
 const __weAudioOwners=new Set();
 function __weActive(index){return index>=0&&!!__weScripts[index]&&!__weScripts[index].disabled&&!__weNodes[__weScripts[index].node].__destroyed;}
@@ -129,6 +129,7 @@ function __weMakeLayer(raw,index) {
 function __wePath(object,path) { for(const key of path) object=object[key];return object; }
 function __weSetPath(object,path,value) {
     const parent=__wePath(object,path.slice(0,-1)),key=path[path.length-1];
+    if(parent[key]===value)return;
     if(parent[key] instanceof WEVec) value=__weVector(value,parent[key]._n);
     parent[key]=value;
 }
@@ -190,7 +191,7 @@ function __weFlush() {
         deltas.push([index,path,value]);
     }
     __weDirty.clear();
-    for(let index=0;index<__weNodes.length;index++) {
+    for(const index of __wePendingDestroy) {
         const node=__weNodes[index];
         if(node.__pendingDestroy && !node.__destroyed) {
             for(let i=0;i<__weScripts.length;i++) if(__weScripts[i].node===index) __weCall(i,'destroy');
@@ -200,6 +201,8 @@ function __weFlush() {
             deltas.push([index,['__destroyed'],true]);
         }
     }
+    __wePendingDestroy.clear();
+    if(deltas.length===0)return '[]';
     __weSyncing=true;
     try{return __weSerialize(deltas);}finally{__weSyncing=false;}
 }
@@ -238,7 +241,7 @@ const thisScene=new Proxy({
     sortLayer(layer,index){const node=typeof layer==='object'?layer:this.getLayer(layer);if(!node||node.__destroyed||!Number.isInteger(index)||index<0||index>=this.getLayerCount())return false;__weLayerOrder=this.enumerateLayers().map(n=>n.__index);__weLayerOrder.splice(__weLayerOrder.indexOf(node.__index),1);__weLayerOrder.splice(index,0,node.__index);__wePublishOrder();return true;},
     getCameraTransforms(){const settings=__weSettings(),raw=settings.__cameraPose&&!settings.__cameraPose.__path&&!settings.__cameraOverride?settings.__cameraPose:settings.cameraTransforms;const out=new CameraTransforms();for(const key of ['eye','center','up'])out[key]=__weVector(raw[key],3).copy();out.zoom=raw.zoom;return out;},
     setCameraTransforms(value){const out=this.getCameraTransforms();for(const key of ['eye','center','up'])if(value[key]!==undefined){out[key]=__weVector(value[key],3).copy();if(!out[key].isFinite())throw new TypeError('Invalid camera vector');}if(value.zoom!==undefined){if(!(value.zoom>0)||value.zoom>1000||!Number.isFinite(value.zoom))throw new RangeError('Invalid camera zoom');out.zoom=value.zoom;}if(out.up.lengthSqr()<1e-12||out.eye.subtract(out.center).cross(out.up).lengthSqr()<1e-12)throw new RangeError('Invalid camera orientation');out.up=out.up.normalize();__weSettings().cameraTransforms=out;__weSettings().__cameraOverride=true;},
-    destroyLayer(layer){const node=typeof layer==='object'?layer:this.getLayer(layer);if(!node||node.__destroyed)return false;node.__pendingDestroy=true;return true;},
+    destroyLayer(layer){const node=typeof layer==='object'?layer:this.getLayer(layer);if(!node||node.__destroyed)return false;node.__pendingDestroy=true;__wePendingDestroy.add(node.__index);return true;},
     createModelData(config){return new IModelData(__weModelData('create',0,config),__weModelToken);},
     destroyModelData(handle){__weModelData('destroy',__weModelId(handle),null);},
 },{get(target,key){return key in target?target[key]:__weSettings()[key];},set(target,key,value){if(key in target)throw new TypeError('Scene method is read-only');__weSettings()[key]=value;return true;}});
@@ -345,7 +348,7 @@ function __weFrame(frame) {
     }
     for(const event of frame.pointerEvents??[]) __wePointer(event);
     __wePointer(frame);
-    if(frame.delta>0) for(const timer of [...__weTimers]) if(timer.due<=engine.runtime) {
+    if(frame.delta>0&&__weTimers.size) for(const timer of [...__weTimers]) if(timer.due<=engine.runtime) {
         if(timer.repeat) timer.due=engine.runtime+timer.delay;else __weTimers.delete(timer);
         if(timer.owner>=0){if(!__weActive(timer.owner)){__weTimers.delete(timer);continue;}__weActivate(timer.owner);}
         try{timer.callback();}catch(error){__weTimers.delete(timer);__weLog('SceneScript timer: '+String(error.stack||error));}
@@ -363,5 +366,5 @@ function __weProperties(values,changed,overrides) {
     __weEvent('applyUserProperties',__weUserProperties(changed));
     return __weFlush();
 }
-function __weShutdown() { __weEvent('destroy');__weTimers.clear(); }
+function __weShutdown() { __weEvent('destroy');__weTimers.clear();__wePendingDestroy.clear(); }
 globalThis.__weBuiltins={WEMath,WEVector,WEColor};

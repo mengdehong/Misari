@@ -2,6 +2,75 @@ use super::*;
 
 #[test]
 #[ignore = "requires headless Weston and WALLPAPERD_TEST_NIRI"]
+fn static_shm_snapshot_transition_and_worker_recovery() {
+    let mut rig = Rig::new();
+    let red = rig.root().join("immutable.png");
+    let blue = rig.root().join("blue.png");
+    RgbaImage::from_pixel(8, 8, Rgba([255, 0, 0, 255]))
+        .save(&red)
+        .unwrap();
+    RgbaImage::from_pixel(8, 8, Rgba([0, 0, 255, 255]))
+        .save(&blue)
+        .unwrap();
+    rig.set(&red, "cut", 60);
+    rig.wait_corner([255, 0, 0]);
+    let before = rig.frames();
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        rig.frames(),
+        before,
+        "static image must not request frame callbacks"
+    );
+    fs::remove_file(&red).unwrap();
+    let snapshot = rig.ok(&["snapshot"]);
+    let pixels = image::open(snapshot["path"].as_str().unwrap())
+        .unwrap()
+        .to_rgba8();
+    assert_eq!(pixels.get_pixel(0, 0).0, [255, 0, 0, 255]);
+    rig.set(&blue, "fade", 60);
+    rig.wait_corner([0, 0, 255]);
+    thread::sleep(Duration::from_millis(300));
+    let before = rig.frames();
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        rig.frames(),
+        before,
+        "finished transition must return to static SHM"
+    );
+    let daemon = rig.daemon.as_ref().unwrap().id();
+    let children = || {
+        fs::read_to_string(format!("/proc/{daemon}/task/{daemon}/children"))
+            .unwrap()
+            .split_whitespace()
+            .map(|pid| pid.parse::<i32>().unwrap())
+            .collect::<Vec<_>>()
+    };
+    let worker = children()
+        .into_iter()
+        .find(|pid| {
+            fs::read(format!("/proc/{pid}/cmdline"))
+                .unwrap_or_default()
+                .split(|&b| b == 0)
+                .any(|arg| arg == b"render-worker")
+        })
+        .unwrap();
+    assert_eq!(unsafe { libc::kill(worker, libc::SIGKILL) }, 0);
+    rig.wait_state(|state| state["outputs"]["winit"]["renderer"] == "stopped");
+    // During the recovery backoff there is no producer. The supervisor must
+    // retain the compositor's last buffer, without a readback or a black gap.
+    let frozen = rig.shot();
+    assert_eq!(frozen.get_pixel(10, 10).0, [0, 0, 255, 255]);
+    rig.wait_state(|state| {
+        state["outputs"]["winit"]["backend"] == "image"
+            && state["outputs"]["winit"]["pending"].is_null()
+            && !children().contains(&worker)
+    });
+    rig.wait_corner([0, 0, 255]);
+    assert_eq!(rig.daemon.as_ref().unwrap().id(), daemon);
+}
+
+#[test]
+#[ignore = "requires headless Weston and WALLPAPERD_TEST_NIRI"]
 fn library_import_rotation_and_source_safety() {
     use serde_json::json;
     let mut rig = Rig::new();

@@ -1,9 +1,7 @@
 //! Wayland negotiation stays independent of content engines and control transactions.
-#[cfg(feature = "web")]
-#[path = "worker_dmabuf.rs"]
-mod dmabuf;
 use std::{
     io::{self, Read, Write},
+    os::fd::AsFd,
     os::unix::net::UnixStream,
     time::{Duration, Instant},
 };
@@ -27,12 +25,15 @@ use smithay_client_toolkit::{
             LayerSurfaceConfigure,
         },
     },
-    shm::{Shm, ShmHandler, slot::Buffer},
+    shm::{Shm, ShmHandler},
 };
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle,
     globals::registry_queue_init,
-    protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface, wl_surface::WlSurface},
+    protocol::{
+        wl_buffer, wl_callback, wl_output, wl_pointer, wl_seat, wl_shm, wl_shm_pool, wl_surface,
+        wl_surface::WlSurface,
+    },
 };
 use wayland_protocols::wp::{
     cursor_shape::v1::client::{
@@ -49,7 +50,7 @@ use wayland_protocols::wp::{
 use crate::{
     catalog::{self, Kind},
     content::Content,
-    decoder::{Decoder, Frame},
+    decoder::{Decoder, Frame, ShmFrame},
     domain::{
         Error, Playback, Selection, Transition, WorkerAction, WorkerCommand, WorkerReply,
         WorkerRuntime,
@@ -78,10 +79,31 @@ struct State {
     closed: bool,
 }
 
+struct FirstCommit;
+impl Dispatch<wl_callback::WlCallback, FirstCommit> for State {
+    fn event(
+        state: &mut Self,
+        _: &wl_callback::WlCallback,
+        _: wl_callback::Event,
+        _: &FirstCommit,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let Some(presenter) = &mut state.presenter {
+            presenter.committed = true;
+            presenter.runtime(Ok(()));
+        }
+    }
+}
+
 pub fn run(output_name: &str) -> Result<()> {
-    // The guard outlives content and GL resources; CEF starts lazily on the first Web load.
-    #[cfg(feature = "web")]
-    let _web_runtime = we_web::ShutdownGuard;
+    let panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        panic(info);
+        // This is an isolated process. Unwinding live Wayland owners would
+        // destroy the last surface that the supervisor retains for recovery.
+        unsafe { libc::_exit(1) }
+    }));
     let conn = Connection::connect_to_env().context("connecting to Wayland")?;
     let (globals, mut queue) = registry_queue_init(&conn)?;
     let qh = queue.handle();
@@ -90,8 +112,6 @@ pub fn run(output_name: &str) -> Result<()> {
     let shm = Shm::bind(&globals, &qh).context("wl_shm unavailable")?;
     let viewporter: Option<WpViewporter> = globals.bind(&qh, 1..=1, ()).ok();
     let fractional_manager: Option<WpFractionalScaleManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
-    #[cfg(feature = "web")]
-    let dmabuf = dmabuf::Dmabuf::bind(&globals, &qh);
     let mut state = State {
         registry: RegistryState::new(&globals),
         outputs: OutputState::new(&globals, &qh),
@@ -157,8 +177,6 @@ pub fn run(output_name: &str) -> Result<()> {
         viewport,
         state.shm.wl_shm().clone(),
         output_name,
-        #[cfg(feature = "web")]
-        dmabuf,
     )?);
     state.layer = Some(layer);
     conn.flush()?;
@@ -167,59 +185,68 @@ pub fn run(output_name: &str) -> Result<()> {
     let mut lines = ipc::Lines::default();
     let mut fds = Vec::with_capacity(6);
     let mut input_enabled = false;
-    while !state.closed {
-        queue.dispatch_pending(&mut state)?;
-        state.presenter.as_mut().unwrap().tick(&qh)?;
-        let enabled = state.presenter.as_ref().unwrap().accepts_pointer();
-        if enabled != input_enabled {
-            let surface = state.layer.as_ref().unwrap().wl_surface();
-            surface.set_input_region(if enabled {
-                None
-            } else {
-                Some(empty.wl_region())
-            });
-            surface.commit();
-            input_enabled = enabled;
-        }
-        let needs_write = ipc::flush_wayland(&conn)?;
-        if !needs_write {
-            state.presenter.as_mut().unwrap().flushed();
-        }
-        let Some(guard) = queue.prepare_read() else {
-            continue;
-        };
-        let presenter = state.presenter.as_ref().unwrap();
-        fds.clear();
-        fds.extend([
-            ipc::interest(&guard.connection_fd(), needs_write),
-            ipc::interest(&io::stdin(), false),
-            ipc::interest(&presenter.decoder.wake, false),
-            ipc::interest(&presenter.wake, false),
-        ]);
-        ipc::poll(&mut fds, presenter.timeout())?;
-        if fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-            ipc::read_wayland(guard)?;
+    let result = (|| -> Result<()> {
+        while !state.closed {
             queue.dispatch_pending(&mut state)?;
-        } else {
-            drop(guard);
-        }
-        // New selections win over old completions from the same readiness batch.
-        let presenter = state.presenter.as_mut().unwrap();
-        if fds[1].revents != 0 {
-            let (commands, eof) = lines.read(&mut io::stdin().lock())?;
-            for line in commands {
-                presenter.command(serde_json::from_slice::<WorkerCommand>(&line)?);
+            state.presenter.as_mut().unwrap().tick(&qh)?;
+            let enabled = state.presenter.as_ref().unwrap().accepts_pointer();
+            if enabled != input_enabled {
+                let surface = state.layer.as_ref().unwrap().wl_surface();
+                surface.set_input_region(if enabled {
+                    None
+                } else {
+                    Some(empty.wl_region())
+                });
+                surface.commit();
+                input_enabled = enabled;
             }
-            if eof {
-                return Ok(());
+            let needs_write = ipc::flush_wayland(&conn)?;
+            if !needs_write {
+                state.presenter.as_mut().unwrap().flushed();
+            }
+            let Some(guard) = queue.prepare_read() else {
+                continue;
+            };
+            let presenter = state.presenter.as_ref().unwrap();
+            fds.clear();
+            fds.extend([
+                ipc::interest(&guard.connection_fd(), needs_write),
+                ipc::interest(&io::stdin(), false),
+                ipc::interest(&presenter.decoder.wake, false),
+                ipc::interest(&presenter.wake, false),
+            ]);
+            ipc::poll(&mut fds, presenter.timeout())?;
+            if fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                ipc::read_wayland(guard)?;
+                queue.dispatch_pending(&mut state)?;
+            } else {
+                drop(guard);
+            }
+            // New selections win over old completions from the same readiness batch.
+            let presenter = state.presenter.as_mut().unwrap();
+            if fds[1].revents != 0 {
+                let (commands, eof) = lines.read(&mut io::stdin().lock())?;
+                for line in commands {
+                    presenter.command(serde_json::from_slice::<WorkerCommand>(&line)?);
+                }
+                if eof {
+                    return Ok(());
+                }
+            }
+            if fds[2].revents != 0 {
+                presenter.decoded(&qh)?;
+            }
+            if fds[3].revents != 0 {
+                presenter.drain_wake()?;
             }
         }
-        if fds[2].revents != 0 {
-            presenter.decoded()?;
-        }
-        if fds[3].revents != 0 {
-            presenter.drain_wake()?;
-        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        eprintln!("wallpaperd worker: {error:#}");
+        // Keep protocol objects alive on fatal I/O/driver errors. The parent
+        // drops their connection only after a new worker commits or releases.
+        unsafe { libc::_exit(1) }
     }
     Ok(())
 }
@@ -464,6 +491,8 @@ wayland_client::delegate_noop!(State: ignore WpViewport);
 wayland_client::delegate_noop!(State: ignore WpFractionalScaleManagerV1);
 wayland_client::delegate_noop!(State: ignore WpCursorShapeManagerV1);
 wayland_client::delegate_noop!(State: ignore WpCursorShapeDeviceV1);
+wayland_client::delegate_noop!(State: ignore wl_buffer::WlBuffer);
+wayland_client::delegate_noop!(State: ignore wl_shm_pool::WlShmPool);
 impl Dispatch<WpFractionalScaleV1, ()> for State {
     fn event(
         state: &mut Self,
@@ -498,6 +527,7 @@ struct Pending {
     properties: crate::properties::Values,
     clock: Option<wallpaper_media::clock::Timeline>,
     deadline: Instant,
+    next_frame: Instant,
 }
 /// A selection has one acknowledgement point: first frame committed, then flushed.
 #[derive(Default)]
@@ -579,6 +609,16 @@ enum FrameCallback {
     Waiting(Instant),
 }
 
+struct StaticBuffer {
+    buffer: wl_buffer::WlBuffer,
+    frame: ShmFrame,
+}
+impl Drop for StaticBuffer {
+    fn drop(&mut self) {
+        self.buffer.destroy();
+    }
+}
+
 struct Presenter {
     output_name: String,
     // Drop content before its GL context, and GL before its Wayland connection.
@@ -589,9 +629,8 @@ struct Presenter {
     connection: Connection,
     surface: WlSurface,
     viewport: Option<WpViewport>,
-    buffer: Option<Buffer>,
-    #[cfg(feature = "web")]
-    dmabuf: Option<dmabuf::Dmabuf>,
+    buffer: Option<StaticBuffer>,
+    shm: wl_shm::WlShm,
     pub decoder: Decoder,
     pub wake: UnixStream,
     wake_writer: UnixStream,
@@ -601,6 +640,8 @@ struct Presenter {
     geometry: Option<Geometry>,
     playback: Playback,
     frame_callback: FrameCallback,
+    commit_requested: bool,
+    committed: bool,
     throttled: bool,
     last_presented: Instant,
     repaint: bool,
@@ -609,6 +650,7 @@ struct Presenter {
     media: crate::media::Snapshot,
     audio: we_scene::audio::AudioSnapshot,
     reported_diagnostics: (u64, u64),
+    last_progress: Option<(u64, Instant)>,
 }
 
 impl Presenter {
@@ -618,7 +660,6 @@ impl Presenter {
         viewport: Option<WpViewport>,
         shm: wl_shm::WlShm,
         output_name: &str,
-        #[cfg(feature = "web")] dmabuf: Option<dmabuf::Dmabuf>,
     ) -> Result<Self> {
         let (wake, wake_writer) = UnixStream::pair()?;
         wake.set_nonblocking(true)?;
@@ -633,9 +674,8 @@ impl Presenter {
             surface,
             viewport,
             buffer: None,
-            #[cfg(feature = "web")]
-            dmabuf,
-            decoder: Decoder::new(shm)?,
+            shm,
+            decoder: Decoder::new()?,
             wake,
             wake_writer,
             generation: 0,
@@ -644,6 +684,8 @@ impl Presenter {
             geometry: None,
             playback: Playback::default(),
             frame_callback: FrameCallback::Ready,
+            commit_requested: false,
+            committed: false,
             throttled: false,
             last_presented: Instant::now() - Duration::from_secs(1),
             repaint: false,
@@ -652,10 +694,15 @@ impl Presenter {
             media: Default::default(),
             audio: Default::default(),
             reported_diagnostics: (0, 0),
+            last_progress: None,
         })
     }
 
     pub fn command(&mut self, command: WorkerCommand) {
+        if matches!(&command.action, WorkerAction::Probe) {
+            emit_probe(self.selection_id);
+            return;
+        }
         if let WorkerAction::SetAudio { ref audio } = command.action {
             if audio.valid() {
                 self.audio = *audio.clone();
@@ -745,6 +792,7 @@ impl Presenter {
                 .set_playback(playback)
                 .map_err(|e| Error::new("playback_failed", e.to_string()));
             if result.is_ok() {
+                self.last_progress = None;
                 self.runtime(Ok(()));
             }
             reply(command.id, result);
@@ -784,23 +832,23 @@ impl Presenter {
                     properties,
                     clock: None,
                     deadline: Instant::now() + Duration::from_secs(45),
+                    next_frame: Instant::now(),
                 }));
                 self.load();
             }
             WorkerAction::Release => {
                 self.current = None;
                 self.selection = None;
-                self.surface.attach(None, 0, 0);
-                self.surface.commit();
+                // The supervisor retires this surface after the release reply.
+                // Keep its role mapped until then: an unmap resets layer-shell
+                // state and races input commits or a superseding selection.
                 self.buffer = None;
-                #[cfg(feature = "web")]
-                if let Some(dmabuf) = &mut self.dmabuf {
-                    dmabuf.clear();
-                }
                 self.switch = Switch::AwaitingFlush(command.id);
                 self.repaint = false;
+                self.last_progress = None;
             }
-            WorkerAction::SetPlayback { .. }
+            WorkerAction::Probe
+            | WorkerAction::SetPlayback { .. }
             | WorkerAction::SetProperties { .. }
             | WorkerAction::SetClock { .. }
             | WorkerAction::SetMedia { .. }
@@ -819,7 +867,9 @@ impl Presenter {
             "wallpaper instance changed"
         );
         let selection = self.selection.as_ref().context("no wallpaper is playing")?;
-        let image = if let (Some(current), Some(gpu)) = (&mut self.current, &self.gpu) {
+        let image = if let Some(buffer) = &self.buffer {
+            buffer.frame.image()?
+        } else if let (Some(current), Some(gpu)) = (&mut self.current, &self.gpu) {
             current.export_frame(gpu)?
         } else {
             // EGL-free static wallpapers use the same fit as the SHM presenter.
@@ -933,7 +983,7 @@ impl Presenter {
                 content.resized();
             }
         }
-        self.repaint = self.current.is_some();
+        self.repaint = self.current.is_some() && !self.failed;
         if self.switch.pending().is_some() {
             if self.switch.candidate().is_none()
                 || self.switch.pending().is_some_and(|p| {
@@ -946,12 +996,8 @@ impl Presenter {
             && catalog::kind(catalog::path(selection)) == Some(Kind::Image)
         {
             self.generation += 1;
-            self.decoder.submit(
-                self.generation,
-                selection.clone(),
-                geometry.pixels,
-                self.gpu.is_some(),
-            );
+            self.decoder
+                .submit(self.generation, selection.clone(), geometry.pixels, false);
         }
         self.send_pointer(None);
         Ok(())
@@ -962,6 +1008,30 @@ impl Presenter {
             return;
         };
         let kind = catalog::kind(catalog::path(&pending.selection));
+        // An immutable SHM buffer is all a static desktop needs. Do not create
+        // an EGL context/swapchain just to copy an image once.
+        if kind == Some(Kind::Image)
+            && (pending.transition == Transition::Cut || self.selection.is_none())
+        {
+            self.generation += 1;
+            self.decoder.submit(
+                self.generation,
+                pending.selection.clone(),
+                geometry.pixels,
+                false,
+            );
+            return;
+        }
+        if kind == Some(Kind::Image) {
+            // Decode while EGL and the old static frame are being prepared.
+            self.generation += 1;
+            self.decoder.submit(
+                self.generation,
+                pending.selection.clone(),
+                geometry.pixels,
+                true,
+            );
+        }
         if self.gpu.is_none() {
             match Gpu::wayland(
                 self.connection.backend().display_ptr().cast(),
@@ -969,11 +1039,6 @@ impl Presenter {
                 geometry.pixels,
             ) {
                 Ok(gpu) => self.gpu = Some(gpu),
-                Err(error)
-                    if kind == Some(Kind::Image) && pending.transition == Transition::Cut =>
-                {
-                    eprintln!("wallpaperd worker: EGL unavailable, using static SHM: {error:#}");
-                }
                 Err(error) => {
                     self.fail(Error::new(
                         "unsupported",
@@ -987,57 +1052,70 @@ impl Presenter {
             && self.selection.is_some()
             && self.current.is_none()
         {
-            self.fail(Error::new(
-                "unsupported",
-                "animated transitions require an EGL-rendered current frame",
-            ));
-            return;
+            // Snapshot the immutable displayed pixels, even if the source file
+            // has since changed or disappeared. No idle texture/cache is needed.
+            let result = self
+                .buffer
+                .as_ref()
+                .context("static frame missing")
+                .and_then(|buffer| buffer.frame.image())
+                .and_then(|image| {
+                    Content::image(
+                        self.gpu.as_ref().unwrap(),
+                        image,
+                        &Selection {
+                            fit: crate::domain::Fit::Stretch,
+                            ..self.selection.as_ref().unwrap().clone()
+                        },
+                    )
+                });
+            match result {
+                Ok(content) => self.current = Some(content),
+                Err(error) => {
+                    self.fail(Error::new("load_failed", format!("snapshot: {error:#}")));
+                    return;
+                }
+            }
         }
         if kind == Some(Kind::Image) {
-            self.generation += 1;
-            self.decoder.submit(
-                self.generation,
-                pending.selection.clone(),
-                geometry.pixels,
-                self.gpu.is_some(),
-            );
-        } else {
-            let gpu = self.gpu.as_ref().unwrap();
-            match Content::load_for_output(
-                gpu,
-                &pending.selection,
-                pending.playback.for_engine(self.throttled, false, true),
-                &self.wake_writer,
-                &pending.properties,
-                pending.clock,
-                Some(&self.output_name),
-            ) {
-                Ok(mut content) => {
-                    content.set_media(&self.media);
-                    content.set_audio(&self.audio);
-                    self.switch.pending_mut().unwrap().candidate = Some(content);
-                    self.send_pointer(None);
-                }
-                Err(error) => self.fail(Error::new(
-                    if (kind == Some(Kind::Video)
-                        && wallpaper_media::capability()["available"] == false)
-                        || (kind == Some(Kind::WeWeb)
-                            && crate::web::capability()["available"] == false)
-                        || (kind == Some(Kind::WeScene)
-                            && crate::store::Config::load().is_ok_and(|config| {
-                                matches!(
-                                    config.wallpaper_engine.scene_backend,
-                                    crate::store::SceneBackend::Native
-                                )
-                            }))
-                    {
-                        "unsupported"
-                    } else {
-                        "load_failed"
-                    },
-                    format!("{error:#}"),
-                )),
+            return;
+        }
+        let gpu = self.gpu.as_ref().unwrap();
+        match Content::load_for_output(
+            gpu,
+            &pending.selection,
+            pending.playback.for_engine(self.throttled, false, true),
+            &self.wake_writer,
+            &pending.properties,
+            pending.clock,
+            Some(&self.output_name),
+        ) {
+            Ok(mut content) => {
+                content.set_media(&self.media);
+                content.set_audio(&self.audio);
+                self.switch.pending_mut().unwrap().candidate = Some(content);
+                self.send_pointer(None);
             }
+            Err(error) => self.fail(Error::new(
+                if (kind == Some(Kind::Video)
+                    && wallpaper_media::capability()["available"] == false)
+                    || (kind == Some(Kind::WeApplication)
+                        && crate::application::capability()["available"] == false)
+                    || (kind == Some(Kind::WeWeb) && crate::web::capability()["available"] == false)
+                    || (kind == Some(Kind::WeScene)
+                        && crate::store::Config::load().is_ok_and(|config| {
+                            matches!(
+                                config.wallpaper_engine.scene_backend,
+                                crate::store::SceneBackend::Native
+                            )
+                        }))
+                {
+                    "unsupported"
+                } else {
+                    "load_failed"
+                },
+                format!("{error:#}"),
+            )),
         }
     }
 
@@ -1045,6 +1123,14 @@ impl Presenter {
         self.generation += 1;
         self.decoder.cancel(self.generation);
         self.switch.take_candidate();
+        if self.buffer.is_some() {
+            // A static promotion is speculative until the first EGL commit.
+            self.current = None;
+            self.animation = None;
+            self.gpu = None;
+            self.decoder.reclaim();
+            self.repaint = false;
+        }
         if let Some(pending) = self.switch.take_pending() {
             reply(pending.id, Err(error));
         } else {
@@ -1052,7 +1138,7 @@ impl Presenter {
         }
     }
 
-    pub fn decoded(&mut self) -> Result<()> {
+    pub fn decoded(&mut self, qh: &QueueHandle<State>) -> Result<()> {
         for decoded in self.decoder.receive()? {
             if decoded.generation != self.generation {
                 continue;
@@ -1080,13 +1166,36 @@ impl Presenter {
                         Err(error) => self.fail(Error::new("load_failed", error.to_string())),
                     }
                 }
-                Ok(Frame::Shm { size, buffer }) => {
+                Ok(Frame::Shm(frame)) => {
+                    let size = frame.size;
+                    let pool =
+                        self.shm
+                            .create_pool(frame.file.as_fd(), size.bytes() as i32, qh, ());
+                    let buffer = pool.create_buffer(
+                        0,
+                        size.width as i32,
+                        size.height as i32,
+                        (size.width * 4) as i32,
+                        wl_shm::Format::Xrgb8888,
+                        qh,
+                        (),
+                    );
+                    pool.destroy();
                     self.surface_geometry();
                     self.surface
                         .damage_buffer(0, 0, size.width as i32, size.height as i32);
-                    buffer.attach_to(&self.surface)?;
+                    self.surface.attach(Some(&buffer), 0, 0);
                     self.surface.commit();
-                    self.buffer = Some(buffer);
+                    self.confirm_first_commit(qh);
+                    self.buffer = Some(StaticBuffer { buffer, frame });
+                    self.animation = None;
+                    self.current = None;
+                    self.gpu = None;
+                    self.decoder.reclaim();
+                    self.repaint = false;
+                    self.failed = false;
+                    self.throttled = false;
+                    self.frame_callback = FrameCallback::Ready;
                     if let Some(pending) = self.switch.take_pending() {
                         self.selection_id = pending.id;
                         self.selection = Some(pending.selection);
@@ -1101,6 +1210,11 @@ impl Presenter {
     }
 
     pub fn drain_wake(&mut self) -> io::Result<()> {
+        if let Some(pending) = self.switch.pending_mut() {
+            // Decoder/browser readiness wins over the fallback preparation timer;
+            // a low playback ceiling must not delay a newly available first frame.
+            pending.next_frame = Instant::now();
+        }
         let mut bytes = [0; 256];
         loop {
             match self.wake.read(&mut bytes) {
@@ -1120,6 +1234,16 @@ impl Presenter {
                 viewport.set_source(-1.0, -1.0, -1.0, -1.0);
                 viewport.set_destination(geometry.logical.0 as i32, geometry.logical.1 as i32);
             }
+        }
+    }
+
+    fn confirm_first_commit(&mut self, qh: &QueueHandle<State>) {
+        if !self.commit_requested {
+            // Socket flush alone does not prove the new surface is mapped.
+            // Keep the old worker's connection alive until the compositor has
+            // processed this commit, without waiting for a visible frame callback.
+            self.connection.display().sync(qh, FirstCommit);
+            self.commit_requested = true;
         }
     }
 
@@ -1151,9 +1275,7 @@ impl Presenter {
                 .poll()
                 .and_then(|()| current.prepare_frame(self.gpu.as_ref()))
         {
-            current.fail(self.playback);
-            self.failed = true;
-            self.runtime(Err(Error::new("playback_failed", error.to_string())));
+            self.playback_failed(error);
         }
         // A page can subscribe to audio without painting another frame.
         self.report_diagnostics();
@@ -1164,8 +1286,12 @@ impl Presenter {
             self.update_engines()?;
             self.runtime(Ok(()));
         }
+        let candidate_due = self
+            .switch
+            .pending()
+            .is_some_and(|p| p.candidate.is_some() && p.next_frame <= Instant::now());
         if !matches!(self.frame_callback, FrameCallback::Ready)
-            || self.last_presented.elapsed() < self.interval()
+            || (!candidate_due && self.last_presented.elapsed() < self.interval())
         {
             return Ok(());
         }
@@ -1177,20 +1303,23 @@ impl Presenter {
             .switch
             .pending()
             .is_some_and(|p| p.transition != Transition::Cut)
-            && self.current.is_some();
-        #[cfg(feature = "web")]
-        let candidate_direct = !animation && self.can_present_dmabuf(self.switch.candidate());
-        #[cfg(not(feature = "web"))]
-        let candidate_direct = false;
-        if let Some(candidate) = self.switch.candidate_mut()
-            && candidate.needs_render()
-            && !candidate_direct
-            && let Err(error) = candidate.render(gpu)
-        {
-            self.fail(Error::new("load_failed", error.to_string()));
-            return Ok(());
+            && self.current.is_some()
+            && !self.failed;
+        if candidate_due && let Some(pending) = self.switch.pending_mut() {
+            pending.next_frame =
+                rendering_started + Duration::from_secs_f64(1.0 / f64::from(pending.playback.fps));
+            let candidate = pending.candidate.as_mut().unwrap();
+            if candidate.needs_render()
+                && let Err(error) = candidate.render(gpu)
+            {
+                self.fail(Error::new("load_failed", error.to_string()));
+                return Ok(());
+            }
         }
         let switch = self.switch.candidate().is_some_and(Content::ready);
+        if !switch && self.last_presented.elapsed() < self.interval() {
+            return Ok(());
+        }
         let animation_finished = self
             .animation
             .as_ref()
@@ -1198,21 +1327,12 @@ impl Presenter {
         let direct = !switch
             && (self.animation.is_none() || animation_finished)
             && self.current.as_ref().is_some_and(Content::dynamic);
-        #[cfg(feature = "web")]
-        let dma_direct = if switch {
-            candidate_direct
-        } else {
-            (self.animation.is_none() || animation_finished)
-                && self.can_present_dmabuf(self.current.as_ref())
-        };
-        #[cfg(not(feature = "web"))]
-        let dma_direct = false;
         // Compose the transition independently, without upsampling the content engine.
         let content_due = self.animation.as_ref().is_none_or(|animation| {
             animation.last_rendered.elapsed()
                 >= Duration::from_secs_f64(1.0 / f64::from(self.playback.fps))
         });
-        let changed = if let Some(current) = &mut self.current {
+        let changed: Result<bool> = if let Some(current) = &mut self.current {
             if switch && animation {
                 if let Err(error) = current.snapshot(gpu) {
                     // Snapshot allocation is part of the candidate transaction.
@@ -1220,18 +1340,23 @@ impl Presenter {
                     self.fail(Error::new("load_failed", format!("snapshot: {error:#}")));
                     return Ok(());
                 }
-                false
-            } else if dma_direct {
-                current.needs_render()
-            } else if direct {
-                current.render_direct(gpu, self.repaint || animation_finished)?
+                Ok(false)
+            } else if direct && (current.needs_render() || self.repaint || animation_finished) {
+                current.render_direct(gpu, self.repaint || animation_finished)
             } else if !switch && content_due && current.needs_render() {
-                current.render(gpu)?
+                current.render(gpu)
             } else {
-                false
+                Ok(false)
             }
         } else {
-            false
+            Ok(false)
+        };
+        let changed = match changed {
+            Ok(changed) => changed,
+            Err(error) => {
+                self.playback_failed(error);
+                return Ok(());
+            }
         };
         if changed && let Some(animation) = &mut self.animation {
             animation.last_rendered = frame_anchor(
@@ -1249,11 +1374,12 @@ impl Presenter {
             let Some(content) = content else {
                 return Ok(());
             };
+            let submitted_active = content.animated();
             let (previous, kind, progress) = if switch && animation {
                 (
                     self.current.as_ref().map(Content::target),
                     self.switch.pending().unwrap().transition,
-                    0.0,
+                    1.0 / self.playback.fps.max(60) as f32,
                 )
             } else if !switch && let Some(animation) = &self.animation {
                 (
@@ -1266,56 +1392,24 @@ impl Presenter {
             };
             self.surface_geometry();
             self.surface.frame(qh, self.surface.clone());
-            #[cfg(feature = "web")]
-            if dma_direct {
-                let frame = content.direct_frame().unwrap();
-                let buffer = self.dmabuf.as_mut().unwrap().buffer(frame, qh)?;
-                if let Some(viewport) = &self.viewport {
-                    let [x, y, w, h] = frame.info.visible;
-                    let scale = f64::from(self.geometry.unwrap().buffer_scale);
-                    viewport.set_source(
-                        x as f64 / scale,
-                        y as f64 / scale,
-                        w as f64 / scale,
-                        h as f64 / scale,
-                    );
-                }
-                self.surface.attach(Some(&buffer), 0, 0);
-                self.surface.damage_buffer(
-                    0,
-                    0,
-                    frame.info.size[0] as i32,
-                    frame.info.size[1] as i32,
-                );
-                self.surface.commit();
-            }
-            if !dma_direct && direct {
+            if direct {
                 gpu.swap()?;
-            } else if !dma_direct {
+            } else {
                 gpu.present(content.target(), previous, kind, progress)?;
             }
             content.report_swap();
+            self.confirm_first_commit(qh);
             self.last_presented =
                 frame_anchor(self.last_presented, rendering_started, self.interval());
             self.frame_callback = FrameCallback::Waiting(Instant::now());
             self.repaint = false;
             self.buffer = None;
-            #[cfg(feature = "web")]
-            if dma_direct {
-                if switch {
-                    self.switch.candidate_mut().unwrap().direct_presented();
-                } else {
-                    self.current.as_mut().unwrap().direct_presented();
-                }
-            } else if let Some(dmabuf) = &mut self.dmabuf {
-                dmabuf.clear();
-            }
             if switch {
                 let previous = self.current.replace(self.switch.take_candidate().unwrap());
                 if animation && let Some(previous) = previous {
                     self.animation = Some(Animation {
                         previous: previous.into_snapshot(),
-                        start: Instant::now(),
+                        start: rendering_started - Duration::from_secs_f32(progress),
                         last_rendered: Instant::now(),
                         kind,
                     });
@@ -1326,27 +1420,54 @@ impl Presenter {
                     self.playback = pending.playback;
                     self.switch = Switch::AwaitingFlush(pending.id);
                 }
-                let playback = self.effective_playback();
-                self.current.as_mut().unwrap().playback(playback)?;
                 self.failed = false;
+                let playback = self.effective_playback();
+                if let Err(error) = self.current.as_mut().unwrap().playback(playback) {
+                    self.playback_failed(error);
+                    return Ok(());
+                }
                 self.runtime(Ok(()));
             } else if progress >= 1.0 {
                 self.animation = None;
             }
+            if self.animation.is_none()
+                && self
+                    .current
+                    .as_ref()
+                    .is_some_and(|content| !content.dynamic())
+            {
+                // Transfer the exact displayed pixels to immutable SHM, rather
+                // than reopening a source which may have changed during blending.
+                match self
+                    .current
+                    .as_mut()
+                    .unwrap()
+                    .export_frame(self.gpu.as_ref().unwrap())
+                {
+                    Ok(image) => {
+                        self.generation += 1;
+                        self.decoder.submit_image(self.generation, image);
+                    }
+                    Err(error) => eprintln!("wallpaperd worker: static readback: {error:#}"),
+                }
+            }
+            self.report_progress(submitted_active, rendering_started);
         }
         self.report_diagnostics();
         Ok(())
     }
 
-    #[cfg(feature = "web")]
-    fn can_present_dmabuf(&self, content: Option<&Content>) -> bool {
-        content
-            .and_then(Content::direct_frame)
-            .is_some_and(|frame| {
-                self.dmabuf
-                    .as_ref()
-                    .is_some_and(|dmabuf| dmabuf.supports(frame, self.viewport.is_some()))
-            })
+    fn playback_failed(&mut self, error: anyhow::Error) {
+        if let Some(current) = &mut self.current {
+            current.fail(self.playback);
+        }
+        if let Some(gpu) = &self.gpu {
+            gpu.reset();
+        }
+        self.failed = true;
+        self.repaint = false;
+        self.animation = None;
+        self.runtime(Err(Error::new("playback_failed", format!("{error:#}"))));
     }
 
     fn report_diagnostics(&mut self) {
@@ -1371,6 +1492,11 @@ impl Presenter {
     }
 
     pub fn flushed(&mut self) {
+        if self.selection.is_none() && crate::web::cleanup_pending() {
+            // Browser reaping wakes us; keep the event loop responsive until
+            // resources are retired and the supervisor can remove the surface.
+            return;
+        }
         if let Some(id) = if self.switch.is_flushing() {
             self.switch.cancel()
         } else {
@@ -1381,11 +1507,7 @@ impl Presenter {
     }
     fn interval(&self) -> Duration {
         if self.animation.is_some() {
-            let fps = if self.gpu.as_ref().is_some_and(Gpu::software) {
-                30.0
-            } else {
-                60.0
-            };
+            let fps = f64::from(self.playback.fps.max(60));
             return Duration::from_secs_f64(1.0 / fps);
         }
         let fps = if self.selection.is_none() {
@@ -1407,13 +1529,19 @@ impl Presenter {
         // clock is not a reason to poll at the presentation ceiling.
         let work = self.repaint
             || self.animation.is_some()
-            || self
-                .switch
-                .candidate()
-                .is_some_and(|c| c.ready() || c.needs_render())
             || self.current.as_ref().is_some_and(Content::needs_render);
-        let render = (work && matches!(self.frame_callback, FrameCallback::Ready))
-            .then(|| self.last_presented + self.interval());
+        let frame_ready = matches!(self.frame_callback, FrameCallback::Ready);
+        let render = (work && frame_ready).then(|| self.last_presented + self.interval());
+        let candidate = self
+            .switch
+            .pending()
+            .filter(|p| {
+                frame_ready
+                    && p.candidate
+                        .as_ref()
+                        .is_some_and(|c| c.ready() || c.needs_render())
+            })
+            .map(|p| p.next_frame);
         let throttle = match self.frame_callback {
             FrameCallback::Waiting(start) if !self.throttled && active => {
                 Some(start + CALLBACK_STALL)
@@ -1423,6 +1551,7 @@ impl Presenter {
         render
             .into_iter()
             .chain(throttle)
+            .chain(candidate)
             .chain(self.switch.pending().map(|p| p.deadline))
             .min()
             .map_or(-1, |deadline| {
@@ -1437,9 +1566,15 @@ impl Presenter {
     fn observed(&self) -> WorkerRuntime {
         WorkerRuntime {
             selection_id: self.selection_id,
+            committed: self.committed,
+            active: self.current.as_ref().is_some_and(Content::animated),
             audio: self.current.as_ref().is_some_and(Content::requires_audio)
                 || self.switch.candidate().is_some_and(Content::requires_audio),
-            backend: self.current.as_ref().map(Content::backend),
+            backend: self
+                .current
+                .as_ref()
+                .map(Content::backend)
+                .or_else(|| self.buffer.as_ref().map(|_| crate::domain::Backend::Image)),
             throttled: self.throttled,
             failed: self.failed,
             properties: self
@@ -1458,6 +1593,19 @@ impl Presenter {
     }
     fn runtime(&self, result: Result<(), Error>) {
         emit(0, result, Some(self.observed()), None);
+    }
+
+    fn report_progress(&mut self, active: bool, now: Instant) {
+        if !active
+            || self.last_progress.is_some_and(|(selection, previous)| {
+                selection == self.selection_id
+                    && now.saturating_duration_since(previous) < Duration::from_secs(5)
+            })
+        {
+            return;
+        }
+        self.last_progress = Some((self.selection_id, now));
+        emit_progress(self.selection_id);
     }
 }
 
@@ -1481,6 +1629,26 @@ pub fn reply(id: u64, result: Result<(), Error>) {
     emit(id, result, None, None);
 }
 
+fn emit_progress(selection_id: u64) {
+    emit_signal(Some(selection_id), None);
+}
+
+fn emit_probe(selection_id: u64) {
+    emit_signal(None, Some(selection_id));
+}
+
+fn emit_signal(progress: Option<u64>, probe: Option<u64>) {
+    write_reply(WorkerReply {
+        id: 0,
+        ok: true,
+        error: None,
+        runtime: None,
+        snapshot: None,
+        progress,
+        probe,
+    });
+}
+
 fn emit(
     id: u64,
     result: Result<(), Error>,
@@ -1491,17 +1659,20 @@ fn emit(
         Ok(()) => (true, None),
         Err(error) => (false, Some(error)),
     };
+    write_reply(WorkerReply {
+        id,
+        ok,
+        error,
+        runtime,
+        snapshot,
+        progress: None,
+        probe: None,
+    });
+}
+
+fn write_reply(reply: WorkerReply) {
     let mut stdout = io::stdout().lock();
-    let _ = serde_json::to_writer(
-        &mut stdout,
-        &WorkerReply {
-            id,
-            ok,
-            error,
-            runtime,
-            snapshot,
-        },
-    );
+    let _ = serde_json::to_writer(&mut stdout, &reply);
     let _ = stdout.write_all(b"\n");
     let _ = stdout.flush();
 }

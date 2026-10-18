@@ -84,10 +84,17 @@ impl Project {
     fn source(&self, root: &Path) -> Result<PathBuf, Error> {
         let kind = self.kind()?;
         if kind == Kind::WeApplication {
-            return Err(Error::new(
-                "unsupported",
-                format!("WE {} projects are not supported", self.r#type),
-            ));
+            let relative = PathBuf::from(self.file.replace('\\', "/"));
+            if !relative
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+            {
+                return Err(Error::new(
+                    "unsupported",
+                    "应用兼容后端需要项目提供 Windows .exe 文件",
+                ));
+            }
+            return project_file(root, &relative);
         }
         let mut relative = PathBuf::from(self.file.replace('\\', "/"));
         if kind == Kind::WeScene {
@@ -231,7 +238,7 @@ pub fn list(config: &Config, library: &Library) -> Vec<Asset> {
         .asset_dirs
         .iter()
         .cloned()
-        .chain(steam_workshops())
+        .chain(automatic_sources())
         .chain(library.sources.iter().cloned())
         .filter(|path| library.source_enabled(path))
     {
@@ -332,13 +339,22 @@ fn steam_roots() -> impl Iterator<Item = PathBuf> {
         .into_iter()
         .map(|path| home().join(path))
 }
-pub fn steam_workshops() -> impl Iterator<Item = PathBuf> {
-    steam_roots()
-        .map(|root| root.join("steamapps/workshop/content/431960"))
-        .filter(|root| root.is_dir())
-        .filter_map(|root| root.canonicalize().ok())
-        .collect::<BTreeSet<_>>()
+pub fn automatic_sources() -> impl Iterator<Item = PathBuf> {
+    automatic_sources_for(steam_roots()).into_iter()
+}
+fn automatic_sources_for(roots: impl IntoIterator<Item = PathBuf>) -> BTreeSet<PathBuf> {
+    roots
         .into_iter()
+        .flat_map(|root| {
+            [
+                root.join("steamapps/workshop/content/431960"),
+                root.join("steamapps/common/wallpaper_engine/projects/defaultprojects"),
+                root.join("steamapps/common/wallpaper_engine/projects/myprojects"),
+            ]
+        })
+        .filter(|path| path.is_dir())
+        .filter_map(|path| path.canonicalize().ok())
+        .collect()
 }
 pub(crate) fn we_assets(config: &WallpaperEngine) -> anyhow::Result<PathBuf> {
     let path = config
@@ -514,6 +530,65 @@ mod tests {
                 .unwrap_err()
                 .code,
             "asset_unavailable"
+        );
+    }
+    #[test]
+    fn application_projects_require_a_local_executable_without_running_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        project(root, "application", "wallpaper.exe");
+        std::fs::write(
+            root.join("wallpaper.exe"),
+            b"MZ synthetic metadata fixture, never execute",
+        )
+        .unwrap();
+        let selection = resolve(root.to_str().unwrap(), Fit::Cover).unwrap();
+        assert_eq!(kind(root), Some(Kind::WeApplication));
+        assert_eq!(source(&selection).unwrap(), root.join("wallpaper.exe"));
+        project(root, "application", "../outside.exe");
+        assert!(resolve(root.to_str().unwrap(), Fit::Cover).is_err());
+    }
+    #[test]
+    fn automatic_sources_include_bundled_and_authored_projects_and_honor_exclusions() {
+        let temp = tempfile::tempdir().unwrap();
+        let steam = temp.path().join("Steam");
+        let workshop = steam.join("steamapps/workshop/content/431960");
+        let bundled = steam.join("steamapps/common/wallpaper_engine/projects/defaultprojects");
+        let authored = steam.join("steamapps/common/wallpaper_engine/projects/myprojects");
+        for (source, name) in [
+            (&workshop, "subscribed"),
+            (&bundled, "bundled"),
+            (&authored, "authored"),
+        ] {
+            let directory = source.join(name);
+            std::fs::create_dir_all(&directory).unwrap();
+            project(&directory, "web", "index.html");
+            std::fs::write(directory.join("index.html"), "test").unwrap();
+        }
+        let alias = temp.path().join("Steam-alias");
+        std::os::unix::fs::symlink(&steam, &alias).unwrap();
+        let sources = automatic_sources_for([steam, alias]);
+        assert_eq!(sources.len(), 3, "Steam aliases never duplicate sources");
+        let mut library = Library::default();
+        library
+            .edit(crate::library::Edit::RemoveSource {
+                path: bundled.clone(),
+            })
+            .unwrap();
+        let enabled: Vec<_> = sources
+            .into_iter()
+            .filter(|path| library.source_enabled(path))
+            .collect();
+        assert_eq!(enabled.len(), 2);
+        let mut assets = Vec::new();
+        for source in enabled {
+            visit(&source, 0, &mut assets);
+        }
+        assert_eq!(assets.len(), 2);
+        assert!(assets.iter().all(|asset| !asset.path.starts_with(&bundled)));
+        assert!(
+            bundled.exists(),
+            "excluding installed resources never deletes them"
         );
     }
 }

@@ -1,0 +1,30 @@
+[Desktop Entry]
+Type=Application
+Name=Misari Wallpapers
+Name[zh_CN]=Misari 壁纸
+Comment=Discover, collect and play Wallpaper Engine wallpapers
+Comment[zh_CN]=发现、收藏与播放 Wallpaper Engine 壁纸
+Exec=misari-wallpaper
+Icon=io.misari.wallpaper
+Terminal=false
+Categories=Graphics;
+Keywords=wallpaper;desktop;Steam;Wallpaper Engine;
+Keywords[zh_CN]=壁纸;桌面;动态壁纸;创意工坊;
+StartupNotify=true
+StartupWMClass=io.misari.wallpaper
+Actions=Library;Workshop;Downloads;
+
+[Desktop Action Library]
+Name=My Library
+Name[zh_CN]=我的壁纸
+Exec=misari-wallpaper --page library
+
+[Desktop Action Workshop]
+Name=Steam Workshop
+Name[zh_CN]=创意工坊
+Exec=misari-wallpaper --page workshop
+
+[Desktop Action Downloads]
+Name=Downloads
+Name[zh_CN]=下载任务
+Exec=misari-wallpaper --page downloads

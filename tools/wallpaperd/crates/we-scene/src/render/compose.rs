@@ -681,13 +681,21 @@ impl Renderer {
                         frame.composite = surface.group.is_some();
                         frame.projection =
                             surface.view.matrix(model.state.perspective) * model.state.transform;
-                        model.draw(
+                        unsafe {
+                            self.gl
+                                .color_mask(true, true, true, surface.group.is_some());
+                        }
+                        let result = model.draw(
                             &self.gl,
                             surface.view.matrix(model.state.perspective),
                             surface.view.eye,
                             frame,
                             |name| self.surface_texture(name, &surface, prepared),
-                        )?;
+                        );
+                        unsafe {
+                            self.gl.color_mask(true, true, true, true);
+                        }
+                        result?;
                     }
                     RenderObject::Particle(index) => {
                         let particle = &self.particles[index];
@@ -705,12 +713,20 @@ impl Renderer {
                         frame.composite = surface.group.is_some();
                         frame.projection =
                             surface.view.matrix(particle.perspective()) * particle.state.transform;
-                        particle.draw(
+                        unsafe {
+                            self.gl
+                                .color_mask(true, true, true, surface.group.is_some());
+                        }
+                        let result = particle.draw(
                             &self.gl,
                             frame,
                             |name| self.surface_texture(name, &surface, prepared),
                             surface.view,
-                        )?;
+                        );
+                        unsafe {
+                            self.gl.color_mask(true, true, true, true);
+                        }
+                        result?;
                     }
                 },
             }

@@ -1,3 +1,4 @@
+mod application;
 mod audio_capture;
 mod catalog;
 mod content;

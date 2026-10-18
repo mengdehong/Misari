@@ -26,6 +26,8 @@ pub(crate) struct Assets {
     data: std::rc::Rc<PackageData>,
     entries: std::rc::Rc<HashMap<String, Range<usize>>>,
     roots: Vec<PathBuf>,
+    selectors: std::rc::Rc<HashMap<String, bool>>,
+    selected: std::rc::Rc<std::cell::RefCell<Vec<(PathBuf, bool)>>>,
     texture_info: std::rc::Rc<std::cell::RefCell<HashMap<AssetKey, std::rc::Rc<TextureInfo>>>>,
 }
 enum PackageData {
@@ -114,12 +116,47 @@ impl Assets {
         if let Some(common) = common {
             roots.push(common.canonicalize()?);
         }
+        let definitions: serde_json::Value =
+            bounded_read_limit(&roots[0].join("project.json"), 1024 * 1024)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default();
+        let selectors = definitions["general"]["properties"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(key, value)| match value["type"].as_str() {
+                Some("file") => Some((key.clone(), false)),
+                Some("directory") => Some((key.clone(), true)),
+                _ => None,
+            })
+            .collect();
         Ok(Self {
             data: std::rc::Rc::new(data),
             entries: std::rc::Rc::new(entries),
             roots,
+            selectors: std::rc::Rc::new(selectors),
+            selected: Default::default(),
             texture_info: Default::default(),
         })
+    }
+    pub fn select(&self, properties: &crate::Properties) {
+        *self.selected.borrow_mut() = self
+            .selectors
+            .iter()
+            .filter_map(|(key, directory)| {
+                let path = Path::new(properties.get(key)?.as_str()?);
+                if !path.is_absolute() {
+                    return None;
+                }
+                let path = path.canonicalize().ok()?;
+                ((*directory && path.is_dir()) || (!directory && path.is_file()))
+                    .then_some((path, *directory))
+            })
+            .collect();
+    }
+    pub fn has_selectors(&self) -> bool {
+        !self.selectors.is_empty()
     }
     /// Common effects ship their materials/shaders under the effect directory.
     /// Keep that lookup scope local to this effect, sharing the indexed package.
@@ -139,6 +176,8 @@ impl Assets {
             data: self.data.clone(),
             entries: self.entries.clone(),
             roots,
+            selectors: self.selectors.clone(),
+            selected: self.selected.clone(),
             texture_info: self.texture_info.clone(),
         })
     }
@@ -147,6 +186,18 @@ impl Assets {
             .with_context(|| format!("asset not found: {name}"))
     }
     fn locate_optional(&self, name: &str) -> Result<Option<AssetKey>> {
+        if Path::new(name).is_absolute() {
+            let path = Path::new(name).canonicalize()?;
+            ensure!(
+                self.selected
+                    .borrow()
+                    .iter()
+                    .any(|(selected, directory)| path == *selected
+                        || *directory && path.starts_with(selected)),
+                "external asset was not selected by the user: {name}"
+            );
+            return Ok(path.is_file().then_some(AssetKey::File(path)));
+        }
         let name = normalize(name)?;
         if self.entries.contains_key(&name) {
             return Ok(Some(AssetKey::Package(name)));
@@ -196,6 +247,9 @@ impl Assets {
             .transpose()
     }
     pub fn texture_key(&self, name: &str) -> Result<AssetKey> {
+        if Path::new(name).is_absolute() {
+            return self.locate(name);
+        }
         self.locate(&texture_name(name)?)
     }
     pub fn json(&self, name: &str) -> Result<serde_json::Value> {
@@ -210,6 +264,21 @@ impl Assets {
         Ok(value)
     }
     pub fn texture(&self, name: &str, compressed: impl Fn(u32) -> bool) -> Result<Texture> {
+        if Path::new(name).is_absolute() {
+            let image = self.selected_image(name)?;
+            let size = [image.width(), image.height()];
+            return Ok(Texture {
+                compressed: None,
+                mipmaps: Vec::new(),
+                flags: 2,
+                video: None,
+                frames: Vec::new(),
+                width: size[0],
+                height: size[1],
+                content: size,
+                rgba: image.into_raw(),
+            });
+        }
         let mut texture = texture::load_compressed(&self.bytes(&texture_name(name)?)?, compressed)
             .with_context(|| format!("reading TEX {name}"))?;
         if texture.frames.is_empty()
@@ -226,6 +295,16 @@ impl Assets {
         Ok((info.format, info.frames.clone()))
     }
     pub fn texture_info(&self, name: &str) -> Result<std::rc::Rc<TextureInfo>> {
+        if Path::new(name).is_absolute() {
+            let image = self.selected_image(name)?;
+            return Ok(std::rc::Rc::new(TextureInfo {
+                size: [image.width(), image.height()],
+                format: 0,
+                frames: Vec::new(),
+                video: false,
+                duration: 0.0,
+            }));
+        }
         let key = self.texture_key(name)?;
         if let Some(info) = self.texture_info.borrow().get(&key) {
             return Ok(info.clone());
@@ -248,6 +327,20 @@ impl Assets {
         let info = std::rc::Rc::new(info);
         cache.insert(key, info.clone());
         Ok(info)
+    }
+    fn selected_image(&self, name: &str) -> Result<image::RgbaImage> {
+        let AssetKey::File(path) = self.locate(name)? else {
+            unreachable!()
+        };
+        let bytes = bounded_read_limit(&path, 64 * 1024 * 1024)?;
+        let mut reader =
+            image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(8192);
+        limits.max_image_height = Some(8192);
+        limits.max_alloc = Some(128 * 1024 * 1024);
+        reader.limits(limits);
+        Ok(reader.decode()?.into_rgba8())
     }
     fn texture_sidecar(&self, name: &str) -> Result<Option<serde_json::Value>> {
         let key = self.texture_key(name)?;
@@ -592,6 +685,8 @@ mod tests {
             data: std::rc::Rc::new(PackageData::Json(Vec::new())),
             entries: std::rc::Rc::new(HashMap::new()),
             roots: vec![root.path().canonicalize().unwrap()],
+            selectors: Default::default(),
+            selected: Default::default(),
             texture_info: Default::default(),
         };
         let a = assets.effect("a/effect.json").unwrap();
@@ -624,5 +719,57 @@ mod tests {
         assert!(!invalid_system_texture(
             &serde_json::json!({"alpha":{"user":"alpha","value":1}})
         ));
+    }
+    #[test]
+    fn selected_external_assets_are_typed_scoped_revocable_and_decode_raster_files() {
+        use serde_json::json;
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let file = outside.path().join("selected.png");
+        let sibling = outside.path().join("unselected.txt");
+        let folder = outside.path().join("photos");
+        std::fs::create_dir(&folder).unwrap();
+        image::RgbaImage::from_pixel(3, 2, image::Rgba([12, 34, 56, 255]))
+            .save(&file)
+            .unwrap();
+        std::fs::write(&sibling, b"private").unwrap();
+        std::fs::write(folder.join("data.json"), b"{\"selected\":true}").unwrap();
+        std::fs::write(project.path().join("scene.json"), b"{}").unwrap();
+        std::fs::write(project.path().join("project.json"), json!({"general":{"properties":{
+            "file":{"type":"file","value":file}, "folder":{"type":"directory","value":folder}, "text":{"type":"textinput"}
+        }}}).to_string()).unwrap();
+        let assets =
+            Assets::open(project.path(), &project.path().join("scene.json"), None).unwrap();
+        assert!(
+            assets.read(file.to_str().unwrap()).is_err(),
+            "authored defaults grant nothing"
+        );
+        let values =
+            serde_json::from_value(json!({"file":file,"folder":folder,"text":sibling})).unwrap();
+        assets.select(&values);
+        let texture = assets.texture(file.to_str().unwrap(), |_| false).unwrap();
+        assert_eq!(texture.content, [3, 2]);
+        assert_eq!(&texture.rgba[..4], &[12, 34, 56, 255]);
+        assert_eq!(
+            assets.texture_info(file.to_str().unwrap()).unwrap().size,
+            [3, 2]
+        );
+        assert_eq!(
+            assets
+                .json(folder.join("data.json").to_str().unwrap())
+                .unwrap()["selected"],
+            true
+        );
+        assert!(assets.read(sibling.to_str().unwrap()).is_err());
+        let link = folder.join("escape.txt");
+        std::os::unix::fs::symlink(&sibling, &link).unwrap();
+        assert!(assets.read(link.to_str().unwrap()).is_err());
+        assert!(assets.read("../unselected.txt").is_err());
+        let shared = assets.clone();
+        assets.select(&Default::default());
+        assert!(
+            shared.read(file.to_str().unwrap()).is_err(),
+            "reset revokes shared runtime asset scopes"
+        );
     }
 }

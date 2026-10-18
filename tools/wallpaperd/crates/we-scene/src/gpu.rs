@@ -1333,14 +1333,54 @@ impl Pass {
             }
         }
     }
-    pub fn vector3(&self, name: &str, value: glam::Vec3) {
-        let Some(location) = self.builtin(name) else {
-            return;
-        };
+    pub fn transforms(
+        &self,
+        model: Mat4,
+        view_projection: Option<Mat4>,
+        eye: glam::Vec3,
+        basis: Option<glam::Mat3>,
+    ) {
         unsafe {
             self.gl.use_program(Some(self.handle));
+            self.gl.uniform_matrix_4_f32_slice(
+                self.builtin("g_ModelMatrix"),
+                false,
+                &model.to_cols_array(),
+            );
+            if let Some(location) = self.builtin("g_ModelMatrixInverse") {
+                let inverse = if model.determinant().abs() > 1e-12 {
+                    model.inverse()
+                } else {
+                    Mat4::IDENTITY
+                };
+                self.gl
+                    .uniform_matrix_4_f32_slice(Some(location), false, &inverse.to_cols_array());
+            }
+            if let Some(value) = view_projection {
+                self.gl.uniform_matrix_4_f32_slice(
+                    self.builtin("g_ViewProjectionMatrix"),
+                    false,
+                    &value.to_cols_array(),
+                );
+            }
+            if let Some(location) = self.builtin("g_NormalModelMatrix") {
+                let normal = glam::Mat3::from_mat4(model);
+                let normal = if normal.determinant().abs() > 1e-12 {
+                    normal.inverse().transpose()
+                } else {
+                    normal
+                };
+                self.gl
+                    .uniform_matrix_3_f32_slice(Some(location), false, &normal.to_cols_array());
+            }
             self.gl
-                .uniform_3_f32(Some(location), value.x, value.y, value.z);
+                .uniform_3_f32(self.builtin("g_EyePosition"), eye.x, eye.y, eye.z);
+            if let Some(basis) = basis {
+                for (name, value) in [("g_ViewRight", basis.x_axis), ("g_ViewUp", basis.y_axis)] {
+                    self.gl
+                        .uniform_3_f32(self.builtin(name), value.x, value.y, value.z);
+                }
+            }
         }
     }
     pub fn vector4(&self, name: &str, value: glam::Vec4) {
@@ -1351,26 +1391,6 @@ impl Pass {
             self.gl.use_program(Some(self.handle));
             self.gl
                 .uniform_4_f32(Some(location), value.x, value.y, value.z, value.w);
-        }
-    }
-    pub fn matrix4(&self, name: &str, value: Mat4) {
-        let Some(location) = self.builtin(name) else {
-            return;
-        };
-        unsafe {
-            self.gl.use_program(Some(self.handle));
-            self.gl
-                .uniform_matrix_4_f32_slice(Some(location), false, &value.to_cols_array());
-        }
-    }
-    pub fn matrix3(&self, name: &str, value: glam::Mat3) {
-        let Some(location) = self.builtin(name) else {
-            return;
-        };
-        unsafe {
-            self.gl.use_program(Some(self.handle));
-            self.gl
-                .uniform_matrix_3_f32_slice(Some(location), false, &value.to_cols_array());
         }
     }
 }

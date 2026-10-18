@@ -58,6 +58,175 @@ impl<T: Clone + Default + PartialEq + Send + 'static> Monitor<T> {
     }
 }
 
+pub mod power {
+    use serde::Serialize;
+    use std::{
+        io,
+        os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+        path::Path,
+    };
+
+    pub struct Watch(OwnedFd);
+
+    impl Watch {
+        pub fn open() -> io::Result<Self> {
+            // Subscribe before reading sysfs so a change during the initial
+            // snapshot stays queued for the session's next poll.
+            let raw = unsafe {
+                libc::socket(
+                    libc::AF_NETLINK,
+                    libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                    libc::NETLINK_KOBJECT_UEVENT,
+                )
+            };
+            if raw < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let descriptor = unsafe { OwnedFd::from_raw_fd(raw) };
+            let mut address: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+            address.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+            address.nl_groups = 1;
+            if unsafe {
+                libc::bind(
+                    descriptor.as_raw_fd(),
+                    std::ptr::addr_of!(address).cast(),
+                    std::mem::size_of_val(&address) as libc::socklen_t,
+                )
+            } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self(descriptor))
+        }
+
+        pub fn changed(&self) -> io::Result<bool> {
+            let mut changed = false;
+            let mut bytes = [0; 8192];
+            // Bound each turn so a busy uevent source cannot starve clients.
+            for _ in 0..64 {
+                let mut sender: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+                let mut sender_len = std::mem::size_of_val(&sender) as libc::socklen_t;
+                let count = unsafe {
+                    libc::recvfrom(
+                        self.as_raw_fd(),
+                        bytes.as_mut_ptr().cast(),
+                        bytes.len(),
+                        0,
+                        std::ptr::addr_of_mut!(sender).cast(),
+                        &mut sender_len,
+                    )
+                };
+                if count < 0 {
+                    let error = io::Error::last_os_error();
+                    match error.kind() {
+                        io::ErrorKind::WouldBlock => break,
+                        io::ErrorKind::Interrupted => continue,
+                        // A full receive queue lost evidence. Refresh sysfs
+                        // once and keep using the still-valid subscription.
+                        _ if error.raw_os_error() == Some(libc::ENOBUFS) => changed = true,
+                        _ => return Err(error),
+                    }
+                } else if sender.nl_pid == 0 {
+                    // A truncated datagram might hide SUBSYSTEM; rescan rather
+                    // than silently miss a power change in that case.
+                    changed |=
+                        count as usize == bytes.len() || power_event(&bytes[..count as usize]);
+                }
+            }
+            Ok(changed)
+        }
+    }
+
+    impl AsRawFd for Watch {
+        fn as_raw_fd(&self) -> RawFd {
+            self.0.as_raw_fd()
+        }
+    }
+
+    fn power_event(bytes: &[u8]) -> bool {
+        bytes
+            .split(|byte| *byte == 0)
+            .any(|field| field == b"SUBSYSTEM=power_supply")
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+    pub struct Snapshot {
+        pub available: bool,
+        pub on_battery: bool,
+    }
+    pub fn read() -> Snapshot {
+        read_from(Path::new("/sys/class/power_supply"))
+    }
+    fn read_from(root: &Path) -> Snapshot {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return Snapshot::default();
+        };
+        let mut battery = false;
+        let mut discharging = false;
+        let mut online = None;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let read = |name| {
+                std::fs::read_to_string(path.join(name))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned()
+            };
+            if read("type") == "Battery" {
+                if read("present") == "0" {
+                    continue;
+                }
+                let status = read("status");
+                battery |= matches!(
+                    status.as_str(),
+                    "Charging" | "Discharging" | "Full" | "Not charging"
+                );
+                discharging |= status == "Discharging";
+            } else if let Ok(value) = read("online").parse::<u8>() {
+                online = Some(online.unwrap_or(false) || value > 0);
+            }
+        }
+        Snapshot {
+            available: battery || online.is_some(),
+            on_battery: battery && online.map_or(discharging, |value| !value),
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn only_power_supply_events_refresh_evidence() {
+            assert!(power_event(
+                b"change@/devices/BAT0\0SUBSYSTEM=power_supply\0"
+            ));
+            assert!(power_event(b"remove@/devices/AC\0SUBSYSTEM=power_supply\0"));
+            assert!(!power_event(b"change@/devices/usb\0SUBSYSTEM=usb\0"));
+            assert!(!power_event(b"SUBSYSTEM=power_supply_other\0"));
+            assert!(!power_event(b"OTHER=SUBSYSTEM=power_supply\0"));
+        }
+
+        #[test]
+        fn power_evidence_handles_ac_battery_and_missing_hardware() {
+            let root = tempfile::tempdir().unwrap();
+            assert!(!read_from(root.path()).available);
+            let battery = root.path().join("BAT0");
+            std::fs::create_dir(&battery).unwrap();
+            std::fs::write(battery.join("type"), "Battery\n").unwrap();
+            std::fs::write(battery.join("status"), "Discharging\n").unwrap();
+            assert!(read_from(root.path()).on_battery);
+            let ac = root.path().join("AC");
+            std::fs::create_dir(&ac).unwrap();
+            std::fs::write(ac.join("type"), "Mains").unwrap();
+            std::fs::write(ac.join("online"), "1\n").unwrap();
+            assert!(!read_from(root.path()).on_battery);
+            std::fs::write(ac.join("online"), "0\n").unwrap();
+            assert!(read_from(root.path()).on_battery);
+            std::fs::write(battery.join("present"), "0\n").unwrap();
+            assert!(!read_from(root.path()).on_battery);
+        }
+    }
+}
+
 pub mod logind {
     //! logind events are optional desktop evidence, independent of the user's persisted pause.
     use std::{collections::HashMap, io};

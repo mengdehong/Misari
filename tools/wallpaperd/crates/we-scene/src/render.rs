@@ -39,6 +39,7 @@ pub struct Renderer {
     particles: Vec<particles::Renderer>,
     models: Vec<mdl::Renderer>,
     puppet_vertices: Vec<f32>,
+    rig_objects: Vec<Option<RenderObject>>,
     shadows: Option<lighting::shadow::Renderer>,
     model_target: Option<Buffer>,
     reflection: Option<Buffer>,
@@ -476,6 +477,7 @@ impl Renderer {
         initialize_scripts: bool,
     ) -> Result<Self> {
         let assets = Assets::open(project, package, common)?;
+        assets.select(properties);
         let mut scene = scene::Scene::load(&assets, properties)?;
         scene::prepare_texture_animations(&mut scene, &assets)?;
         let runtime = runtime::Runtime::new(
@@ -640,7 +642,8 @@ impl Renderer {
         } else {
             None
         };
-        let keep_assets = text_system.is_some()
+        let keep_assets = assets.has_selectors()
+            || text_system.is_some()
             || runtime.scripts.is_some()
             || !initialize_scripts
             || bindings::has_binding(&scene.general["hdr"])
@@ -673,6 +676,7 @@ impl Renderer {
             particles,
             models,
             puppet_vertices: Vec::new(),
+            rig_objects: Vec::new(),
             shadows: None,
             model_target: None,
             reflection: None,
@@ -770,7 +774,24 @@ impl Renderer {
 
     /// Validate the complete update before changing any visible state.
     pub fn set_properties(&mut self, properties: &Properties) -> Result<()> {
-        let update = self.prepare_properties(properties)?;
+        if let Some(assets) = &self.assets {
+            assets.select(properties);
+        }
+        let update = match self.prepare_properties(properties) {
+            Ok(update) => update,
+            Err(error) => {
+                if let Some(assets) = &self.assets {
+                    let previous = match &self.pending {
+                        Some(Update::Reload(_, properties) | Update::Values { properties, .. }) => {
+                            properties
+                        }
+                        None => &self.properties,
+                    };
+                    assets.select(previous);
+                }
+                return Err(error);
+            }
+        };
         if self.paused {
             self.pending = Some(update);
         } else {
@@ -793,8 +814,7 @@ impl Renderer {
             changed = true;
         }
         if !paused && let Some(media) = self.pending_media.take() {
-            self.set_media(media);
-            changed = true;
+            changed |= self.set_media(media);
         }
         if let Err(error) = self.media_system.pause(paused, &self.runtime.objects) {
             self.runtime.error(format!("scene media pause: {error:#}"));
@@ -1159,7 +1179,7 @@ impl Renderer {
         self.resources().bytes
     }
     fn update_materials(&mut self) -> Result<()> {
-        if self.runtime.scripts.is_none() && !self.runtime.animations.present() {
+        if !self.runtime.materials_dirty() {
             return Ok(());
         }
         for (spec, layer) in self.scene.layers.iter().zip(&mut self.layers) {
@@ -1178,23 +1198,61 @@ impl Renderer {
                 }
             }
         }
+        self.runtime.materials_updated();
         Ok(())
     }
-    pub fn set_media(&mut self, media: serde_json::Value) {
+    pub fn set_media(&mut self, media: serde_json::Value) -> bool {
         if self.paused {
             self.pending_media = Some(media);
-            return;
+            return false;
         }
-        if self.media != media {
-            self.media_texture_dirty |= self.media["enabled"] != media["enabled"]
-                || self.media["artwork"]["path"] != media["artwork"]["path"]
-                || self.media["previous_artwork"]["path"] != media["previous_artwork"]["path"];
-            self.refresh_script_clock();
-            for (event, arg) in media_events::changes(&self.media, &media) {
-                self.runtime.event(event, &arg);
-            }
-            self.media = media;
+        if self.media == media {
+            return false;
         }
+        let enabled_changed = self.media["enabled"] != media["enabled"];
+        let artwork_changed =
+            enabled_changed || self.media["artwork"]["path"] != media["artwork"]["path"];
+        let previous_artwork_changed = enabled_changed
+            || self.media["previous_artwork"]["path"] != media["previous_artwork"]["path"];
+        self.media_texture_dirty |= artwork_changed || previous_artwork_changed;
+        let mut changed =
+            self.uses_changed_media_artwork(artwork_changed, previous_artwork_changed);
+        self.refresh_script_clock();
+        for (event, arg) in media_events::changes(&self.media, &media) {
+            changed |= self.runtime.event(event, &arg);
+        }
+        self.media = media;
+        changed
+    }
+
+    fn uses_changed_media_artwork(&self, artwork: bool, previous: bool) -> bool {
+        let changed = |name: &str| {
+            artwork && name == "_system$mediaThumbnail"
+                || previous && name == "_system$mediaPreviousThumbnail"
+        };
+        self.layers
+            .iter()
+            .flat_map(|layer| {
+                layer
+                    .base
+                    .references
+                    .iter()
+                    .filter_map(Option::as_deref)
+                    .chain(
+                        layer
+                            .effects
+                            .iter()
+                            .flat_map(Effect::scene_references)
+                            .map(String::as_str),
+                    )
+            })
+            .chain(self.models.iter().flat_map(mdl::Renderer::references))
+            .chain(
+                self.particles
+                    .iter()
+                    .flat_map(particles::Renderer::references),
+            )
+            .any(changed)
     }
     fn refresh_script_clock(&mut self) {
         if let (Some(clock), Some(scripts)) = (self.script_clock, &self.runtime.scripts) {
@@ -1409,7 +1467,7 @@ impl Renderer {
                     layers: &rig.layers,
                 })
                 .collect();
-            let curve_events = self.runtime.animations.events.clone();
+            let curve_events = std::mem::take(&mut self.runtime.animations.events);
             let animation_events = rigs
                 .iter()
                 .flat_map(|(node, rig)| {
@@ -1794,21 +1852,13 @@ impl Renderer {
         }
     }
     fn update_skeletons(&mut self, time: f32, states: &mut [scene::State]) -> Result<()> {
-        let mut rigs = vec![None; states.len()];
-        for (index, (spec, layer)) in self.scene.layers.iter().zip(&self.layers).enumerate() {
-            if layer.puppet.is_some() {
-                rigs[spec.node] = Some(RenderObject::Image(index));
-            }
-        }
-        for (index, model) in self.models.iter().enumerate() {
-            rigs[model.index] = Some(RenderObject::Model(index));
-        }
+        debug_assert_eq!(self.rig_objects.len(), states.len());
         // Compose each child after its parent's current pose is available. This
         // also gives nested rigs the correct physics space without a second pass.
         for position in 0..self.runtime.order().len() {
             let node = self.runtime.order()[position];
             self.runtime.compose_node(node, states)?;
-            match rigs[node] {
+            match self.rig_objects[node] {
                 Some(RenderObject::Image(index)) => {
                     let layer = &mut self.layers[index];
                     let rig = layer.puppet.as_mut().unwrap();

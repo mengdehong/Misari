@@ -20,6 +20,8 @@ pub struct Library {
     pub playlists: BTreeMap<String, Playlist>,
     pub hidden: BTreeSet<String>,
     pub titles: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub presets: BTreeMap<String, BTreeMap<String, crate::properties::Values>>,
     next_id: u64,
 }
 
@@ -27,25 +29,104 @@ pub struct Library {
 pub struct Playlist {
     pub name: String,
     pub members: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub properties: BTreeMap<String, crate::properties::Values>,
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Edit {
-    Import { path: PathBuf },
-    RemoveSource { path: PathBuf },
-    Favorite { asset_id: String, favorite: bool },
-    Hide { asset_id: String, hidden: bool },
-    RenameAsset { asset_id: String, title: String },
-    CreatePlaylist { name: String },
-    RenamePlaylist { id: String, name: String },
-    DeletePlaylist { id: String },
-    PlaylistMembers { id: String, members: Vec<String> },
+    SavePreset {
+        asset_id: String,
+        name: String,
+        properties: crate::properties::Values,
+    },
+    DeletePreset {
+        asset_id: String,
+        name: String,
+    },
+    PlaylistProperties {
+        id: String,
+        asset_id: String,
+        properties: crate::properties::Values,
+    },
+    Import {
+        path: PathBuf,
+    },
+    RemoveSource {
+        path: PathBuf,
+    },
+    Favorite {
+        asset_id: String,
+        favorite: bool,
+    },
+    Hide {
+        asset_id: String,
+        hidden: bool,
+    },
+    RenameAsset {
+        asset_id: String,
+        title: String,
+    },
+    CreatePlaylist {
+        name: String,
+    },
+    RenamePlaylist {
+        id: String,
+        name: String,
+    },
+    DeletePlaylist {
+        id: String,
+    },
+    PlaylistMembers {
+        id: String,
+        members: Vec<String>,
+    },
 }
 
 impl Library {
     pub fn edit(&mut self, edit: Edit) -> Result<Option<String>, Error> {
         match edit {
+            Edit::SavePreset {
+                asset_id,
+                name,
+                properties,
+            } => {
+                validate_id(&asset_id)?;
+                let name = playlist_name(name)?;
+                validate_properties(&asset_id, &properties)?;
+                let presets = self.presets.entry(asset_id).or_default();
+                if presets.len() >= 128 && !presets.contains_key(&name) {
+                    return Err(Error::new(
+                        "bad_request",
+                        "at most 128 presets per wallpaper",
+                    ));
+                }
+                presets.insert(name, properties);
+            }
+            Edit::DeletePreset { asset_id, name } => {
+                if let Some(presets) = self.presets.get_mut(&asset_id) {
+                    presets.remove(&name);
+                    if presets.is_empty() {
+                        self.presets.remove(&asset_id);
+                    }
+                }
+            }
+            Edit::PlaylistProperties {
+                id,
+                asset_id,
+                properties,
+            } => {
+                if !self.playlist(&id)?.members.contains(&asset_id) {
+                    return Err(Error::new(
+                        "bad_request",
+                        "wallpaper is not in this playlist",
+                    ));
+                }
+                validate_properties(&asset_id, &properties)?;
+                // An empty snapshot means authored defaults, distinct from no snapshot.
+                self.playlist(&id)?.properties.insert(asset_id, properties);
+            }
             Edit::Import { path } => {
                 let path = path
                     .canonicalize()
@@ -102,13 +183,22 @@ impl Library {
             }
             Edit::CreatePlaylist { name } => {
                 let name = playlist_name(name)?;
-                self.next_id += 1;
-                let id = format!("playlist:{}", self.next_id);
+                let id = loop {
+                    self.next_id = self
+                        .next_id
+                        .checked_add(1)
+                        .ok_or_else(|| Error::new("bad_request", "playlist id limit reached"))?;
+                    let id = format!("playlist:{}", self.next_id);
+                    if !self.playlists.contains_key(&id) {
+                        break id;
+                    }
+                };
                 self.playlists.insert(
                     id.clone(),
                     Playlist {
                         name,
                         members: Vec::new(),
+                        properties: BTreeMap::new(),
                     },
                 );
                 return Ok(Some(id));
@@ -131,7 +221,11 @@ impl Library {
                         return Err(Error::new("bad_request", "duplicate playlist member"));
                     }
                 }
-                self.playlist(&id)?.members = members;
+                let playlist = self.playlist(&id)?;
+                playlist
+                    .properties
+                    .retain(|asset, _| members.contains(asset));
+                playlist.members = members;
             }
         }
         Ok(None)
@@ -180,6 +274,99 @@ impl Library {
     }
 }
 
+fn validate_properties(asset: &str, properties: &crate::properties::Values) -> Result<(), Error> {
+    let selection = catalog::resolve(asset, Fit::Cover)?;
+    // Existing unknown fields must round-trip; only known authored values are validated.
+    let schema = crate::properties::Schema::load(&selection)?;
+    let resolved = schema.resolve(properties, &Default::default())?;
+    if let Some((key, warning)) = resolved.warnings.iter().find(|(key, _)| {
+        schema
+            .definitions
+            .iter()
+            .any(|d| &d.key == *key && d.editable)
+    }) {
+        return Err(Error::new(
+            "bad_request",
+            format!("property {key}: {warning}"),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimeRule {
+    pub start: String,
+    pub end: String,
+    /// Monday = 1, Sunday = 7. Empty means every day; overnight belongs to its starting day.
+    #[serde(default)]
+    pub days: Vec<u8>,
+}
+impl TimeRule {
+    fn minutes(text: &str) -> Option<u16> {
+        if text.len() != 5
+            || text.as_bytes()[2] != b':'
+            || !text
+                .bytes()
+                .enumerate()
+                .all(|(i, b)| i == 2 || b.is_ascii_digit())
+        {
+            return None;
+        }
+        let (hour, minute) = text.split_once(':')?;
+        let hour: u16 = hour.parse().ok()?;
+        let minute: u16 = minute.parse().ok()?;
+        (hour < 24 && minute < 60).then_some(hour * 60 + minute)
+    }
+    fn validate(&self) -> Result<(), Error> {
+        if Self::minutes(&self.start).is_none()
+            || Self::minutes(&self.end).is_none()
+            || self.days.iter().any(|d| !(1..=7).contains(d))
+        {
+            return Err(Error::new(
+                "bad_request",
+                "time rules need HH:MM times and weekdays 1–7",
+            ));
+        }
+        Ok(())
+    }
+    fn active(&self, weekday: u8, minute: u16) -> bool {
+        let (Some(start), Some(end)) = (Self::minutes(&self.start), Self::minutes(&self.end))
+        else {
+            return false;
+        };
+        let day_matches = |day| self.days.is_empty() || self.days.contains(&day);
+        if start < end {
+            day_matches(weekday) && (start..end).contains(&minute)
+        } else if start == end {
+            day_matches(weekday)
+        } else {
+            minute >= start && day_matches(weekday)
+                || minute < end && day_matches(if weekday == 1 { 7 } else { weekday - 1 })
+        }
+    }
+}
+impl Rotation {
+    pub fn scheduled_now(&self) -> bool {
+        if self.schedule.is_empty() {
+            return true;
+        }
+        let now = unsafe { libc::time(std::ptr::null_mut()) };
+        let mut local: libc::tm = unsafe { std::mem::zeroed() };
+        if unsafe { libc::localtime_r(&now, &mut local) }.is_null() {
+            return false;
+        }
+        let day = if local.tm_wday == 0 {
+            7
+        } else {
+            local.tm_wday as u8
+        };
+        self.schedule
+            .iter()
+            .any(|rule| rule.active(day, (local.tm_hour * 60 + local.tm_min) as u16))
+    }
+}
+
 fn validate_id(id: &str) -> Result<(), Error> {
     if crate::domain::AssetRef::parse(id).is_some_and(|asset| asset.path().is_absolute())
         && id.len() <= 4096
@@ -192,7 +379,7 @@ fn validate_id(id: &str) -> Result<(), Error> {
 
 fn playlist_name(name: String) -> Result<String, Error> {
     let name = name.trim();
-    if name.is_empty() || name.chars().count() > 80 {
+    if name.is_empty() || name.chars().count() > 80 || name.chars().any(char::is_control) {
         return Err(Error::new(
             "bad_request",
             "playlist name must contain 1 to 80 characters",
@@ -214,6 +401,7 @@ pub struct Rotation {
     pub interval_seconds: u64,
     pub fit: Fit,
     pub transition: Transition,
+    pub schedule: Vec<TimeRule>,
 }
 
 impl Default for Rotation {
@@ -225,6 +413,7 @@ impl Default for Rotation {
             interval_seconds: 300,
             fit: Fit::Cover,
             transition: Transition::Fade,
+            schedule: Vec::new(),
         }
     }
 }
@@ -244,6 +433,12 @@ impl Rotation {
                 "bad_request",
                 "rotation interval must be between 10 and 86400 seconds",
             ));
+        }
+        if self.schedule.len() > 64 {
+            return Err(Error::new("bad_request", "at most 64 time rules"));
+        }
+        for rule in &self.schedule {
+            rule.validate()?;
         }
         if self.enabled {
             library.members(&self.source)?;
@@ -359,6 +554,7 @@ mod tests {
             "playlist:1".into(),
             Playlist {
                 name: "工作".into(),
+                properties: BTreeMap::new(),
                 members: vec![
                     "we:/3".into(),
                     "we:/1".into(),
@@ -433,5 +629,105 @@ mod tests {
         );
         rotation.interval_seconds = 0;
         assert!(rotation.validate(&library).is_err());
+    }
+    #[test]
+    fn presets_and_playlist_values_roundtrip_and_prune() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project.json");
+        std::fs::write(&project, r#"{"type":"web","file":"index.html","general":{"properties":{"flag":{"type":"bool","value":true}}}}"#).unwrap();
+        std::fs::write(temp.path().join("index.html"), "hello").unwrap();
+        let asset = format!("we:{}", temp.path().display());
+        let mut library = Library::default();
+        let id = library
+            .edit(Edit::CreatePlaylist {
+                name: "工作".into(),
+            })
+            .unwrap()
+            .unwrap();
+        library
+            .edit(Edit::PlaylistMembers {
+                id: id.clone(),
+                members: vec![asset.clone()],
+            })
+            .unwrap();
+        let properties = BTreeMap::from([
+            ("flag".into(), json!(false)),
+            ("future".into(), json!({"preserve":true})),
+        ]);
+        library
+            .edit(Edit::SavePreset {
+                asset_id: asset.clone(),
+                name: "Night".into(),
+                properties: properties.clone(),
+            })
+            .unwrap();
+        library
+            .edit(Edit::PlaylistProperties {
+                id: id.clone(),
+                asset_id: asset.clone(),
+                properties: properties.clone(),
+            })
+            .unwrap();
+        let mut restored: Library =
+            serde_json::from_value(serde_json::to_value(library).unwrap()).unwrap();
+        assert_eq!(restored.presets[&asset]["Night"], properties);
+        assert_eq!(restored.playlists[&id].properties[&asset], properties);
+        assert!(
+            restored
+                .edit(Edit::SavePreset {
+                    asset_id: asset.clone(),
+                    name: "Broken".into(),
+                    properties: BTreeMap::from([("flag".into(), json!("wrong"))])
+                })
+                .is_err()
+        );
+        restored
+            .edit(Edit::PlaylistMembers {
+                id: id.clone(),
+                members: vec![],
+            })
+            .unwrap();
+        assert!(restored.playlists[&id].properties.is_empty());
+        restored
+            .edit(Edit::DeletePreset {
+                asset_id: asset.clone(),
+                name: "Night".into(),
+            })
+            .unwrap();
+        assert!(!restored.presets.contains_key(&asset));
+    }
+
+    #[test]
+    fn daily_and_overnight_rules_follow_local_weekdays() {
+        let rule = TimeRule {
+            start: "22:00".into(),
+            end: "06:00".into(),
+            days: vec![7],
+        };
+        rule.validate().unwrap();
+        assert!(rule.active(7, 23 * 60));
+        assert!(rule.active(1, 5 * 60));
+        assert!(!rule.active(1, 6 * 60));
+        assert!(!rule.active(1, 22 * 60));
+        assert!(!rule.active(7, 21 * 60));
+        let all_day = TimeRule {
+            start: "00:00".into(),
+            end: "00:00".into(),
+            days: vec![],
+        };
+        assert!(all_day.active(3, 10));
+        for invalid in ["25:00", "12:60", "1:00", "ab:cd", "12:xx"] {
+            assert!(
+                TimeRule {
+                    start: invalid.into(),
+                    end: "12:00".into(),
+                    days: vec![]
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        let legacy: Rotation = serde_json::from_value(json!({"enabled":false})).unwrap();
+        assert!(legacy.scheduled_now());
     }
 }

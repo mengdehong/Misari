@@ -69,29 +69,12 @@ impl Renderer {
         let target = surface.target;
         let view = surface.view;
         let matrix = self.image_matrix(layer, view);
-        layer.base.matrix4("g_ModelMatrix", transform);
-        layer.base.matrix4(
-            "g_ModelMatrixInverse",
-            if transform.determinant().abs() > 1e-12 {
-                transform.inverse()
-            } else {
-                Mat4::IDENTITY
-            },
+        layer.base.transforms(
+            transform,
+            Some(view.matrix(layer.state.perspective)),
+            view.eye,
+            None,
         );
-        layer.base.matrix4(
-            "g_ViewProjectionMatrix",
-            view.matrix(layer.state.perspective),
-        );
-        let normal = glam::Mat3::from_mat4(transform);
-        layer.base.matrix3(
-            "g_NormalModelMatrix",
-            if normal.determinant().abs() > 1e-12 {
-                normal.inverse().transpose()
-            } else {
-                normal
-            },
-        );
-        layer.base.vector3("g_EyePosition", view.eye);
         let [left, bottom, width, height] = surface.clip;
         unsafe {
             if layer.needs_backdrop(composed)
@@ -984,29 +967,12 @@ impl Renderer {
         let mut budget = self.budget;
         let buffer = Buffer::formatted(self.gl.clone(), size, glow::RGBA8, &mut budget)?;
         let transform = layer.state.transform;
-        layer.base.matrix4("g_ModelMatrix", transform);
-        layer.base.matrix4(
-            "g_ModelMatrixInverse",
-            if transform.determinant().abs() > 1e-12 {
-                transform.inverse()
-            } else {
-                Mat4::IDENTITY
-            },
+        layer.base.transforms(
+            transform,
+            Some(view.matrix(layer.state.perspective)),
+            view.eye,
+            None,
         );
-        layer.base.matrix4(
-            "g_ViewProjectionMatrix",
-            view.matrix(layer.state.perspective),
-        );
-        let normal = glam::Mat3::from_mat4(transform);
-        layer.base.matrix3(
-            "g_NormalModelMatrix",
-            if normal.determinant().abs() > 1e-12 {
-                normal.inverse().transpose()
-            } else {
-                normal
-            },
-        );
-        layer.base.vector3("g_EyePosition", view.eye);
         let mut inputs = [None; 8];
         for (slot, name) in layer.base.references.iter().enumerate() {
             if let Some(name) = name {

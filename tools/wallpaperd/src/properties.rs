@@ -35,6 +35,30 @@ impl Definition {
         {
             "bool" if value.is_boolean() => Ok(value.clone()),
             "textinput" if value.is_string() => Ok(value.clone()),
+            "file" | "directory" => {
+                let text = value.as_str().ok_or("expected a local path")?;
+                if text.is_empty() {
+                    return Ok(json!(""));
+                }
+                let path = std::path::Path::new(text);
+                if !path.is_absolute() {
+                    return Err("choose an absolute local path".into());
+                }
+                let path = path
+                    .canonicalize()
+                    .map_err(|e| format!("path unavailable: {e}"))?;
+                let directory =
+                    self.metadata.get("type").and_then(Value::as_str) == Some("directory");
+                if directory {
+                    std::fs::read_dir(&path).map_err(|e| format!("directory unavailable: {e}"))?;
+                } else {
+                    if !path.is_file() {
+                        return Err("expected a regular file".into());
+                    }
+                    std::fs::File::open(&path).map_err(|e| format!("file unavailable: {e}"))?;
+                }
+                Ok(json!(path.to_str().ok_or("path must be valid UTF-8")?))
+            }
             "slider" => {
                 let n = value
                     .as_f64()
@@ -163,10 +187,9 @@ impl Schema {
                 .and_then(Value::as_str)
                 .unwrap_or("");
             if matches!(kind, "file" | "directory") {
-                // WE scripts expect these keys even before the user selects a file.
-                // Keep them read-only and empty until file selection is supported.
+                // Authored paths are metadata, never an implicit grant to read local files.
                 definition.default = Some(json!(""));
-                definition.error = Some("file/directory selection is not supported".into());
+                definition.editable = true;
             } else if !matches!(kind, "group" | "text") {
                 match definition.normalize(&raw["value"]) {
                     Ok(default) => {
@@ -202,6 +225,19 @@ impl Schema {
             }
         }
         Ok(Self { definitions })
+    }
+
+    pub fn snapshot_patch(&self, snapshot: &Values) -> Values {
+        self.definitions
+            .iter()
+            .filter(|d| d.editable)
+            .map(|d| {
+                (
+                    d.key.clone(),
+                    snapshot.get(&d.key).cloned().unwrap_or(Value::Null),
+                )
+            })
+            .collect()
     }
 
     pub fn resolve(&self, saved: &Values, patch: &Values) -> Result<Resolved, Error> {
@@ -460,6 +496,87 @@ mod tests {
             schema
                 .resolve(&saved, &values(json!({"typo":null})))
                 .is_err()
+        );
+    }
+    #[test]
+    fn file_and_directory_validate_kind_and_preserve_author_metadata() {
+        let folder = tempfile::tempdir().unwrap();
+        let file = folder.path().join("测试.txt");
+        std::fs::write(&file, "test").unwrap();
+        let schema = Schema::parse(&json!({"general":{"properties":{
+            "file":{"type":"file","value":file,"future":{"keep":true}},
+            "dir":{"type":"directory","value":""}
+        }}}))
+        .unwrap();
+        assert_eq!(
+            schema
+                .resolve(&Values::new(), &Values::new())
+                .unwrap()
+                .values["file"],
+            "",
+            "authored defaults cannot grant access to local files"
+        );
+        assert_eq!(
+            schema
+                .definitions
+                .iter()
+                .find(|d| d.key == "file")
+                .unwrap()
+                .metadata["future"]["keep"],
+            true
+        );
+        let selected = schema
+            .resolve(
+                &Values::new(),
+                &values(json!({"file":file,"dir":folder.path()})),
+            )
+            .unwrap();
+        assert_eq!(selected.values["file"], json!(file));
+        assert!(
+            schema
+                .resolve(&Values::new(), &values(json!({"file":folder.path()})))
+                .is_err()
+        );
+        assert!(
+            schema
+                .resolve(&Values::new(), &values(json!({"dir":file})))
+                .is_err()
+        );
+        assert!(
+            schema
+                .resolve(&Values::new(), &values(json!({"file":"relative.txt"})))
+                .is_err()
+        );
+        std::fs::remove_file(file).unwrap();
+        let restored = schema.resolve(&selected.overrides, &Values::new()).unwrap();
+        assert!(restored.warnings.contains_key("file"));
+        assert_eq!(restored.values["file"], "");
+    }
+    #[test]
+    fn preset_restores_editable_values_and_defaults_retaining_unknown_saved_fields() {
+        let schema = Schema::parse(&json!({"general":{"properties":{
+            "flag":{"type":"bool","value":true},
+            "number":{"type":"slider","value":4,"min":0,"max":10},
+            "future":{"type":"not_supported","value":{}}
+        }}}))
+        .unwrap();
+        let saved = values(json!({"flag":false,"number":9,"removed":{"keep":true},"future":"old"}));
+        let preset = values(json!({"number":2,"future":"new","unknown":17}));
+        let resolved = schema
+            .resolve(&saved, &schema.snapshot_patch(&preset))
+            .unwrap();
+        assert_eq!(resolved.values["number"], 2);
+        assert_eq!(resolved.values["flag"], true);
+        assert!(!resolved.overrides.contains_key("flag"));
+        assert_eq!(resolved.overrides["future"], "old");
+        assert_eq!(resolved.overrides["removed"], json!({"keep":true}));
+        assert!(!resolved.overrides.contains_key("unknown"));
+        assert_eq!(
+            schema
+                .resolve(&saved, &schema.snapshot_patch(&Values::new()))
+                .unwrap()
+                .values["number"],
+            4
         );
     }
 }

@@ -10,6 +10,7 @@ fn web_project_properties_snapshots_failed_switch_restore_and_release() {
     fs::write(project.join("index.html"), r#"<!doctype html><body style="margin:0;background:red"><script>
     window.wallpaperPropertyListener={applyUserProperties(p){
     if(p.useDefault?.value) p.customimage.value='';
+    if(p.customimage) document.body.style.backgroundImage=p.customimage.value?'url("file:///'+p.customimage.value+'")':'none';
     if(p.tint)
     document.body.style.background=`rgb(${p.tint.value.split(' ').map(v=>Math.round(v*255)).join(',')})`;
     if(p.listen?.value) setTimeout(()=>wallpaperRegisterAudioListener(()=>document.body.style.background='magenta'),300);
@@ -46,10 +47,30 @@ fn web_project_properties_snapshots_failed_switch_restore_and_release() {
         ""
     );
     assert!(
-        !rig.cli(&["set-properties", path, r#"{"customimage":"/etc/passwd"}"#])
-            .status
-            .success()
+        !rig.cli(&[
+            "set-properties",
+            path,
+            r#"{"customimage":"/definitely-missing-misari-selected-image.png"}"#
+        ])
+        .status
+        .success()
     );
+    let selected_file = rig.root().join("selected external.png");
+    RgbaImage::from_pixel(4, 4, Rgba([128, 64, 192, 255]))
+        .save(&selected_file)
+        .unwrap();
+    rig.ok(&[
+        "set-properties",
+        path,
+        &serde_json::json!({"customimage":selected_file,"useDefault":false}).to_string(),
+    ]);
+    rig.wait_corner([128, 64, 192]);
+    rig.ok(&[
+        "set-properties",
+        path,
+        r#"{"customimage":null,"useDefault":true}"#,
+    ]);
+    rig.wait_corner([0, 255, 0]);
     rig.ok(&["pause"]);
     rig.ok(&["set-properties", path, r#"{"tint":[0,0,1]}"#]);
     rig.wait_corner([0, 0, 255]);
@@ -88,7 +109,7 @@ fn web_project_properties_snapshots_failed_switch_restore_and_release() {
             .success()
     );
     rig.wait_corner([0, 0, 255]);
-    // A dead in-process browser host must release its Chromium process group;
+    // A dead output worker must release its isolated Chromium process group;
     // the daemon then restores accepted Web content in a fresh output worker.
     assert!(
         !fs::read_to_string(format!("/proc/{daemon_pid}/maps"))
@@ -134,7 +155,7 @@ fn web_project_properties_snapshots_failed_switch_restore_and_release() {
         thread::sleep(Duration::from_millis(20));
     }
     assert!(!profile.exists(), "crashed worker retained its CEF profile");
-    // A second consecutive host failure must stop rather than restart indefinitely.
+    // Repeated failures must back off before restoring the accepted content.
     let recovered_worker = *process_children(daemon_pid).first().unwrap();
     let recovered_profile = process_profile(recovered_worker);
     assert_eq!(
@@ -154,6 +175,71 @@ fn web_project_properties_snapshots_failed_switch_restore_and_release() {
         !recovered_profile.exists(),
         "failed worker retained its CEF profile"
     );
+    assert_eq!(rig.shot().get_pixel(10, 10).0, [0, 0, 255, 255]);
+    rig.wait_state(|state| {
+        state["outputs"]["winit"]["renderer"] == "running"
+            && state["outputs"]["winit"]["backend"] == "cef"
+            && state["outputs"]["winit"]["pending"].is_null()
+            && state["outputs"]["winit"]["recovery_attempts"] == 2
+    });
+    rig.wait_corner([0, 0, 255]);
+    let recovered_worker = *process_children(daemon_pid).first().unwrap();
+    assert!(
+        !fs::read_to_string(format!("/proc/{recovered_worker}/maps"))
+            .unwrap()
+            .contains("/libcef.so"),
+        "presentation worker must not load CEF"
+    );
+    let host = process_children(recovered_worker)
+        .into_iter()
+        .find(|pid| {
+            fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|args| {
+                args.split(|&byte| byte == 0)
+                    .any(|arg| arg.starts_with(b"--we-web-host-fd="))
+            })
+        })
+        .expect("isolated CEF host missing");
+    let profile = process_profile(host);
+    assert_eq!(unsafe { libc::kill(host as i32, libc::SIGKILL) }, 0);
+    let recovered = rig.wait_state(|state| {
+        state["outputs"]["winit"]["recovery_attempts"] == 3
+            || (state["outputs"]["winit"]["recovery_attempts"] == 2
+                && state["outputs"]["winit"]["renderer"] == "running"
+                && state["outputs"]["winit"]["error"].is_null()
+                && process_children(recovered_worker)
+                    .into_iter()
+                    .any(|pid| pid != host && is_cef_host(pid)))
+    });
+    let fallback = recovered["outputs"]["winit"]["recovery_attempts"] == 2;
+    if fallback {
+        assert!(
+            fs::read_to_string(rig.root().join("wallpaperd.log"))
+                .unwrap()
+                .contains("DMA-BUF unavailable (CEF host failed:"),
+            "host replacement did not report the expected mmap fallback"
+        );
+    }
+    assert_eq!(rig.shot().get_pixel(10, 10).0, [0, 0, 255, 255]);
+    rig.wait_state(|state| {
+        state["outputs"]["winit"]["renderer"] == "running"
+            && state["outputs"]["winit"]["error"].is_null()
+            && state["outputs"]["winit"]["pending"].is_null()
+            && (fallback || !process_running(recovered_worker))
+    });
+    rig.wait_corner([0, 0, 255]);
+    // A healthy replacement must render new content, not just retain its last snapshot.
+    rig.ok(&["set-properties", path, r#"{"tint":[0,1,1]}"#]);
+    rig.wait_corner([0, 255, 255]);
+    rig.ok(&["set-properties", path, r#"{"tint":[0,0,1]}"#]);
+    rig.wait_corner([0, 0, 255]);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while profile.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "dead CEF host retained its profile"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
     // Restore project identity, accepted properties and paused intent after a daemon restart.
     rig.daemon.as_mut().unwrap().kill().unwrap();
     rig.daemon.take().unwrap().wait().unwrap();
@@ -187,6 +273,13 @@ fn process_profile(pid: u32) -> PathBuf {
         .find_map(|value| value.strip_prefix(b"WALLPAPERD_WEB_PROFILE="))
         .map(|path| PathBuf::from(String::from_utf8(path.to_vec()).unwrap()))
         .expect("daemon-owned CEF profile missing")
+}
+
+fn is_cef_host(pid: u32) -> bool {
+    fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|args| {
+        args.split(|&byte| byte == 0)
+            .any(|arg| arg.starts_with(b"--we-web-host-fd="))
+    })
 }
 
 fn process_children(parent: u32) -> Vec<u32> {

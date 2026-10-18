@@ -18,12 +18,15 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io::Read,
+    os::unix::net::UnixStream,
     time::{Duration, Instant},
 };
 
 #[derive(Serialize)]
 struct OutputView {
     current: Option<String>,
+    fit: Option<Fit>,
     revision: u64,
     pending: Option<String>,
     #[serde(flatten)]
@@ -41,6 +44,7 @@ struct OutputView {
     media_available: bool,
     media_error: Option<String>,
     diagnostics: Option<String>,
+    recovery_attempts: u32,
     properties: Values,
     property_warnings: BTreeMap<String, String>,
 }
@@ -49,6 +53,7 @@ struct Pending {
     id: u64,
     group: u64,
     selection: Option<Selection>,
+    kind: Option<catalog::Kind>,
     deadline: Instant,
     playback: Playback,
     properties: Resolved,
@@ -80,8 +85,10 @@ struct Output {
     properties: Values,
     property_warnings: BTreeMap<String, String>,
     worker: Option<Renderer>,
-    web_host: bool,
-    web_recovered: bool,
+    frozen: Option<UnixStream>,
+    recoverable: Option<Selection>,
+    recovery: Recovery,
+    watchdog: Watchdog,
     pending: Option<Pending>,
     control: Option<Control>,
     property_control: Option<PropertyControl>,
@@ -89,6 +96,8 @@ struct Output {
     snapshot_control: Option<SnapshotControl>,
     runtime: WorkerRuntime,
     fullscreen: bool,
+    battery: bool,
+    pause_on_session: bool,
     auto_muted: bool,
     sent_clocks: BTreeMap<String, wallpaper_media::clock::Timeline>,
 }
@@ -98,6 +107,83 @@ struct SnapshotControl {
     client: u64,
     revision: u64,
     deadline: Instant,
+}
+
+#[derive(Default)]
+struct Recovery {
+    attempts: u32,
+    due: Option<Instant>,
+    healthy_since: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Default)]
+enum Watchdog {
+    #[default]
+    Idle,
+    Progress(Instant),
+    Probe(Instant),
+}
+
+impl Watchdog {
+    const TIMEOUT: Duration = Duration::from_secs(10);
+
+    fn accepted(&mut self, active: bool, now: Instant) {
+        *self = if active {
+            Self::Progress(now + Self::TIMEOUT)
+        } else {
+            Self::Idle
+        };
+    }
+
+    fn runtime(&mut self, was_active: bool, active: bool, now: Instant) {
+        if !active {
+            *self = Self::Idle;
+        } else if !was_active && matches!(self, Self::Idle) {
+            *self = Self::Progress(now + Self::TIMEOUT);
+        }
+    }
+
+    fn progress(&mut self, healthy_active: bool, now: Instant) {
+        if healthy_active {
+            *self = Self::Progress(now + Self::TIMEOUT);
+        }
+    }
+
+    fn probe(&mut self) {
+        if matches!(self, Self::Probe(_)) {
+            *self = Self::Idle;
+        }
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        match self {
+            Self::Idle => None,
+            Self::Progress(deadline) | Self::Probe(deadline) => Some(*deadline),
+        }
+    }
+}
+
+impl Recovery {
+    fn schedule(&mut self, now: Instant) {
+        if self.due.is_some() {
+            return;
+        }
+        if self
+            .healthy_since
+            .take()
+            .is_some_and(|start| now.saturating_duration_since(start) >= Duration::from_secs(60))
+        {
+            self.attempts = 0;
+        }
+        let delay = Duration::from_secs(1u64 << self.attempts.min(5));
+        self.attempts = self.attempts.saturating_add(1);
+        self.due = Some(now + delay);
+    }
+
+    fn accepted(&mut self) {
+        self.due = None;
+        self.healthy_since = Some(Instant::now());
+    }
 }
 
 impl Output {
@@ -111,8 +197,10 @@ impl Output {
             properties: Values::new(),
             property_warnings: BTreeMap::new(),
             worker: None,
-            web_host: false,
-            web_recovered: false,
+            frozen: None,
+            recoverable: (!saved.released).then(|| saved.selection.clone()).flatten(),
+            recovery: Recovery::default(),
+            watchdog: Watchdog::default(),
             pending: None,
             control: None,
             property_control: None,
@@ -120,6 +208,8 @@ impl Output {
             snapshot_control: None,
             runtime: WorkerRuntime::default(),
             fullscreen: false,
+            battery: false,
+            pause_on_session: true,
             auto_muted: false,
             sent_clocks: BTreeMap::new(),
         }
@@ -127,7 +217,12 @@ impl Output {
 
     fn policy(&self, session: Policy) -> PlaybackPolicy {
         PlaybackPolicy {
-            session,
+            battery: self.battery,
+            session: if self.pause_on_session {
+                session
+            } else {
+                Policy::default()
+            },
             fullscreen: self.fullscreen,
             other_audio: self.auto_muted,
         }
@@ -142,6 +237,11 @@ impl Output {
         );
         OutputView {
             current: self.current.clone(),
+            fit: self
+                .recoverable
+                .as_ref()
+                .filter(|s| self.current.as_deref() == Some(&s.asset_id))
+                .map(|s| s.fit),
             revision: self.revision,
             pending: self
                 .pending
@@ -166,6 +266,7 @@ impl Output {
             media_available: self.runtime.media,
             media_error: self.runtime.media_error.clone(),
             diagnostics: self.runtime.diagnostics.clone(),
+            recovery_attempts: self.recovery.attempts,
             properties: self.properties.clone(),
             property_warnings: self.property_warnings.clone(),
         }
@@ -198,6 +299,41 @@ impl Output {
             && !self.runtime.throttled
             && !self.effective(self.playback(), policy).paused
     }
+
+    fn wants_media(&self) -> bool {
+        self.runtime.media
+            || self.pending.as_ref().is_some_and(|pending| {
+                matches!(
+                    pending.kind,
+                    Some(catalog::Kind::WeScene | catalog::Kind::WeWeb)
+                )
+            })
+    }
+
+    fn preserve_worker_frame(&mut self) {
+        // A compositor can apply the surface commit just before the worker dies,
+        // without the following sync callback reaching the supervisor. An
+        // accepted current selection makes that unconfirmed connection the only
+        // possible last-frame owner. Never let it replace an older known frame.
+        let allow_unconfirmed = self.frozen.is_none() && self.current.is_some();
+        if let Some(connection) = self
+            .worker
+            .as_mut()
+            .and_then(|worker| worker.preserve_frame(allow_unconfirmed))
+        {
+            self.frozen = Some(connection);
+        }
+    }
+
+    fn retire_failed_worker(&mut self) {
+        if !self.runtime.failed {
+            return;
+        }
+        self.preserve_worker_frame();
+        self.worker = None;
+        self.runtime = WorkerRuntime::default();
+        self.watchdog = Watchdog::Idle;
+    }
 }
 
 struct Group {
@@ -219,6 +355,8 @@ struct Session {
     save_needed: bool,
     completed: Vec<(Group, Result<(), Error>)>,
     policy: Policy,
+    power: crate::policy::power::Snapshot,
+    power_due: Option<Instant>,
     niri: crate::policy::niri::Snapshot,
     audio: crate::policy::audio::Snapshot,
     spectrum: we_scene::audio::AudioSnapshot,
@@ -232,6 +370,7 @@ struct Session {
 
 #[derive(Default)]
 struct RotationRuntime {
+    schedule_active: Option<bool>,
     due: Option<Instant>,
     previous: Option<String>,
     error: Option<Error>,
@@ -249,7 +388,9 @@ enum Source {
     Client(u64),
     WorkerRead(String),
     WorkerWrite(String),
+    Frozen(String),
     Policy,
+    Power,
     Niri,
     Audio,
     Media,
@@ -261,21 +402,11 @@ pub fn serve() -> Result<()> {
     let server = Server::bind(socket_path())?;
     let mut desktop = Desktop::connect()?;
     let config = Config::load()?;
-    let mut monitor = if config.pause_on_session.unwrap_or(true) {
-        Some(session_policy::start()?)
-    } else {
-        None
-    };
-    let mut niri_monitor = if config.pause_on_fullscreen.unwrap_or(true) {
-        Some(crate::policy::niri::start()?)
-    } else {
-        None
-    };
-    let mut audio_monitor = if config.mute_on_other_audio.unwrap_or(true) {
-        Some(crate::policy::audio::start()?)
-    } else {
-        None
-    };
+    // Evidence stays live so changing a policy never requires a daemon restart.
+    let mut monitor = Some(session_policy::start()?);
+    let mut niri_monitor = Some(crate::policy::niri::start()?);
+    let mut audio_monitor = Some(crate::policy::audio::start()?);
+    let mut power_watch = crate::policy::power::Watch::open().ok();
     let store = Store::load()?;
     let mut capture = crate::audio_capture::Capture::start()?;
     let mut media_monitor = if config.media_integration.unwrap_or(true) {
@@ -298,6 +429,10 @@ pub fn serve() -> Result<()> {
         save_needed: false,
         completed: Vec::new(),
         policy: Policy::default(),
+        power: crate::policy::power::read(),
+        power_due: power_watch
+            .is_none()
+            .then(|| Instant::now() + Duration::from_secs(15)),
         niri: crate::policy::niri::Snapshot::default(),
         audio: crate::policy::audio::Snapshot::default(),
         spectrum: Default::default(),
@@ -314,12 +449,22 @@ pub fn serve() -> Result<()> {
     let mut sources = Vec::new();
     let mut fds = Vec::new();
     loop {
+        if session.power_due.is_some_and(|due| due <= Instant::now()) {
+            power_watch = crate::policy::power::Watch::open().ok();
+            session.power_changed(crate::policy::power::read());
+            session.power_due = power_watch
+                .is_none()
+                .then(|| Instant::now() + Duration::from_secs(15));
+        }
         if let Some(outputs) = desktop.dispatch()? {
             session.reconcile(outputs);
         }
         session.expire();
         session.finish_turn();
         capture.set_active(session.needs_audio());
+        if let Some(monitor) = &media_monitor {
+            monitor.set_active(session.outputs.values().any(Output::wants_media));
+        }
         let needs_write = ipc::flush_wayland(&desktop.connection)?;
         let Some(guard) = desktop.connection.prepare_read() else {
             continue;
@@ -334,6 +479,10 @@ pub fn serve() -> Result<()> {
         if let Some(monitor) = &monitor {
             sources.push(Source::Policy);
             fds.push(ipc::interest(&monitor.wake, false));
+        }
+        if let Some(watch) = &power_watch {
+            sources.push(Source::Power);
+            fds.push(ipc::interest(watch, false));
         }
         if let Some(monitor) = &niri_monitor {
             sources.push(Source::Niri);
@@ -354,6 +503,10 @@ pub fn serve() -> Result<()> {
             fds.push(fd);
         }
         for (name, output) in &session.outputs {
+            if let Some(connection) = &output.frozen {
+                sources.push(Source::Frozen(name.clone()));
+                fds.push(ipc::interest(connection, false));
+            }
             if let Some(worker) = &output.worker {
                 sources.push(Source::WorkerRead(name.clone()));
                 fds.push(ipc::interest(&worker.output, false));
@@ -379,6 +532,15 @@ pub fn serve() -> Result<()> {
             }
             match source {
                 Source::Desktop => {}
+                Source::Power => match power_watch.as_ref().map(|watch| watch.changed()) {
+                    Some(Ok(true)) => session.power_changed(crate::policy::power::read()),
+                    Some(Err(error)) => {
+                        eprintln!("wallpaperd: power notifications: {error}");
+                        power_watch = None;
+                        session.power_due = Some(Instant::now() + Duration::from_secs(15));
+                    }
+                    _ => {}
+                },
                 Source::Policy => {
                     if let Some(monitor) = &mut monitor {
                         session.policy_changed(monitor.receive()?);
@@ -437,19 +599,47 @@ pub fn serve() -> Result<()> {
                         session.worker_failed(&name, &error.to_string());
                     }
                 }
+                Source::Frozen(name) => {
+                    if let Some(output) = session.outputs.get_mut(&name)
+                        && let Some(connection) = &mut output.frozen
+                    {
+                        let mut bytes = [0; 4096];
+                        // Ordinary read discards (and closes) any received
+                        // ancillary descriptors; no protocol state is reused.
+                        match connection.read(&mut bytes) {
+                            Ok(0) => output.frozen = None,
+                            Err(error)
+                                if error.kind() != std::io::ErrorKind::WouldBlock
+                                    && error.kind() != std::io::ErrorKind::Interrupted =>
+                            {
+                                output.frozen = None
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             }
         }
     }
 }
 
 impl Session {
+    fn power_changed(&mut self, power: crate::policy::power::Snapshot) {
+        if power != self.power {
+            self.power = power;
+            self.update_policy(self.policy);
+        }
+    }
+
     fn media_changed(&mut self, media: crate::media::Snapshot) {
         if self.media == media {
             return;
         }
         self.media = media;
         for output in self.outputs.values_mut() {
-            if let Some(worker) = &mut output.worker {
+            if output.wants_media()
+                && let Some(worker) = &mut output.worker
+            {
                 worker.set_media(&self.media);
             }
         }
@@ -463,6 +653,8 @@ impl Session {
             outputs: BTreeMap<&'a str, OutputView>,
             backends: Value,
             session_policy: Policy,
+            policy_settings: crate::store::RuntimePolicy,
+            power_policy: crate::policy::power::Snapshot,
             niri_policy: &'a crate::policy::niri::Snapshot,
             audio_policy: &'a crate::policy::audio::Snapshot,
             audio_spectrum: Value,
@@ -473,6 +665,7 @@ impl Session {
         serde_json::to_value(Snapshot {
             api: domain::API,
             backends: json!({
+                "application": crate::application::capability(),
                 "image": {"available":true,"content":["image"],"frame_output":["texture","shm"]},
                 "libmpv": wallpaper_media::capability(),
                 "cef": crate::web::capability(),
@@ -490,6 +683,14 @@ impl Session {
                 "coverage_pause": {"available":false,"reason":"niri IPC does not report opaque coverage"}
             }),
             session_policy: self.policy,
+            power_policy: self.power,
+            policy_settings: crate::store::RuntimePolicy {
+                allow_applications: Some(self.store.policy.allow_applications.unwrap_or(false)),
+                pause_on_battery: Some(self.store.policy.pause_on_battery.unwrap_or(false)),
+                pause_on_session: Some(self.store.policy.pause_on_session.or(self.config.pause_on_session).unwrap_or(true)),
+                pause_on_fullscreen: Some(self.store.policy.pause_on_fullscreen.or(self.config.pause_on_fullscreen).unwrap_or(true)),
+                mute_on_other_audio: Some(self.store.policy.mute_on_other_audio.or(self.config.mute_on_other_audio).unwrap_or(true)),
+            },
             niri_policy: &self.niri,
             audio_policy: &self.audio,
             audio_spectrum: json!({"available":self.spectrum.available,"capturing":self.spectrum.capturing,"device":self.spectrum.device,"sequence":self.spectrum.sequence}),
@@ -558,8 +759,29 @@ impl Session {
                 .insert(name.clone(), Output::new(&saved, self.config.playback));
             {
                 let output = self.outputs.get_mut(&name).unwrap();
-                output.fullscreen = self.niri.fullscreen_outputs.contains(&name);
-                output.auto_muted = !matches!(self.audio_mute, AudioMute::Clear);
+                output.recoverable = selection.clone();
+                output.battery =
+                    self.store.policy.pause_on_battery.unwrap_or(false) && self.power.on_battery;
+                output.pause_on_session = self
+                    .store
+                    .policy
+                    .pause_on_session
+                    .or(self.config.pause_on_session)
+                    .unwrap_or(true);
+                output.fullscreen = self
+                    .store
+                    .policy
+                    .pause_on_fullscreen
+                    .or(self.config.pause_on_fullscreen)
+                    .unwrap_or(true)
+                    && self.niri.fullscreen_outputs.contains(&name);
+                output.auto_muted = self
+                    .store
+                    .policy
+                    .mute_on_other_audio
+                    .or(self.config.mute_on_other_audio)
+                    .unwrap_or(true)
+                    && !matches!(self.audio_mute, AudioMute::Clear);
             }
             self.dirty = true;
             if saved.rotation.enabled {
@@ -641,7 +863,7 @@ impl Session {
                 &json!({"ok":true,"library":self.store.library,
                 "configured_sources":self.config.asset_dirs.iter()
                     .filter(|path| self.store.library.source_enabled(path)).collect::<Vec<_>>(),
-                "automatic_sources":crate::catalog::steam_workshops()
+                "automatic_sources":crate::catalog::automatic_sources()
                     .filter(|path| self.store.library.source_enabled(path)).collect::<Vec<_>>()}),
             ),
             "edit_library" => {
@@ -709,6 +931,51 @@ impl Session {
                     return Err(Error::new("bad_request", "next requires one output"));
                 }
                 self.advance_rotation(&outputs[0], Some(client))?;
+            }
+            "set_policy" => {
+                let policy: crate::store::RuntimePolicy = serde_json::from_value(request.params)
+                    .map_err(|e| Error::new("bad_request", e.to_string()))?;
+                let mut candidate = self.store.clone();
+                candidate.policy = policy;
+                candidate
+                    .save()
+                    .map_err(|e| Error::new("save_failed", e.to_string()))?;
+                self.store = candidate;
+                self.update_policy(self.policy);
+                if !self.store.policy.allow_applications.unwrap_or(false) {
+                    let outputs: Vec<_> = self
+                        .outputs
+                        .iter()
+                        .filter(|(_, output)| {
+                            matches!(
+                                output.runtime.backend,
+                                Some(crate::domain::Backend::Application)
+                            ) || output
+                                .pending
+                                .as_ref()
+                                .and_then(|pending| pending.selection.as_ref())
+                                .is_some_and(|selection| {
+                                    catalog::kind(catalog::path(selection))
+                                        == Some(catalog::Kind::WeApplication)
+                                })
+                        })
+                        .map(|(name, _)| name.clone())
+                        .collect();
+                    if !outputs.is_empty() {
+                        self.start(
+                            None,
+                            outputs.clone(),
+                            None,
+                            Transition::Cut,
+                            &PlaybackPatch::default(),
+                            &Values::new(),
+                            false,
+                        )?;
+                        self.stop_rotation(&outputs);
+                    }
+                }
+                self.server
+                    .reply(client, &json!({"ok":true,"policy":self.store.policy}));
             }
             "get_properties" => self.get_properties(client, &request.params)?,
             "set_properties" => self.set_properties(client, &request.params)?,
@@ -883,13 +1150,25 @@ impl Session {
             .ok_or_else(|| Error::new("empty_playlist", "播放来源没有可用素材"))?
             .to_owned();
         let selection = catalog::resolve(&next, settings.fit)?;
+        let properties = if let Some(saved) = self
+            .store
+            .library
+            .playlists
+            .get(&settings.source)
+            .and_then(|playlist| playlist.properties.get(&next))
+        {
+            // A playlist snapshot restores defaults too; unknown authored fields stay stored.
+            Schema::load(&selection)?.snapshot_patch(saved)
+        } else {
+            Values::new()
+        };
         self.start(
             client,
             vec![name.into()],
             Some(selection),
             settings.transition,
             &PlaybackPatch::default(),
-            &Values::new(),
+            &properties,
             false,
         )?;
         let runtime = self.rotations.entry(name.into()).or_default();
@@ -971,7 +1250,7 @@ impl Session {
                 "pending":current.is_some_and(|o| o.property_control.is_some())}));
         }
         let defaults = schema.resolve(&Values::new(), &Values::new())?;
-        self.server.reply(client, &json!({"ok":true,"asset_id":selection.asset_id,"definitions":schema.definitions,"values":defaults.values,"visible":defaults.visible,"outputs":outputs}));
+        self.server.reply(client, &json!({"ok":true,"asset_id":selection.asset_id,"definitions":schema.definitions,"values":defaults.values,"visible":defaults.visible,"presets":self.store.library.presets.get(&selection.asset_id),"outputs":outputs}));
         Ok(())
     }
 
@@ -986,14 +1265,33 @@ impl Session {
                 "property updates require a WE scene or web project",
             ));
         }
-        let patch = properties::patch(params)?;
+        let schema = Schema::load(&selection)?;
+        let mut patch = match params.get("preset") {
+            None | Some(Value::Null) => Values::new(),
+            Some(Value::String(name)) => {
+                let preset = self
+                    .store
+                    .library
+                    .presets
+                    .get(&selection.asset_id)
+                    .and_then(|presets| presets.get(name))
+                    .ok_or_else(|| {
+                        Error::new(
+                            "preset_missing",
+                            "preset no longer exists for this wallpaper",
+                        )
+                    })?;
+                schema.snapshot_patch(preset)
+            }
+            Some(_) => return Err(Error::new("bad_request", "preset must be a name")),
+        };
+        patch.extend(properties::patch(params)?);
         if patch.is_empty() {
             return Err(Error::new(
                 "bad_request",
-                "properties must contain at least one property",
+                "choose a preset or at least one editable property",
             ));
         }
-        let schema = Schema::load(&selection)?;
         let outputs = self.targets(params)?;
         let mut resolved = BTreeMap::new();
         for name in &outputs {
@@ -1146,6 +1444,8 @@ impl Session {
                         error: None,
                         runtime: None,
                         snapshot: None,
+                        progress: None,
+                        probe: None,
                     },
                 );
             }
@@ -1209,8 +1509,28 @@ impl Session {
     fn update_policy(&mut self, previous_session: Policy) {
         for (name, output) in &mut self.outputs {
             let was_paused = output.actual(previous_session).paused;
-            output.fullscreen = self.niri.fullscreen_outputs.contains(name);
-            output.auto_muted = !matches!(self.audio_mute, AudioMute::Clear);
+            output.battery =
+                self.store.policy.pause_on_battery.unwrap_or(false) && self.power.on_battery;
+            output.pause_on_session = self
+                .store
+                .policy
+                .pause_on_session
+                .or(self.config.pause_on_session)
+                .unwrap_or(true);
+            output.fullscreen = self
+                .store
+                .policy
+                .pause_on_fullscreen
+                .or(self.config.pause_on_fullscreen)
+                .unwrap_or(true)
+                && self.niri.fullscreen_outputs.contains(name);
+            output.auto_muted = self
+                .store
+                .policy
+                .mute_on_other_audio
+                .or(self.config.mute_on_other_audio)
+                .unwrap_or(true)
+                && !matches!(self.audio_mute, AudioMute::Clear);
             let playback = output.playback();
             let effective = output.effective(playback, self.policy);
 
@@ -1264,10 +1584,6 @@ impl Session {
                 "property updates require a WE scene or web project",
             ));
         }
-        let web = cfg!(feature = "web")
-            && selection
-                .as_ref()
-                .is_some_and(|s| catalog::kind(catalog::path(s)) == Some(catalog::Kind::WeWeb));
         let mut properties = BTreeMap::new();
         for name in &outputs {
             let saved = selection
@@ -1326,6 +1642,14 @@ impl Session {
             let id = self.next_id;
             self.next_id += 1;
             let entry = self.outputs.get_mut(&name).unwrap();
+            entry.watchdog = Watchdog::Idle;
+            if client.is_some() || selection.is_none() {
+                entry.recovery = Recovery::default();
+            }
+            if selection.is_none() {
+                entry.frozen = None;
+            }
+            entry.recovery.due = None;
             let clock = selection.as_ref().and_then(|selection| {
                 self.synchronized
                     .contains(&selection.asset_id)
@@ -1335,10 +1659,12 @@ impl Session {
                 match Renderer::spawn(&name) {
                     Ok(worker) => {
                         entry.worker = Some(worker);
-                        entry.web_host = false;
                     }
                     Err(error) => {
                         entry.error = Some(Error::new("renderer_failed", error.to_string()));
+                        if entry.recoverable.is_some() {
+                            entry.recovery.schedule(Instant::now());
+                        }
                         let error = entry.error.clone().unwrap();
                         self.complete(group, Err(error));
                         self.dirty = true;
@@ -1346,16 +1672,14 @@ impl Session {
                     }
                 }
             }
-            // Explicit choices replenish the single CEF-host recovery attempt.
-            if client.is_some() {
-                entry.web_recovered = false;
-            }
-            entry.web_host |= web;
             entry.error = None;
             entry.pending = Some(Pending {
                 id,
                 group,
                 selection: selection.clone(),
+                kind: selection
+                    .as_ref()
+                    .and_then(|s| catalog::kind(catalog::path(s))),
                 deadline: Instant::now()
                     + Duration::from_secs(if selection.is_some() { 60 } else { 10 }),
                 playback,
@@ -1384,6 +1708,8 @@ impl Session {
                         error: None,
                         runtime: None,
                         snapshot: None,
+                        progress: None,
+                        probe: None,
                     },
                 );
             }
@@ -1396,6 +1722,21 @@ impl Session {
         let Some(entry) = self.outputs.get_mut(name) else {
             return;
         };
+        if let Some(selection_id) = reply.progress {
+            if selection_id == entry.selection_id && entry.pending.is_none() {
+                entry.watchdog.progress(
+                    entry.runtime.active && !entry.runtime.failed,
+                    Instant::now(),
+                );
+            }
+            return;
+        }
+        if let Some(selection_id) = reply.probe {
+            if selection_id == entry.selection_id {
+                entry.watchdog.probe();
+            }
+            return;
+        }
         if entry
             .snapshot_control
             .as_ref()
@@ -1424,7 +1765,17 @@ impl Session {
                 if runtime.selection_id != entry.selection_id {
                     return;
                 }
+                let was_active = entry.runtime.active;
                 entry.runtime = runtime;
+                entry
+                    .watchdog
+                    .runtime(was_active, entry.runtime.active, Instant::now());
+                if entry.runtime.committed {
+                    entry.frozen = None;
+                }
+                if entry.runtime.failed && entry.pending.is_none() {
+                    entry.recovery.schedule(Instant::now());
+                }
 
                 if entry.wants_audio(self.policy)
                     && let Some(worker) = &mut entry.worker
@@ -1509,17 +1860,22 @@ impl Session {
         let pending = entry.pending.take().unwrap();
         let mut released_control = None;
         let result = if reply.ok {
+            entry.recovery.accepted();
             entry.selection_id = pending.id;
             if let Some(runtime) = reply.runtime {
                 entry.runtime = runtime;
+                if entry.runtime.committed {
+                    entry.frozen = None;
+                }
             }
             entry.revision = pending.id;
             entry.current = pending.selection.as_ref().map(|s| s.asset_id.clone());
-            entry.kind = pending
-                .selection
-                .as_ref()
-                .and_then(|s| catalog::kind(catalog::path(s)));
+            entry.kind = pending.kind;
             entry.playback = pending.playback;
+            entry.recoverable = pending.selection.clone();
+            entry
+                .watchdog
+                .accepted(entry.runtime.active, Instant::now());
             let saved = self.store.outputs.entry(name.into()).or_default();
             entry.properties = pending.properties.values;
             entry.property_warnings = pending.properties.warnings;
@@ -1532,16 +1888,29 @@ impl Session {
             if saved.released {
                 released_control = entry.control.take();
                 entry.worker = None;
+                entry.frozen = None;
                 entry.runtime = WorkerRuntime::default();
+                entry.watchdog = Watchdog::Idle;
             }
             self.save_needed = true;
             Ok(())
         } else {
+            if pending.selection.is_some() && entry.current.is_some() {
+                entry.watchdog.accepted(
+                    entry.runtime.active && !entry.runtime.failed,
+                    Instant::now(),
+                );
+            }
             Err(reply
                 .error
                 .unwrap_or_else(|| Error::new("load_failed", "content loading failed")))
         };
         entry.error = result.as_ref().err().cloned();
+        if (entry.runtime.failed || result.is_err() && entry.current.is_none())
+            && entry.recoverable.is_some()
+        {
+            entry.recovery.schedule(Instant::now());
+        }
         self.complete(pending.group, result);
         if let Some(control) = released_control {
             self.complete(control.group, Ok(()));
@@ -1557,21 +1926,22 @@ impl Session {
         if entry.worker.is_none() {
             return;
         }
-        // A CEF host can fail after initialization has made in-process retry unsafe.
-        // Restore only accepted intent, once per explicit choice, never during release.
-        let restore = (entry.web_host
-            && !entry.web_recovered
-            && entry.pending.as_ref().is_none_or(|p| p.selection.is_some()))
-        .then(|| {
-            self.store
-                .outputs
-                .get(name)
-                .and_then(|s| s.selection.clone())
-        })
-        .flatten();
-        entry.web_recovered |= restore.is_some();
+        // Every engine uses the same recovery policy. Never replay an unaccepted
+        // candidate, or turn an explicit release into a wallpaper resurrection.
+        if entry.pending.as_ref().is_none_or(|p| p.selection.is_some())
+            && entry.recoverable.is_some()
+        {
+            entry.recovery.schedule(Instant::now());
+        } else {
+            entry.recovery.due = None;
+        }
+        entry.preserve_worker_frame();
+        if entry.recovery.due.is_none() {
+            entry.frozen = None;
+        }
         entry.worker = None;
         entry.runtime = WorkerRuntime::default();
+        entry.watchdog = Watchdog::Idle;
         entry.current = None;
         entry.kind = None;
         entry.properties.clear();
@@ -1592,19 +1962,6 @@ impl Session {
         }
         if let Some(control) = property_control {
             self.complete(control.group, Err(error));
-        }
-        if let Some(selection) = restore
-            && let Err(error) = self.start(
-                None,
-                vec![name.into()],
-                Some(selection),
-                Transition::Cut,
-                &PlaybackPatch::default(),
-                &Values::new(),
-                false,
-            )
-        {
-            self.outputs.get_mut(name).unwrap().error = Some(error);
         }
         self.dirty = true;
     }
@@ -1731,19 +2088,6 @@ impl Session {
 
     fn expire(&mut self) {
         self.server.expire();
-        for output in self.outputs.values_mut() {
-            if output
-                .snapshot_control
-                .as_ref()
-                .is_some_and(|c| c.deadline <= Instant::now())
-            {
-                let control = output.snapshot_control.take().unwrap();
-                self.server.reply(
-                    control.client,
-                    &fail(Error::new("snapshot_failed", "snapshot timed out")),
-                );
-            }
-        }
         if matches!(self.audio_mute, AudioMute::Grace(deadline) if deadline <= Instant::now()) {
             self.audio_mute = AudioMute::Clear;
             self.update_policy(self.policy);
@@ -1761,11 +2105,77 @@ impl Session {
                     || o.property_control
                         .as_ref()
                         .is_some_and(|c| c.deadline <= Instant::now())
+                    || o.snapshot_control
+                        .as_ref()
+                        .is_some_and(|c| c.deadline <= Instant::now())
             })
             .map(|(name, _)| name.clone())
             .collect();
         for name in expired {
             self.worker_failed(&name, "worker response timed out");
+        }
+        let now = Instant::now();
+        for output in self.outputs.values_mut() {
+            if output.pending.is_none()
+                && matches!(output.watchdog, Watchdog::Progress(deadline) if deadline <= now)
+                && let Some(worker) = &mut output.worker
+            {
+                worker.probe();
+                output.watchdog = Watchdog::Probe(now + Watchdog::TIMEOUT);
+            }
+        }
+        let stalled: Vec<_> = self
+            .outputs
+            .iter()
+            .filter(|(_, output)| {
+                output.pending.is_none()
+                    && matches!(output.watchdog, Watchdog::Probe(deadline) if deadline <= now)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in stalled {
+            self.worker_failed(&name, "render worker stopped responding");
+        }
+        let recover: Vec<_> = self
+            .outputs
+            .iter()
+            .filter(|(_, output)| {
+                output.pending.is_none()
+                    && output.recovery.due.is_some_and(|due| due <= Instant::now())
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in recover {
+            let output = self.outputs.get_mut(&name).unwrap();
+            output.recovery.due = None;
+            output.retire_failed_worker();
+            let selection = output.recoverable.clone();
+            if let Some(selection) = selection
+                && let Err(error) = self.start(
+                    None,
+                    vec![name.clone()],
+                    Some(selection),
+                    Transition::Cut,
+                    &PlaybackPatch::default(),
+                    &Values::new(),
+                    false,
+                )
+            {
+                let output = self.outputs.get_mut(&name).unwrap();
+                output.error = Some(error);
+                output.recovery.schedule(Instant::now());
+                self.dirty = true;
+            }
+        }
+        for (name, runtime) in &mut self.rotations {
+            let settings = &self.store.outputs[name].rotation;
+            if settings.enabled && !settings.schedule.is_empty() {
+                let active = settings.scheduled_now();
+                if active && runtime.schedule_active != Some(true) {
+                    runtime.due = Some(Instant::now());
+                }
+                runtime.schedule_active = Some(active);
+            }
         }
         let due: Vec<_> = self
             .rotations
@@ -1774,6 +2184,11 @@ impl Session {
             .map(|(name, _)| name.clone())
             .collect();
         for name in due {
+            if !self.store.outputs[&name].rotation.scheduled_now() {
+                self.rotations.get_mut(&name).unwrap().due =
+                    Some(Instant::now() + Duration::from_secs(15));
+                continue;
+            }
             let interval = self.store.outputs[&name]
                 .rotation
                 .interval_seconds
@@ -1813,7 +2228,15 @@ impl Session {
                 AudioMute::Grace(deadline) => Some(deadline),
                 _ => None,
             })
+            .chain(self.power_due)
             .chain(self.rotations.values().filter_map(|r| r.due))
+            .chain(self.outputs.values().filter_map(|o| o.recovery.due))
+            .chain(
+                self.outputs
+                    .values()
+                    .filter(|o| o.pending.is_none())
+                    .filter_map(|o| o.watchdog.deadline()),
+            )
             .min();
         deadline.map_or(-1, |deadline| {
             deadline
@@ -1842,6 +2265,338 @@ fn success(outputs: Vec<String>, current: Option<String>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_backs_off_until_a_stable_run() {
+        let mut recovery = Recovery::default();
+        let mut now = Instant::now();
+        for seconds in [1, 2, 4, 8, 16, 32, 32] {
+            recovery.schedule(now);
+            assert_eq!(recovery.due, Some(now + Duration::from_secs(seconds)));
+            let attempts = recovery.attempts;
+            recovery.schedule(now);
+            assert_eq!(recovery.attempts, attempts);
+            now = recovery.due.take().unwrap();
+        }
+        recovery.healthy_since = Some(now);
+        now += Duration::from_secs(60);
+        recovery.schedule(now);
+        assert_eq!(recovery.due, Some(now + Duration::from_secs(1)));
+        assert_eq!(recovery.attempts, 1);
+    }
+
+    #[test]
+    fn accepted_unconfirmed_frame_is_fallback_but_never_replaces_an_older_one() {
+        use std::os::fd::AsRawFd;
+
+        let mut output = Output::new(&SavedOutput::default(), Playback::default());
+        output.current = Some("local:/accepted.png".into());
+        let (worker, _peer) = Renderer::echo_connected();
+        output.worker = Some(worker);
+        output.runtime.failed = true;
+        output.retire_failed_worker();
+        assert!(output.frozen.is_some());
+
+        let frozen_fd = output.frozen.as_ref().unwrap().as_raw_fd();
+        let (replacement, _replacement_peer) = Renderer::echo_connected();
+        output.worker = Some(replacement);
+        output.runtime.failed = true;
+        output.retire_failed_worker();
+        assert_eq!(output.frozen.as_ref().unwrap().as_raw_fd(), frozen_fd);
+    }
+
+    #[test]
+    fn watchdog_probes_once_and_only_real_progress_rearms_it() {
+        let start = Instant::now();
+        let mut watchdog = Watchdog::default();
+
+        watchdog.accepted(false, start);
+        assert!(
+            watchdog.deadline().is_none(),
+            "static content must stay idle"
+        );
+
+        watchdog.accepted(true, start);
+        assert_eq!(watchdog.deadline(), Some(start + Watchdog::TIMEOUT));
+        watchdog.runtime(true, true, start + Duration::from_secs(3));
+        assert_eq!(
+            watchdog.deadline(),
+            Some(start + Watchdog::TIMEOUT),
+            "periodic runtime metadata must not hide a render stall"
+        );
+
+        watchdog = Watchdog::Probe(start + Duration::from_secs(20));
+        watchdog.runtime(true, true, start + Duration::from_secs(11));
+        assert_eq!(
+            watchdog.deadline(),
+            Some(start + Duration::from_secs(20)),
+            "runtime metadata must not extend a pending probe"
+        );
+        watchdog.probe();
+        assert!(watchdog.deadline().is_none());
+        watchdog.runtime(true, true, start + Duration::from_secs(21));
+        assert!(
+            watchdog.deadline().is_none(),
+            "an acknowledged static engine must not be polled again"
+        );
+
+        watchdog.progress(false, start + Duration::from_secs(22));
+        assert!(
+            watchdog.deadline().is_none(),
+            "late progress from paused or failed content must stay idle"
+        );
+        watchdog.progress(true, start + Duration::from_secs(22));
+        assert_eq!(
+            watchdog.deadline(),
+            Some(start + Duration::from_secs(22) + Watchdog::TIMEOUT)
+        );
+        watchdog.runtime(true, false, start + Duration::from_secs(23));
+        assert!(
+            watchdog.deadline().is_none(),
+            "pause must cancel the watchdog"
+        );
+    }
+
+    #[test]
+    fn media_updates_do_not_wake_image_video_or_shader_workers() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = session(root.path());
+        for (name, media) in [
+            ("image", false),
+            ("video", false),
+            ("shader", false),
+            ("scene", true),
+            ("web", true),
+        ] {
+            let mut output = Output::new(&SavedOutput::default(), Playback::default());
+            output.worker = Some(Renderer::echo());
+            output.runtime.media = media;
+            session.outputs.insert(name.into(), output);
+        }
+        session.media_changed(crate::media::Snapshot {
+            revision: 1,
+            ..Default::default()
+        });
+        for (name, output) in &session.outputs {
+            assert_eq!(
+                output.worker.as_ref().unwrap().wants_write(),
+                name == "scene" || name == "web"
+            );
+        }
+    }
+
+    #[test]
+    fn stalled_snapshot_recovers_even_when_the_wallpaper_is_idle() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = session(root.path());
+        let saved = SavedOutput {
+            selection: Some(Selection {
+                asset_id: "local:/accepted.png".into(),
+                fit: Fit::Contain,
+            }),
+            ..Default::default()
+        };
+        let mut output = Output::new(&saved, Playback::default());
+        output.current = Some(saved.selection.as_ref().unwrap().asset_id.clone());
+        output.worker = Some(Renderer::echo());
+        output.snapshot_control = Some(SnapshotControl {
+            id: 1,
+            client: 7,
+            revision: 0,
+            deadline: Instant::now(),
+        });
+        assert!(!output.runtime.active);
+        session.outputs.insert("A".into(), output);
+        session.expire();
+        let output = &session.outputs["A"];
+        assert!(output.worker.is_none());
+        assert!(output.snapshot_control.is_none());
+        assert!(output.recovery.due.is_some());
+        let recovered = output.recoverable.as_ref().unwrap();
+        let accepted = saved.selection.as_ref().unwrap();
+        assert_eq!(recovered.asset_id, accepted.asset_id);
+        assert_eq!(recovered.fit, accepted.fit);
+    }
+
+    #[test]
+    fn failed_workers_restore_accepted_intent_and_release_cancels_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = session(root.path());
+        let selection = Selection {
+            asset_id: "local:/accepted.png".into(),
+            fit: Fit::Contain,
+        };
+        let saved = SavedOutput {
+            selection: Some(selection.clone()),
+            ..Default::default()
+        };
+        let mut output = Output::new(&saved, Playback::default());
+        output.current = Some(selection.asset_id.clone());
+        output.worker = Some(Renderer::echo());
+        session.store.outputs.insert("A".into(), saved);
+        session.outputs.insert("A".into(), output);
+        session.worker_failed("A", "crashed decoder");
+        assert_eq!(session.outputs["A"].recovery.attempts, 1);
+        assert!(session.outputs["A"].recovery.due.is_some());
+        let output = session.outputs.get_mut("A").unwrap();
+        output.worker = Some(Renderer::echo());
+        output.recovery.due = Some(Instant::now());
+        session.expire();
+        let restored = session.outputs["A"]
+            .pending
+            .as_ref()
+            .unwrap()
+            .selection
+            .as_ref()
+            .unwrap();
+        assert_eq!(restored.asset_id, selection.asset_id);
+        assert_eq!(restored.fit, selection.fit);
+        assert_eq!(session.outputs["A"].recovery.due, None);
+        session
+            .start(
+                Some(7),
+                vec!["A".into()],
+                None,
+                Transition::Cut,
+                &PlaybackPatch::default(),
+                &Values::new(),
+                false,
+            )
+            .unwrap();
+        session.worker_failed("A", "exit during release");
+        assert!(session.outputs["A"].recovery.due.is_none());
+        assert_eq!(session.timeout(), -1, "released session has no timer work");
+    }
+
+    #[test]
+    fn configured_initial_intent_retries_without_becoming_accepted() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = session(root.path());
+        let selection = Selection {
+            asset_id: "local:/configured.png".into(),
+            fit: Fit::Cover,
+        };
+        let mut output = Output::new(&SavedOutput::default(), Playback::default());
+        output.recoverable = Some(selection.clone());
+        output.worker = Some(Renderer::echo());
+        session.outputs.insert("A".into(), output);
+
+        session.worker_failed("A", "failed before first acceptance");
+        assert!(session.outputs["A"].recovery.due.is_some());
+        assert!(!session.store.outputs.contains_key("A"));
+
+        let output = session.outputs.get_mut("A").unwrap();
+        output.worker = Some(Renderer::echo());
+        output.recovery.due = Some(Instant::now());
+        session.expire();
+        let retried = session.outputs["A"]
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.selection.as_ref())
+            .unwrap();
+        assert_eq!(retried.asset_id, selection.asset_id);
+        assert_eq!(retried.fit, selection.fit);
+        assert!(!session.store.outputs.contains_key("A"));
+    }
+
+    #[test]
+    fn runtime_failure_retires_worker_but_candidate_failure_keeps_it() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = session(root.path());
+        let accepted = Selection {
+            asset_id: "local:/accepted.png".into(),
+            fit: Fit::Cover,
+        };
+        let saved = SavedOutput {
+            selection: Some(accepted.clone()),
+            ..Default::default()
+        };
+        let mut output = Output::new(&saved, Playback::default());
+        output.current = Some(accepted.asset_id.clone());
+        output.worker = Some(Renderer::echo());
+        output.runtime.failed = true;
+        let failed_pid = output.worker.as_ref().unwrap().pid();
+        output.retire_failed_worker();
+        assert!(output.worker.is_none());
+        assert!(!output.runtime.failed);
+        output.worker = Some(Renderer::echo());
+        output.runtime.active = true;
+        assert_ne!(output.worker.as_ref().unwrap().pid(), failed_pid);
+        session.store.outputs.insert("A".into(), saved);
+        session.outputs.insert("A".into(), output);
+
+        session
+            .start(
+                Some(7),
+                vec!["A".into()],
+                Some(Selection {
+                    asset_id: "local:/broken-candidate.png".into(),
+                    fit: Fit::Contain,
+                }),
+                Transition::Cut,
+                &PlaybackPatch::default(),
+                &Values::new(),
+                false,
+            )
+            .unwrap();
+        let worker_pid = session.outputs["A"].worker.as_ref().unwrap().pid();
+        let pending = session.outputs["A"].pending.as_ref().unwrap().id;
+        session.worker_reply(
+            "A",
+            WorkerReply {
+                id: pending,
+                ok: false,
+                error: Some(Error::new("load_failed", "fixture")),
+                runtime: None,
+                snapshot: None,
+                progress: None,
+                probe: None,
+            },
+        );
+        assert_eq!(
+            session.outputs["A"].worker.as_ref().unwrap().pid(),
+            worker_pid
+        );
+        let recoverable = session.outputs["A"].recoverable.as_ref().unwrap();
+        assert_eq!(recoverable.asset_id, accepted.asset_id);
+        assert_eq!(recoverable.fit, accepted.fit);
+        assert!(session.outputs["A"].recovery.due.is_none());
+        assert!(matches!(
+            session.outputs["A"].watchdog,
+            Watchdog::Progress(_)
+        ));
+
+        session.outputs.get_mut("A").unwrap().runtime.active = false;
+        session
+            .start(
+                Some(8),
+                vec!["A".into()],
+                Some(Selection {
+                    asset_id: "local:/another-broken-candidate.png".into(),
+                    fit: Fit::Cover,
+                }),
+                Transition::Cut,
+                &PlaybackPatch::default(),
+                &Values::new(),
+                false,
+            )
+            .unwrap();
+        let pending = session.outputs["A"].pending.as_ref().unwrap().id;
+        session.worker_reply(
+            "A",
+            WorkerReply {
+                id: pending,
+                ok: false,
+                error: Some(Error::new("load_failed", "paused fixture")),
+                runtime: None,
+                snapshot: None,
+                progress: None,
+                probe: None,
+            },
+        );
+        assert!(matches!(session.outputs["A"].watchdog, Watchdog::Idle));
+        assert!(session.outputs["A"].recovery.due.is_none());
+    }
 
     #[test]
     fn configured_wallpapers_preserve_saved_choices_and_release() {
@@ -1987,6 +2742,8 @@ mod tests {
                         error: None,
                         runtime: None,
                         snapshot: None,
+                        progress: None,
+                        probe: None,
                     },
                 );
                 assert_eq!(
@@ -2052,6 +2809,8 @@ mod tests {
             error: (!ok).then(|| Error::new("load_failed", "fixture")),
             runtime: None,
             snapshot: None,
+            progress: None,
+            probe: None,
         };
         start(&mut session, &["A", "B"], "old");
         for name in ["A", "B"] {
@@ -2349,6 +3108,8 @@ mod tests {
             save_needed: false,
             completed: Vec::new(),
             policy: Policy::default(),
+            power: Default::default(),
+            power_due: None,
             niri: Default::default(),
             audio: Default::default(),
             spectrum: Default::default(),
@@ -2425,6 +3186,7 @@ mod tests {
                 asset_id: "local:/video.mkv".into(),
                 fit: Fit::Cover,
             }),
+            kind: Some(catalog::Kind::Video),
             deadline: Instant::now(),
             playback: Playback {
                 fps: 15,
@@ -2554,5 +3316,144 @@ mod tests {
         session.audio_changed(Snapshot::default());
         assert!(matches!(session.audio_mute, AudioMute::Clear));
         assert!(!session.outputs["DP-1"].actual(session.policy).mute);
+    }
+    #[test]
+    fn power_events_apply_policy_without_an_idle_poll_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = session(root.path());
+        session.outputs.insert(
+            "A".into(),
+            Output::new(&SavedOutput::default(), Playback::default()),
+        );
+        session.store.policy.pause_on_battery = Some(true);
+        assert_eq!(session.timeout(), -1);
+        let battery = crate::policy::power::Snapshot {
+            available: true,
+            on_battery: true,
+        };
+        session.power_changed(battery);
+        assert!(session.outputs["A"].actual(session.policy).paused);
+        session.dirty = false;
+        session.power_changed(battery);
+        assert!(!session.dirty);
+        session.power_changed(crate::policy::power::Snapshot {
+            on_battery: false,
+            ..battery
+        });
+        assert!(!session.outputs["A"].actual(session.policy).paused);
+        assert_eq!(session.timeout(), -1);
+        session.power_due = Some(Instant::now() + Duration::from_secs(15));
+        assert!((1..=15_001).contains(&session.timeout()));
+    }
+
+    #[test]
+    fn runtime_policy_toggles_keep_user_intent_and_resume_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = session(root.path());
+        session.outputs.insert(
+            "A".into(),
+            Output::new(&SavedOutput::default(), Playback::default()),
+        );
+        session.outputs.get_mut("A").unwrap().current = Some("we:/test".into());
+        session.policy_changed(Policy {
+            locked: true,
+            available: true,
+            ..Policy::default()
+        });
+        assert!(session.outputs["A"].actual(session.policy).paused);
+        session.store.policy.pause_on_session = Some(false);
+        session.update_policy(session.policy);
+        assert!(!session.outputs["A"].actual(session.policy).paused);
+        assert!(session.outputs["A"].revision > 0);
+        session.outputs.get_mut("A").unwrap().playback.paused = true;
+        session.store.policy.pause_on_session = Some(true);
+        session.update_policy(session.policy);
+        session.policy_changed(Policy::default());
+        assert!(session.outputs["A"].actual(session.policy).paused);
+        session.outputs.get_mut("A").unwrap().playback.paused = false;
+        session.niri.fullscreen_outputs.insert("A".into());
+        session.update_policy(session.policy);
+        assert!(session.outputs["A"].actual(session.policy).paused);
+        session.store.policy.pause_on_fullscreen = Some(false);
+        session.update_policy(session.policy);
+        assert!(!session.outputs["A"].actual(session.policy).paused);
+        session.power = crate::policy::power::Snapshot {
+            available: true,
+            on_battery: true,
+        };
+        session.store.policy.pause_on_battery = Some(true);
+        session.update_policy(session.policy);
+        assert!(session.outputs["A"].actual(session.policy).paused);
+        assert!(
+            session.outputs["A"]
+                .view(session.policy)
+                .pause_reasons
+                .contains(&"battery")
+        );
+        session.power.on_battery = false;
+        session.update_policy(session.policy);
+        assert!(!session.outputs["A"].actual(session.policy).paused);
+        let restored: Store =
+            serde_json::from_value(serde_json::to_value(&session.store).unwrap()).unwrap();
+        assert_eq!(restored.policy.pause_on_fullscreen, Some(false));
+    }
+    #[test]
+    fn scheduled_rotation_is_owned_by_daemon_without_frontend() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = session(root.path());
+        session.outputs.insert(
+            "A".into(),
+            Output::new(&SavedOutput::default(), Playback::default()),
+        );
+        let now = unsafe { libc::time(std::ptr::null_mut()) };
+        let mut local: libc::tm = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::localtime_r(&now, &mut local);
+        }
+        let day = if local.tm_wday == 0 {
+            7
+        } else {
+            local.tm_wday as u8
+        };
+        let rotation = crate::library::Rotation {
+            enabled: true,
+            schedule: vec![crate::library::TimeRule {
+                start: "00:00".into(),
+                end: "00:00".into(),
+                days: vec![day % 7 + 1],
+            }],
+            ..Default::default()
+        };
+        session.store.outputs.insert(
+            "A".into(),
+            SavedOutput {
+                rotation,
+                ..Default::default()
+            },
+        );
+        session.rotations.insert(
+            "A".into(),
+            RotationRuntime {
+                due: Some(Instant::now()),
+                ..Default::default()
+            },
+        );
+        session.expire();
+        assert!(session.rotations["A"].error.is_none());
+        assert!(session.rotations["A"].due.unwrap() > Instant::now());
+        session
+            .store
+            .outputs
+            .get_mut("A")
+            .unwrap()
+            .rotation
+            .schedule
+            .clear();
+        session.rotations.get_mut("A").unwrap().due = Some(Instant::now());
+        session.expire();
+        assert_eq!(
+            session.rotations["A"].error.as_ref().unwrap().code,
+            "empty_playlist"
+        );
     }
 }

@@ -3,6 +3,7 @@
     delete window.__wallpaperdHost;
     const listeners = new Map();
     let properties = {};
+    let directories = {};
     let general = {};
     let media = {};
     let paused;
@@ -11,6 +12,10 @@
         catch (error) { console.error(error); }
     };
     const emit = (name, value) => call(listeners.get(name), value);
+    window.wallpaperRequestRandomFileForProperty = (name, callback) => {
+        const files = directories[name]?.files || [];
+        call(callback, name, files.length ? files[Math.floor(Math.random() * files.length)] : '');
+    };
     window.wallpaperRegisterAudioListener = fn => {
         listeners.set('audio', fn);
         host('audio');
@@ -35,8 +40,19 @@
     }
     let initialized = false;
     let frameRevision = -1;
+    document.addEventListener('visibilitychange', () => {
+        const revision = frameRevision;
+        if (document.hidden) {
+            host('hidden', revision);
+        } else {
+            requestAnimationFrame(() => requestAnimationFrame(() =>
+                setTimeout(() => host('visible', revision), 0)));
+        }
+    });
     window.__wallpaperdReceive = state => {
         const listener = window.wallpaperPropertyListener || {};
+        const previousDirectories = directories;
+        if (state.directories) directories = state.directories;
         if (state.properties) {
             const changed = {};
             for (const [key, value] of Object.entries(state.properties)) {
@@ -45,6 +61,17 @@
             }
             properties = state.properties;
             if (Object.keys(changed).length) call(listener.applyUserProperties?.bind(listener), changed);
+        }
+        if (state.directories) {
+            for (const [name, directory] of Object.entries(directories)) {
+                if (directory.mode !== 'fetchall') continue;
+                const old = previousDirectories[name]?.files || [];
+                const files = directory.files || [];
+                const removed = old.filter(file => !files.includes(file));
+                const added = files.filter(file => !old.includes(file));
+                if (removed.length) call(listener.userDirectoryFilesRemoved?.bind(listener), name, removed);
+                if (added.length) call(listener.userDirectoryFilesAddedOrChanged?.bind(listener), name, added);
+            }
         }
         if (state.playback) {
             const next = {fps: state.playback.fps};
@@ -68,11 +95,14 @@
         }
         initialized = true;
         // Apply author properties before the first published browser frame.
-        if (frameRevision !== state.frame_revision) {
+        if (Object.hasOwn(state, 'frame_revision') && frameRevision !== state.frame_revision) {
             frameRevision = state.frame_revision;
             const revision = frameRevision;
-            // Two animation ticks let the compositor consume the updated author state.
-            requestAnimationFrame(() => requestAnimationFrame(() => host('ready', revision)));
+            // Leave the second animation callback before acknowledging the
+            // revision. The browser completes that rendering update, including
+            // paint, before running the queued task.
+            requestAnimationFrame(() => requestAnimationFrame(() =>
+                setTimeout(() => host('ready', revision), 0)));
         }
     };
 })();

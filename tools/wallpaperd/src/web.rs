@@ -33,6 +33,9 @@ mod enabled {
         "media_thumbnails":false,"synchronized_playback":false,"frame_output":["texture"],
         "requires":"matching CEF runtime, EGL/GLES 3","helper":null,"runtime":runtime,"error":error})
     }
+    pub fn cleanup_pending() -> bool {
+        we_web::cleanup_pending()
+    }
     fn bundle_error(directory: &Path) -> Option<String> {
         for name in [
             "libcef.so",
@@ -53,9 +56,6 @@ mod enabled {
     pub struct Web {
         browser: we_web::Renderer,
         pending_gpu: Option<frames::Frame>,
-        direct_frame: Option<frames::Frame>,
-        direct: bool,
-        source_sequence: u64,
         accelerated: bool,
         gpu_seen: bool,
         started: Instant,
@@ -121,6 +121,7 @@ mod enabled {
                 root,
                 entry,
                 [size.width, size.height],
+                state["playback"]["fps"].as_u64().unwrap_or(1).clamp(1, 240) as u16,
                 platform.is_some(),
                 platform.unwrap_or("headless"),
                 wake,
@@ -128,10 +129,6 @@ mod enabled {
             let web = Self {
                 browser,
                 pending_gpu: None,
-                direct_frame: None,
-                direct: platform.is_some()
-                    && std::env::var("WALLPAPERD_WEB_DIRECT").as_deref() == Ok("1"),
-                source_sequence: 0,
                 accelerated: platform.is_some(),
                 gpu_seen: false,
                 started: Instant::now(),
@@ -156,44 +153,49 @@ mod enabled {
             self.browser.send(self.state.clone(), false)
         }
         pub fn playback(&mut self, playback: Playback) -> Result<()> {
-            self.state["playback"] = serde_json::to_value(playback)?;
-            self.send()
+            let playback = serde_json::to_value(playback)?;
+            self.state["playback"] = playback.clone();
+            self.browser.send(json!({"playback":playback}), false)
         }
         pub fn properties(&mut self, values: &Values) -> Result<()> {
-            self.state["properties"] = web_properties(values);
-            self.send()
+            let properties = web_properties(values);
+            self.state["properties"] = properties.clone();
+            self.browser.send(json!({"properties":properties}), false)
         }
         pub fn pointer(&mut self, position: Option<[f32; 2]>, button: Option<bool>) -> Result<()> {
             let old = self.state["pointer"]["down"].as_bool().unwrap_or(false);
             let focused = self.state["pointer"]["focused"].as_bool().unwrap_or(false);
             let [x, y] = position.unwrap_or([0.0, 0.0]);
             let down = position.is_some() && button.unwrap_or(old);
-            self.state["pointer"] = json!({"focused":position.is_some(),"x":x,"y":y,"down":down});
+            let pointer = json!({"focused":position.is_some(),"x":x,"y":y,"down":down});
+            self.state["pointer"] = pointer.clone();
             self.browser.send(
-                self.state.clone(),
+                json!({"pointer":pointer}),
                 down != old || focused != position.is_some(),
             )
         }
         pub fn audio(&mut self, audio: &we_scene::audio::AudioSnapshot) {
             if self.audio {
                 let band = &audio.bands[2];
-                self.state["audio"] = json!(
+                let audio = json!(
                     band.left
                         .iter()
                         .chain(&band.right)
                         .copied()
                         .collect::<Vec<_>>()
                 );
-                if let Err(error) = self.send() {
+                self.state["audio"] = audio.clone();
+                if let Err(error) = self.browser.send(json!({"audio":audio}), false) {
                     self.error = Some(error.to_string());
                 }
             }
         }
         pub fn media(&mut self, media: &crate::media::Snapshot) {
-            self.state["media"] = json!({"enabled":media.enabled,"title":media.title,"artist":media.artist,
+            let media = json!({"enabled":media.enabled,"title":media.title,"artist":media.artist,
             "album_title":media.album_title,"album_artist":media.album_artist,"genres":media.genres,
             "content_type":media.content_type,"playback":media.playback,"position":media.position,"duration":media.duration});
-            if let Err(error) = self.send() {
+            self.state["media"] = media.clone();
+            if let Err(error) = self.browser.send(json!({"media":media}), false) {
                 self.error = Some(error.to_string());
             }
         }
@@ -207,7 +209,7 @@ mod enabled {
             if self.accelerated { "dmabuf" } else { "mmap" }
         }
         pub fn diagnostics(&self) -> Value {
-            json!({"transport":self.transport(),"fallback":self.fallback,"direct":self.direct})
+            json!({"transport":self.transport(),"fallback":self.fallback})
         }
         fn fallback(&mut self, reason: String) -> Result<()> {
             eprintln!("wallpaperd web: DMA-BUF unavailable ({reason}); using mmap");
@@ -228,22 +230,10 @@ mod enabled {
         }
         pub fn ready(&self) -> bool {
             self.sequence > 0
-                && (self.direct_frame().is_some()
-                    || self
-                        .source
-                        .as_ref()
-                        .is_some_and(|source| source.size == self.size))
-        }
-        pub fn direct_frame(&self) -> Option<&frames::Frame> {
-            self.direct.then_some(())?;
-            self.direct_frame
-                .as_ref()
-                .filter(|frame| frame.info.visible[2..] == [self.size.width, self.size.height])
-        }
-        pub fn direct_presented(&mut self) {
-            self.dirty = false;
-            self.source = None;
-            self.source_sequence = 0;
+                && self
+                    .source
+                    .as_ref()
+                    .is_some_and(|source| source.size == self.size)
         }
         pub fn poll(&mut self) -> Result<()> {
             let latest = self.browser.poll();
@@ -276,13 +266,12 @@ mod enabled {
             if gpu.size != self.size {
                 self.browser.resize([gpu.size.width, gpu.size.height])?;
                 self.size = gpu.size;
-                self.state["size"] = json!({"width":self.size.width,"height":self.size.height});
+                let size = json!({"width":self.size.width,"height":self.size.height});
+                self.state["size"] = size.clone();
                 self.dirty = true;
-                self.direct_frame = None;
                 self.source = None;
                 self.sequence = 0;
-                self.source_sequence = 0;
-                self.send()?;
+                self.browser.send(json!({"size":size}), false)?;
             }
             Ok(())
         }
@@ -294,26 +283,12 @@ mod enabled {
                 .is_none_or(|source| source.size != self.size)
             {
                 self.source = Some(Target::new(gpu.gl.clone(), self.size)?);
-                if !self.direct {
-                    self.sequence = 0;
-                }
-                self.source_sequence = 0;
+                self.sequence = 0;
             }
             Ok(())
         }
         pub fn prepare_gpu(&mut self, gpu: &Gpu) -> Result<()> {
             if !self.accelerated {
-                return Ok(());
-            }
-            if self.direct {
-                self.resize(gpu)?;
-                if let Some(frame) = self.pending_gpu.take()
-                    && frame.info.visible[2..] == [self.size.width, self.size.height]
-                {
-                    self.sequence = frame.info.sequence;
-                    self.direct_frame = Some(frame);
-                    self.dirty = true;
-                }
                 return Ok(());
             }
             self.prepare_size(gpu)?;
@@ -351,24 +326,8 @@ mod enabled {
         ) -> Result<bool> {
             self.prepare_size(gpu)?;
             self.prepare_gpu(gpu)?;
-            if let Some(frame) = self.direct_frame()
-                && self.source_sequence != self.sequence
-            {
-                // Snapshots and transitions still need an owned texture. The direct
-                // steady path never calls draw or allocates this texture.
-                if let Err(error) = gpu.copy_dma_buf(
-                    self.source.as_ref().unwrap(),
-                    frame,
-                    frame_damage(self.source_sequence, self.sequence, self.damage, self.size),
-                ) {
-                    self.fallback(format!("{error:#}"))?;
-                    return Ok(false);
-                }
-                self.source_sequence = self.sequence;
-                self.source_bgra = false;
-            }
             let mut changed = self.accelerated && self.dirty && self.sequence != 0;
-            if self.accelerated && !self.direct {
+            if self.accelerated {
                 self.dirty = false;
             }
             if !self.accelerated && self.dirty {
@@ -557,6 +516,9 @@ mod disabled {
         "media_thumbnails":false,"synchronized_playback":false,"frame_output":["texture"],
         "requires":"matching CEF runtime, EGL/GLES 3","helper":null,
         "error":"wallpaperd was built without Web support; run cargo build --locked --features web --release --target-dir target/we-web"})
+    }
+    pub fn cleanup_pending() -> bool {
+        false
     }
 
     // No instance can be constructed when the backend was omitted at build time.

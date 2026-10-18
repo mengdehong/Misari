@@ -632,6 +632,12 @@ impl Player {
                 0 => break,
                 5 if self.seek_reply == Some(event.userdata) => {
                     self.seek_reply = None;
+                    if event.error < 0 {
+                        self.failed = Some(format!(
+                            "media seek failed: {}",
+                            self.api.check(event.error).unwrap_err()
+                        ));
+                    }
                 } // MPV_EVENT_COMMAND_REPLY
                 20 if self.seek_reply.is_none() && self.seek_goal.is_some() => {
                     self.seek_started = true;
@@ -724,6 +730,9 @@ impl Player {
                             )
                         ));
                     }
+                }
+                24 => {
+                    self.failed = Some("libmpv event queue overflow".into());
                 }
                 1 => self.failed = Some("libmpv shut down".into()),
                 _ if event.error < 0 => {
@@ -864,14 +873,15 @@ impl Player {
 
 impl Drop for Player {
     fn drop(&mut self) {
-        // SAFETY: detach callbacks before freeing their state, and free render context with
-        // the same GL context current, before terminating the owning core.
+        // SAFETY: free the render context with its GL context current before making the
+        // non-render-thread-safe client callback call or terminating the owning core.
+        // Callback state remains live until core destruction completes.
         unsafe {
-            (self.api.set_wakeup)(self.handle, None, ptr::null_mut());
             if !self.render.is_null() {
                 (self.api.render_callback)(self.render, None, ptr::null_mut());
                 (self.api.render_free)(self.render);
             }
+            (self.api.set_wakeup)(self.handle, None, ptr::null_mut());
             (self.api.destroy)(self.handle);
         }
     }

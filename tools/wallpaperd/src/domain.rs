@@ -144,6 +144,7 @@ impl Playback {
 /// Environmental evidence is separate from accepted user settings.
 #[derive(Clone, Copy, Default)]
 pub struct PlaybackPolicy {
+    pub battery: bool,
     pub session: crate::policy::logind::Policy,
     pub fullscreen: bool,
     pub other_audio: bool,
@@ -153,6 +154,7 @@ impl PlaybackPolicy {
     pub fn commanded(self, user: Playback) -> Playback {
         Playback {
             paused: user.paused
+                || self.battery
                 || self.session.locked
                 || self.session.sleeping
                 || self.session.inactive
@@ -169,6 +171,7 @@ impl PlaybackPolicy {
             (self.session.sleeping, "sleep"),
             (self.session.inactive, "session_inactive"),
             (self.fullscreen, "fullscreen"),
+            (self.battery, "battery"),
             (runtime.throttled, "frame_throttled"),
             (runtime.failed, "playback_error"),
         ]
@@ -195,6 +198,7 @@ pub struct WorkerCommand {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum WorkerAction {
+    Probe,
     Apply {
         selection: Selection,
         #[serde(default)]
@@ -238,11 +242,16 @@ pub struct WorkerReply {
     pub runtime: Option<WorkerRuntime>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<std::path::PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Backend {
+    Application,
     Image,
     Libmpv,
     RustScene,
@@ -255,6 +264,11 @@ pub struct WorkerRuntime {
     /// The committed instance that produced this observation.
     #[serde(default)]
     pub selection_id: u64,
+    /// The compositor processed this worker's first nonempty surface commit.
+    #[serde(default)]
+    pub committed: bool,
+    #[serde(default)]
+    pub active: bool,
     #[serde(default)]
     pub audio: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -287,13 +301,14 @@ mod tests {
     use super::*;
     #[test]
     fn policy_reason_combinations_never_change_the_users_settings() {
-        for bits in 0u16..512 {
+        for bits in 0u16..1024 {
             let user = Playback {
                 paused: bits & 1 != 0,
                 mute: bits & 2 != 0,
                 ..Default::default()
             };
             let policy = PlaybackPolicy {
+                battery: bits & 512 != 0,
                 session: crate::policy::logind::Policy {
                     locked: bits & 4 != 0,
                     sleeping: bits & 8 != 0,

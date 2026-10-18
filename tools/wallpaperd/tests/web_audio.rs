@@ -54,7 +54,7 @@ fn web_audio_volume_mute_pause_own_stream_and_release() {
     let _runtime = we_web::ShutdownGuard;
     let (wake, _reader) = UnixStream::pair().unwrap();
     let browser =
-        we_web::Renderer::load(&project, &entry, [64, 64], false, "headless", &wake).unwrap();
+        we_web::Renderer::load(&project, &entry, [64, 64], 60, false, "headless", &wake).unwrap();
     let send = |browser: &we_web::Renderer, volume: u32, mute: bool, paused: bool| {
         browser
             .send(

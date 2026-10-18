@@ -1,7 +1,9 @@
 //! One running job, one replaceable pending job, and one bounded result.
 use parking_lot::{Condvar, Mutex};
 use std::{
+    fs::File,
     io::{self, Read, Write},
+    os::fd::{AsRawFd, FromRawFd},
     os::unix::net::UnixStream,
     sync::{
         Arc,
@@ -16,27 +18,82 @@ use crate::{
     pixels::{self, Size},
 };
 
-use smithay_client_toolkit::{
-    registry::SimpleGlobal,
-    shm::slot::{Buffer, SlotPool},
-};
-use wayland_client::protocol::wl_shm;
-
 pub enum Frame {
-    Shm { size: Size, buffer: Buffer },
+    Shm(ShmFrame),
     Image(image::RgbaImage),
+}
+
+pub struct ShmFrame {
+    pub size: Size,
+    pub file: File,
+}
+
+impl ShmFrame {
+    fn render(
+        image: image::RgbaImage,
+        size: Size,
+        fit: crate::domain::Fit,
+    ) -> anyhow::Result<Self> {
+        // SAFETY: memfd_create returns a new descriptor owned by this frame.
+        let fd = unsafe {
+            libc::memfd_create(
+                c"wallpaper-frame".as_ptr(),
+                libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        file.set_len(size.bytes() as u64)?;
+        // SAFETY: the private file has the required length and has no other users.
+        let mut canvas = unsafe { memmap2::MmapMut::map_mut(&file)? };
+        pixels::render(image, size, fit, &mut canvas)?;
+        drop(canvas);
+        // wl_shm compositors may map client buffers with PROT_WRITE even though
+        // they only read the pixels. Seal the extent, and keep pixels immutable
+        // by ownership; F_SEAL_WRITE would reject those compositor mappings.
+        let seals = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+        // SAFETY: no writable mapping survives in the producer.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok(Self { size, file })
+    }
+
+    pub fn image(&self) -> anyhow::Result<image::RgbaImage> {
+        // SAFETY: the sealed extent cannot be truncated, and neither the producer
+        // nor the compositor writes these published pixels. The mapping is transient.
+        let pixels = unsafe { memmap2::Mmap::map(&self.file)? };
+        let mut image = image::RgbaImage::new(self.size.width, self.size.height);
+        for (source, target) in pixels.as_chunks::<4>().0.iter().zip(image.pixels_mut()) {
+            let rgb = u32::from_ne_bytes(*source);
+            target.0 = [(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8, 255];
+        }
+        Ok(image)
+    }
 }
 
 struct Job {
     generation: u64,
-    selection: Selection,
+    source: Source,
     size: Size,
     texture: bool,
 }
+enum Source {
+    Asset(Selection),
+    Pixels(image::RgbaImage),
+}
 struct Mailbox {
-    job: Mutex<Option<Job>>,
+    work: Mutex<Work>,
     ready: Condvar,
     latest: AtomicU64,
+}
+
+#[derive(Default)]
+struct Work {
+    job: Option<Job>,
+    reclaim: bool,
 }
 
 pub struct Decoded {
@@ -51,13 +108,13 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    pub fn new(shm: wl_shm::WlShm) -> io::Result<Self> {
+    pub fn new() -> io::Result<Self> {
         configure_scratch();
         let (wake, mut writer) = UnixStream::pair()?;
         wake.set_nonblocking(true)?;
         writer.set_nonblocking(true)?;
         let mailbox = Arc::new(Mailbox {
-            job: Mutex::new(None),
+            work: Mutex::new(Work::default()),
             ready: Condvar::new(),
             latest: AtomicU64::new(0),
         });
@@ -66,20 +123,31 @@ impl Decoder {
         thread::Builder::new()
             .name("wallpaper-decode".into())
             .spawn(move || {
-                let shm = SimpleGlobal::<_, 1>::from_bound(shm);
                 loop {
-                    let job = {
-                        let mut slot = work.job.lock();
-                        while slot.is_none() {
-                            work.ready.wait(&mut slot);
+                    let (job, reclaim) = {
+                        let mut pending = work.work.lock();
+                        while pending.job.is_none() && !pending.reclaim {
+                            work.ready.wait(&mut pending);
                         }
-                        slot.take().unwrap()
+                        let job = pending.job.take();
+                        let reclaim = std::mem::take(&mut pending.reclaim);
+                        (job, reclaim)
+                    };
+                    let Some(job) = job else {
+                        release_scratch();
+                        continue;
                     };
                     let is_current = || work.latest.load(Ordering::Acquire) == job.generation;
                     if !is_current() {
+                        if reclaim {
+                            release_scratch();
+                        }
                         continue;
                     }
-                    let image = pixels::decode(&job.selection);
+                    let (image, fit) = match job.source {
+                        Source::Asset(selection) => (pixels::decode(&selection), selection.fit),
+                        Source::Pixels(image) => (Ok(image), crate::domain::Fit::Stretch),
+                    };
                     if !is_current() {
                         drop(image);
                         release_scratch();
@@ -88,28 +156,10 @@ impl Decoder {
                     let frame = image.and_then(|image| {
                         if job.texture {
                             let mut target = image::RgbaImage::new(job.size.width, job.size.height);
-                            pixels::render_rgba(
-                                image,
-                                job.size,
-                                job.selection.fit,
-                                target.as_mut(),
-                            )?;
+                            pixels::render_rgba(image, job.size, fit, target.as_mut())?;
                             return Ok(Frame::Image(target));
                         }
-                        let mut pool = SlotPool::new(job.size.bytes(), &shm)?;
-                        let (buffer, canvas) = pool.create_buffer(
-                            job.size.width as i32,
-                            job.size.height as i32,
-                            (job.size.width * 4) as i32,
-                            wl_shm::Format::Xrgb8888,
-                        )?;
-                        pixels::render(image, job.size, job.selection.fit, canvas)?;
-                        // The compositor keeps the storage behind the buffer. The worker
-                        // does not need a CPU mapping after rendering, even before attach.
-                        Ok(Frame::Shm {
-                            size: job.size,
-                            buffer,
-                        })
+                        ShmFrame::render(image, job.size, fit).map(Frame::Shm)
                     });
                     release_scratch();
                     if !is_current() {
@@ -140,17 +190,39 @@ impl Decoder {
 
     pub fn cancel(&self, generation: u64) {
         self.mailbox.latest.store(generation, Ordering::Release);
-        self.mailbox.job.lock().take();
+        self.mailbox.work.lock().job.take();
     }
 
     pub fn submit(&self, generation: u64, selection: Selection, size: Size, texture: bool) {
         self.mailbox.latest.store(generation, Ordering::Release);
-        *self.mailbox.job.lock() = Some(Job {
+        self.mailbox.work.lock().job = Some(Job {
             generation,
-            selection,
+            source: Source::Asset(selection),
             size,
             texture,
         });
+        self.mailbox.ready.notify_one();
+    }
+
+    pub fn submit_image(&self, generation: u64, image: image::RgbaImage) {
+        self.mailbox.latest.store(generation, Ordering::Release);
+        let size = Size {
+            width: image.width(),
+            height: image.height(),
+        };
+        self.mailbox.work.lock().job = Some(Job {
+            generation,
+            source: Source::Pixels(image),
+            size,
+            texture: false,
+        });
+        self.mailbox.ready.notify_one();
+    }
+
+    pub fn reclaim(&self) {
+        let mut work = self.mailbox.work.lock();
+        work.reclaim = true;
+        drop(work);
         self.mailbox.ready.notify_one();
     }
 
@@ -187,5 +259,37 @@ fn configure_scratch() {
     // SAFETY: mallopt changes allocator policy; it does not invalidate live allocations.
     unsafe {
         libc::mallopt(libc::M_MMAP_THRESHOLD, 128 * 1024);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::FileExt;
+
+    #[test]
+    fn static_frame_keeps_its_extent_and_exact_displayed_pixels() {
+        let image =
+            image::RgbaImage::from_fn(13, 7, |x, y| image::Rgba([x as u8, y as u8, 193, 255]));
+        let frame = ShmFrame::render(
+            image.clone(),
+            Size::new(13, 7).unwrap(),
+            crate::domain::Fit::Stretch,
+        )
+        .unwrap();
+        assert_eq!(frame.image().unwrap(), image);
+        assert!(
+            frame
+                .file
+                .write_at(&[0; 4], frame.size.bytes() as u64)
+                .is_err()
+        );
+        assert!(frame.file.set_len(0).is_err());
+        let second = ShmFrame {
+            size: frame.size,
+            file: frame.file.try_clone().unwrap(),
+        };
+        drop(frame);
+        assert_eq!(second.image().unwrap(), image);
     }
 }

@@ -3,15 +3,22 @@
 pub use artwork::Artwork;
 
 use anyhow::{Context, Result};
+use futures_lite::{
+    StreamExt,
+    future::{self, block_on},
+    stream,
+};
 use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     io::{self, Read, Write},
     os::unix::net::UnixStream,
+    pin::Pin,
     sync::Arc,
+    task::{Context as TaskContext, Poll, Waker},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use zbus::{
     MatchRule,
@@ -124,6 +131,23 @@ struct Bridge {
 }
 
 impl Bridge {
+    fn deactivate(&mut self) -> bool {
+        let before = self.snapshot.clone();
+        self.generation += 1;
+        self.pending_artwork = None;
+        self.key = None;
+        self.snapshot = Snapshot {
+            enabled: true,
+            revision: before.revision,
+            ..Snapshot::default()
+        };
+        let changed = before != self.snapshot;
+        if changed {
+            self.snapshot.revision += 1;
+        }
+        changed
+    }
+
     fn update(
         &mut self,
         available: bool,
@@ -218,9 +242,18 @@ impl Bridge {
     }
 }
 
+#[derive(Default)]
+struct Control {
+    active: bool,
+    generation: u64,
+    cancel: Option<Waker>,
+}
+
 struct Shared {
     bridge: Mutex<Bridge>,
-    ready: Condvar,
+    artwork_ready: Condvar,
+    control: Mutex<Control>,
+    control_ready: Condvar,
     writer: Mutex<UnixStream>,
 }
 
@@ -228,12 +261,99 @@ impl Shared {
     fn notify(&self) {
         let _ = self.writer.lock().write_all(&[1]);
     }
-    fn publish(&self, available: bool, player: Option<(&str, &Candidate)>, error: Option<String>) {
-        if self.bridge.lock().update(available, player, error) {
+    fn publish(
+        &self,
+        generation: u64,
+        available: bool,
+        player: Option<(&str, &Candidate)>,
+        error: Option<String>,
+    ) -> bool {
+        let control = self.control.lock();
+        if !control.active || control.generation != generation {
+            return false;
+        }
+        let mut bridge = self.bridge.lock();
+        let changed = bridge.update(available, player, error);
+        let artwork_pending = bridge.pending_artwork.is_some();
+        drop(bridge);
+        if changed {
             self.notify();
         }
-        self.ready.notify_one();
+        if artwork_pending {
+            self.artwork_ready.notify_one();
+        }
+        true
     }
+
+    fn set_active(&self, active: bool) {
+        let cancel = {
+            let mut control = self.control.lock();
+            if control.active == active {
+                return;
+            }
+            control.active = active;
+            control.generation = control.generation.wrapping_add(1);
+            control.cancel.take()
+        };
+        if !active && self.bridge.lock().deactivate() {
+            self.notify();
+        }
+        if let Some(cancel) = cancel {
+            cancel.wake();
+        }
+        self.control_ready.notify_one();
+    }
+
+    fn wait_active(&self) -> u64 {
+        let mut control = self.control.lock();
+        while !control.active {
+            self.control_ready.wait(&mut control);
+        }
+        control.generation
+    }
+
+    fn active(&self, generation: u64) -> bool {
+        let control = self.control.lock();
+        control.active && control.generation == generation
+    }
+
+    fn wait_retry(&self, generation: u64) {
+        let mut control = self.control.lock();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while control.active && control.generation == generation {
+            if self
+                .control_ready
+                .wait_until(&mut control, deadline)
+                .timed_out()
+            {
+                break;
+            }
+        }
+    }
+}
+
+struct Cancelled<'a> {
+    shared: &'a Shared,
+    generation: u64,
+}
+
+impl std::future::Future for Cancelled<'_> {
+    type Output = WatchNext;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        let mut control = self.shared.control.lock();
+        if !control.active || control.generation != self.generation {
+            Poll::Ready(WatchNext::Cancelled)
+        } else {
+            control.cancel = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+enum WatchNext {
+    Message(Option<zbus::Result<zbus::Message>>),
+    Cancelled,
 }
 
 pub struct Monitor {
@@ -247,8 +367,16 @@ impl Monitor {
         wake.set_nonblocking(true)?;
         writer.set_nonblocking(true)?;
         let shared = Arc::new(Shared {
-            bridge: Mutex::new(Bridge::default()),
-            ready: Condvar::new(),
+            bridge: Mutex::new(Bridge {
+                snapshot: Snapshot {
+                    enabled: true,
+                    ..Snapshot::default()
+                },
+                ..Bridge::default()
+            }),
+            artwork_ready: Condvar::new(),
+            control: Mutex::new(Control::default()),
+            control_ready: Condvar::new(),
             writer: Mutex::new(writer),
         });
         let covers = shared.clone();
@@ -259,7 +387,7 @@ impl Monitor {
                     let (generation, uri) = {
                         let mut bridge = covers.bridge.lock();
                         while bridge.pending_artwork.is_none() {
-                            covers.ready.wait(&mut bridge);
+                            covers.artwork_ready.wait(&mut bridge);
                         }
                         bridge.pending_artwork.take().unwrap()
                     };
@@ -274,14 +402,18 @@ impl Monitor {
             .name("wallpaper-mpris".into())
             .spawn(move || {
                 loop {
-                    events.publish(false, None, None);
-                    if let Err(error) = watch(&events) {
-                        events.publish(false, None, Some(format!("MPRIS: {error:#}")));
+                    let generation = events.wait_active();
+                    if let Err(error) = watch(&events, generation) {
+                        events.publish(generation, false, None, Some(format!("MPRIS: {error:#}")));
                     }
-                    thread::sleep(Duration::from_secs(5));
+                    events.wait_retry(generation);
                 }
             })?;
         Ok(Self { wake, shared })
+    }
+
+    pub fn set_active(&self, active: bool) {
+        self.shared.set_active(active);
     }
 
     pub fn receive(&mut self) -> io::Result<Snapshot> {
@@ -299,30 +431,58 @@ impl Monitor {
     }
 }
 
-fn watch(shared: &Shared) -> Result<()> {
+fn watch(shared: &Shared, generation: u64) -> Result<()> {
     let conn = Builder::session()?
         .method_timeout(Duration::from_secs(1))
         .build()?;
+    if !shared.active(generation) {
+        return Ok(());
+    }
     let dbus = Proxy::new(
         &conn,
         "org.freedesktop.DBus",
         "/org/freedesktop/DBus",
         "org.freedesktop.DBus",
     )?;
-    // Subscribe before discovery. A single signal stream includes owner and property changes.
-    let messages = MessageIterator::for_match_rule(
-        MatchRule::builder().msg_type(Type::Signal).build(),
-        &conn,
-        Some(256),
-    )?;
+    // Subscribe before discovery so a player cannot appear between the two steps.
+    // Keep separate filtered streams: activating the connection-wide iterator
+    // would also queue every synchronous discovery reply and can stall zbus's
+    // socket reader when its bounded broadcast channel fills.
+    let [owners, properties, seeked] = mpris_match_rules()?;
+    let owners = MessageIterator::for_match_rule(owners, &conn, Some(64))?.into_inner();
+    if !shared.active(generation) {
+        return Ok(());
+    }
+    let properties = MessageIterator::for_match_rule(properties, &conn, Some(64))?.into_inner();
+    if !shared.active(generation) {
+        return Ok(());
+    }
+    let seeked = MessageIterator::for_match_rule(seeked, &conn, Some(64))?.into_inner();
+    let mut messages = Box::pin(stream::race(stream::race(owners, properties), seeked));
+    if !shared.active(generation) {
+        return Ok(());
+    }
     let mut players = Players::default();
     let names: Vec<String> = dbus.call("ListNames", &())?;
     for name in names.into_iter().filter(|name| name.starts_with(PREFIX)) {
+        if !shared.active(generation) {
+            return Ok(());
+        }
         refresh_name(&conn, &dbus, &mut players, &name);
     }
-    shared.publish(true, players.choose(), None);
-    for message in messages {
-        let message = message?;
+    if !shared.publish(generation, true, players.choose(), None) {
+        return Ok(());
+    }
+    loop {
+        let next = async { WatchNext::Message(messages.next().await) };
+        let message = match block_on(future::or(Cancelled { shared, generation }, next)) {
+            WatchNext::Message(Some(message)) => message?,
+            WatchNext::Message(None) => anyhow::bail!("session bus disconnected"),
+            WatchNext::Cancelled => return Ok(()),
+        };
+        if !shared.active(generation) {
+            return Ok(());
+        }
         let header = message.header();
         let interface = header.interface().map(|v| v.as_str()).unwrap_or("");
         let member = header.member().map(|v| v.as_str()).unwrap_or("");
@@ -394,9 +554,35 @@ fn watch(shared: &Shared) -> Result<()> {
         } else {
             continue;
         }
-        shared.publish(true, players.choose(), None);
+        if !shared.publish(generation, true, players.choose(), None) {
+            return Ok(());
+        }
     }
-    anyhow::bail!("session bus disconnected")
+}
+
+fn mpris_match_rules() -> zbus::Result<[MatchRule<'static>; 3]> {
+    Ok([
+        MatchRule::builder()
+            .msg_type(Type::Signal)
+            .sender("org.freedesktop.DBus")?
+            .interface("org.freedesktop.DBus")?
+            .member("NameOwnerChanged")?
+            .arg0ns("org.mpris.MediaPlayer2")?
+            .build(),
+        MatchRule::builder()
+            .msg_type(Type::Signal)
+            .interface("org.freedesktop.DBus.Properties")?
+            .member("PropertiesChanged")?
+            .path(PATH)?
+            .arg(0, PLAYER)?
+            .build(),
+        MatchRule::builder()
+            .msg_type(Type::Signal)
+            .interface(PLAYER)?
+            .member("Seeked")?
+            .path(PATH)?
+            .build(),
+    ])
 }
 
 fn refresh_name(conn: &Connection, dbus: &Proxy<'_>, players: &mut Players, name: &str) {
@@ -663,6 +849,143 @@ mod artwork {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mpris_bus_rules_filter_on_a_private_session_bus() {
+        let status = std::process::Command::new("timeout")
+            .args(["10s", "dbus-run-session", "--"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "media::tests::mpris_bus_rules_private_bus_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "private D-Bus test failed: {status}");
+    }
+
+    #[test]
+    #[ignore = "runs only as the child of the private D-Bus test"]
+    fn mpris_bus_rules_private_bus_child() {
+        use std::os::fd::AsRawFd;
+
+        let listener = Connection::session().unwrap();
+        let [owners, properties, seeked] = mpris_match_rules().unwrap();
+        let owners = MessageIterator::for_match_rule(owners, &listener, Some(8))
+            .unwrap()
+            .into_inner();
+        let properties = MessageIterator::for_match_rule(properties, &listener, Some(8))
+            .unwrap()
+            .into_inner();
+        let seeked = MessageIterator::for_match_rule(seeked, &listener, Some(8))
+            .unwrap()
+            .into_inner();
+        let mut messages = Box::pin(stream::race(stream::race(owners, properties), seeked));
+
+        let emitter = Connection::session().unwrap();
+        emitter
+            .emit_signal(None::<&str>, PATH, "org.example.Unrelated", "Changed", &())
+            .unwrap();
+        emitter
+            .request_name("org.mpris.MediaPlayer2.WallpaperdTest")
+            .unwrap();
+        emitter
+            .emit_signal(
+                None::<&str>,
+                PATH,
+                "org.freedesktop.DBus.Properties",
+                "PropertiesChanged",
+                &(
+                    PLAYER,
+                    BTreeMap::<String, OwnedValue>::new(),
+                    Vec::<String>::new(),
+                ),
+            )
+            .unwrap();
+        emitter
+            .emit_signal(None::<&str>, PATH, PLAYER, "Seeked", &(123_i64,))
+            .unwrap();
+
+        let mut received = std::collections::BTreeSet::new();
+        for _ in 0..3 {
+            let message = block_on(messages.next()).unwrap().unwrap();
+            let header = message.header();
+            let interface = header.interface().unwrap().as_str();
+            let member = header.member().unwrap().as_str();
+            assert_ne!(interface, "org.example.Unrelated");
+            received.insert((interface.to_owned(), member.to_owned()));
+        }
+        assert_eq!(
+            received,
+            [
+                (
+                    "org.freedesktop.DBus".to_owned(),
+                    "NameOwnerChanged".to_owned()
+                ),
+                (
+                    "org.freedesktop.DBus.Properties".to_owned(),
+                    "PropertiesChanged".to_owned()
+                ),
+                (PLAYER.to_owned(), "Seeked".to_owned()),
+            ]
+            .into()
+        );
+
+        let unique_names = || {
+            let dbus = Proxy::new(
+                &listener,
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+            )
+            .unwrap();
+            dbus.call::<_, _, Vec<String>>("ListNames", &())
+                .unwrap()
+                .into_iter()
+                .filter(|name| name.starts_with(':'))
+                .count()
+        };
+        let baseline = unique_names();
+        let mut monitor = Monitor::start().unwrap();
+        assert_eq!(
+            unique_names(),
+            baseline,
+            "inactive monitor connected to D-Bus"
+        );
+
+        let receive = |monitor: &mut Monitor| {
+            let mut fd = libc::pollfd {
+                fd: monitor.wake.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(unsafe { libc::poll(&mut fd, 1, 2_000) }, 1);
+            monitor.receive().unwrap()
+        };
+        monitor.set_active(true);
+        assert!(receive(&mut monitor).available);
+        assert_eq!(unique_names(), baseline + 1);
+
+        monitor.set_active(false);
+        assert!(!receive(&mut monitor).available);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while unique_names() != baseline && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            unique_names(),
+            baseline,
+            "inactive monitor kept its D-Bus connection"
+        );
+
+        monitor.set_active(true);
+        assert!(
+            receive(&mut monitor).available,
+            "reactivation did not rediscover the bus"
+        );
+    }
 
     #[test]
     fn playing_selection_is_sticky_and_falls_back_on_pause_or_exit() {
