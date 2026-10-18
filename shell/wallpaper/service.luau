@@ -71,44 +71,17 @@ end
 local function syncBackgrounds()
     if not data.connected or noctalia.getConfig("sync_backgrounds") == false then return end
     for name, view in pairs(data.snapshot.outputs) do
-        if not view.current or view.renderer ~= "running" then
+        local background = data.backgrounds[name] or {}
+        data.backgrounds[name] = background
+        background.error = view.background_error and view.background_error.message or nil
+        local frame = view.background
+        if not view.current then
             data.backgrounds[name] = nil
-        elseif view.revision and not view.pending then
-            local background = data.backgrounds[name] or {}
-            data.backgrounds[name] = background
-            if background.desiredRevision ~= view.revision then
-                background.desiredRevision = view.revision
-                -- ponytail: native WE accepts properties before rendering them.
-                -- Let an existing wallpaper settle for five seconds; replace
-                -- this delay when the engine exposes a property/frame revision.
-                background.readyAt = background.current == view.current and noctalia.nowMs() + 5000 or 0
-            end
-            if not background.busy and background.revision ~= view.revision
-                and noctalia.nowMs() >= background.readyAt then
-                local output, revision, current = name, view.revision, view.current
-                background.busy = true
-                local accepted = noctalia.runAsync({ "wallpaperd", "snapshot", "--output", output,
-                    "--revision", tostring(revision) }, function(result)
-                    -- Reconnects and hotplug discard requests from the previous context.
-                    if data.backgrounds[output] ~= background then return end
-                    background.busy = false
-                    local latest = data.snapshot.outputs[output]
-                    if not data.connected or not latest or latest.current ~= current
-                        or latest.revision ~= revision or latest.pending then return end
-                    local reply = decode(result.stdout)
-                    background.error = replyError(result, reply)
-                    if not background.error and (type(reply.path) ~= "string"
-                        or reply.output ~= output or reply.revision ~= revision or reply.current ~= current) then
-                        background.error = "背景帧与当前壁纸不一致"
-                    end
-                    if not background.error and noctalia.getConfig("sync_backgrounds") ~= false then
-                        noctalia.setWallpaper(output, reply.path)
-                        background.revision, background.path, background.current = revision, reply.path, current
-                    end
-                    publish()
-                end, 60000)
-                if not accepted then background.busy = false; background.error = "无法抽取壁纸背景"; publish() end
-            end
+        elseif not view.pending and frame and frame.current == view.current
+            and frame.revision == view.revision and type(frame.path) == "string"
+            and (background.revision ~= frame.revision or background.path ~= frame.path) then
+            noctalia.setWallpaper(name, frame.path)
+            background.revision, background.path = frame.revision, frame.path
         end
     end
 end

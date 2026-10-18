@@ -28,6 +28,8 @@ struct OutputView {
     current: Option<String>,
     fit: Option<Fit>,
     revision: u64,
+    background: Option<Background>,
+    background_error: Option<Error>,
     pending: Option<String>,
     #[serde(flatten)]
     playback: Playback,
@@ -47,6 +49,13 @@ struct OutputView {
     recovery_attempts: u32,
     properties: Values,
     property_warnings: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Serialize)]
+struct Background {
+    current: String,
+    revision: u64,
+    path: std::path::PathBuf,
 }
 
 struct Pending {
@@ -96,6 +105,10 @@ struct Output {
     property_control: Option<PropertyControl>,
     selection_id: u64,
     snapshot_control: Option<SnapshotControl>,
+    background: Option<Background>,
+    background_error: Option<Error>,
+    background_attempt: Option<u64>,
+    background_due: Option<Instant>,
     runtime: WorkerRuntime,
     fullscreen: bool,
     battery: bool,
@@ -106,7 +119,7 @@ struct Output {
 
 struct SnapshotControl {
     id: u64,
-    client: u64,
+    clients: Vec<u64>,
     revision: u64,
     deadline: Instant,
 }
@@ -189,6 +202,18 @@ impl Recovery {
 }
 
 impl Output {
+    fn background_deadline(&self) -> Option<Instant> {
+        (self.current.is_some()
+            && self.worker.is_some()
+            && self.runtime.committed
+            && !self.runtime.failed
+            && self.pending.is_none()
+            && self.property_control.is_none()
+            && self.snapshot_control.is_none())
+        .then_some(self.background_due)
+        .flatten()
+    }
+
     fn new(saved: &SavedOutput, defaults: Playback) -> Self {
         Self {
             current: None,
@@ -208,6 +233,10 @@ impl Output {
             property_control: None,
             selection_id: 0,
             snapshot_control: None,
+            background: None,
+            background_error: None,
+            background_attempt: None,
+            background_due: None,
             runtime: WorkerRuntime::default(),
             fullscreen: false,
             battery: false,
@@ -245,6 +274,8 @@ impl Output {
                 .filter(|s| self.current.as_deref() == Some(&s.asset_id))
                 .map(|s| s.fit),
             revision: self.revision,
+            background: self.background.clone(),
+            background_error: self.background_error.clone(),
             pending: self
                 .pending
                 .as_ref()
@@ -770,10 +801,12 @@ impl Session {
             self.rotations.remove(&name);
             if let Some(output) = self.outputs.remove(&name) {
                 if let Some(control) = output.snapshot_control {
-                    self.server.reply(
-                        control.client,
-                        &fail(Error::new("output_missing", "output disconnected")),
-                    );
+                    for client in control.clients {
+                        self.server.reply(
+                            client,
+                            &fail(Error::new("output_missing", "output disconnected")),
+                        );
+                    }
                 }
                 for group in output
                     .pending
@@ -1054,7 +1087,7 @@ impl Session {
             }
             "get_properties" => self.get_properties(client, &request.params)?,
             "set_properties" => self.set_properties(client, &request.params)?,
-            "get_snapshot" => self.get_snapshot(client, &request.params)?,
+            "get_snapshot" => self.get_snapshot(Some(client), &request.params)?,
             "apply" => {
                 let transition = serde_json::from_value(
                     request
@@ -1191,16 +1224,13 @@ impl Session {
         Ok(())
     }
 
-    fn get_snapshot(&mut self, client: u64, params: &Value) -> Result<(), Error> {
+    fn get_snapshot(&mut self, client: Option<u64>, params: &Value) -> Result<(), Error> {
         let outputs = self.targets(params)?;
         if outputs.len() != 1 {
             return Err(Error::new("bad_request", "snapshot requires one output"));
         }
         let entry = self.outputs.get_mut(&outputs[0]).unwrap();
-        if entry.pending.is_some()
-            || entry.property_control.is_some()
-            || entry.snapshot_control.is_some()
-        {
+        if entry.pending.is_some() || entry.property_control.is_some() {
             return Err(Error::new("busy", "output is processing another operation"));
         }
         if let Some(revision) = params.get("revision").filter(|v| !v.is_null()) {
@@ -1210,6 +1240,13 @@ impl Session {
             if revision != entry.revision {
                 return Err(Error::new("stale_selection", "wallpaper revision changed"));
             }
+        }
+        if let Some(control) = &mut entry.snapshot_control {
+            if control.revision != entry.revision {
+                return Err(Error::new("busy", "output is exporting an older frame"));
+            }
+            control.clients.extend(client);
+            return Ok(());
         }
         let worker = entry
             .worker
@@ -1221,7 +1258,7 @@ impl Session {
         worker.snapshot(id, entry.selection_id);
         entry.snapshot_control = Some(SnapshotControl {
             id,
-            client,
+            clients: client.into_iter().collect(),
             revision: entry.revision,
             deadline: Instant::now() + Duration::from_secs(10),
         });
@@ -1914,17 +1951,31 @@ impl Session {
                 || entry.pending.is_some()
                 || entry.property_control.is_some()
             {
+                entry.background_attempt = None;
                 fail(Error::new("stale_selection", "wallpaper revision changed"))
             } else if reply.ok
                 && let Some(path) = reply.snapshot
             {
+                entry.background = Some(Background {
+                    current: entry.current.clone().unwrap(),
+                    revision: control.revision,
+                    path: path.clone(),
+                });
+                entry.background_error = None;
+                entry.background_attempt = Some(control.revision);
+                entry.background_due = None;
                 json!({"ok":true,"output":name,"current":entry.current,"revision":control.revision,"path":path})
             } else {
-                fail(reply.error.unwrap_or_else(|| {
+                let error = reply.error.unwrap_or_else(|| {
                     Error::new("snapshot_failed", "worker did not export a frame")
-                }))
+                });
+                entry.background_error = Some(error.clone());
+                fail(error)
             };
-            self.server.reply(control.client, &value);
+            for client in control.clients {
+                self.server.reply(client, &value);
+            }
+            self.dirty = true;
             return;
         }
         if reply.id == 0 {
@@ -2072,6 +2123,14 @@ impl Session {
             saved.released = pending.selection.is_none();
             saved.selection = pending.selection;
             if saved.released {
+                if let Some(control) = entry.snapshot_control.take() {
+                    for client in control.clients {
+                        self.server.reply(
+                            client,
+                            &fail(Error::new("asset_unavailable", "wallpaper was released")),
+                        );
+                    }
+                }
                 released_control = entry.control.take();
                 entry.worker = None;
                 entry.frozen = None;
@@ -2135,7 +2194,9 @@ impl Session {
         let error = Error::new("renderer_failed", message);
         entry.error = Some(error.clone());
         if let Some(control) = entry.snapshot_control.take() {
-            self.server.reply(control.client, &fail(error.clone()));
+            for client in control.clients {
+                self.server.reply(client, &fail(error.clone()));
+            }
         }
         let pending = entry.pending.take();
         let control = entry.control.take();
@@ -2230,8 +2291,50 @@ impl Session {
         }
     }
 
+    fn sync_backgrounds(&mut self) {
+        let now = Instant::now();
+        let mut ready = Vec::new();
+        for (name, output) in &mut self.outputs {
+            if output.current.is_none() {
+                if output.recoverable.is_none() {
+                    output.background = None;
+                    output.background_error = None;
+                    output.background_attempt = None;
+                    output.background_due = None;
+                }
+                continue;
+            }
+            if output.background_attempt != Some(output.revision) {
+                output.background_attempt = Some(output.revision);
+                output.background_error = None;
+                // ponytail: native WE acknowledges properties before painting them.
+                // Retain the existing settling delay until it exposes frame revisions.
+                let delay =
+                    if output.background.as_ref().is_some_and(|background| {
+                        Some(&background.current) == output.current.as_ref()
+                    }) {
+                        Duration::from_secs(5)
+                    } else {
+                        Duration::ZERO
+                    };
+                output.background_due = Some(now + delay);
+            }
+            if output.background_deadline().is_some_and(|due| due <= now) {
+                output.background_due = None;
+                ready.push(name.clone());
+            }
+        }
+        for name in ready {
+            if let Err(error) = self.get_snapshot(None, &json!({"output":name})) {
+                self.outputs.get_mut(&name).unwrap().background_error = Some(error);
+                self.dirty = true;
+            }
+        }
+    }
+
     fn finish_turn(&mut self) {
         self.sync_clocks();
+        self.sync_backgrounds();
         let save_error = if std::mem::take(&mut self.save_needed) {
             self.store
                 .save()
@@ -2425,6 +2528,11 @@ impl Session {
                 _ => None,
             })
             .chain(self.power_due)
+            .chain(
+                self.outputs
+                    .values()
+                    .filter_map(Output::background_deadline),
+            )
             .chain(self.rotations.values().filter_map(|r| r.due))
             .chain(self.outputs.values().filter_map(|o| o.recovery.due))
             .chain(
@@ -2582,6 +2690,121 @@ mod tests {
     }
 
     #[test]
+    fn backgrounds_follow_committed_revisions_and_discard_superseded_frames() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = session(root.path());
+        let mut output = Output::new(&SavedOutput::default(), Playback::default());
+        output.current = Some("local:/first.png".into());
+        output.revision = 1;
+        output.selection_id = 1;
+        output.worker = Some(Renderer::echo());
+        session.next_id = 2;
+        session.outputs.insert("A".into(), output);
+
+        session.sync_backgrounds();
+        assert!(session.outputs["A"].snapshot_control.is_none());
+        session.outputs.get_mut("A").unwrap().runtime.committed = true;
+        session.sync_backgrounds();
+        let first = session.outputs["A"].snapshot_control.as_ref().unwrap().id;
+        session
+            .get_snapshot(Some(7), &json!({"output":"A", "revision":1}))
+            .unwrap();
+        assert_eq!(
+            session.outputs["A"]
+                .snapshot_control
+                .as_ref()
+                .unwrap()
+                .clients,
+            [7]
+        );
+        let frame = |id, path: &str| WorkerReply {
+            id,
+            ok: true,
+            snapshot: Some(path.into()),
+            error: None,
+            runtime: None,
+            progress: None,
+            probe: None,
+        };
+        session.worker_reply("A", frame(first, "/frames/first.png"));
+        assert!(session.dirty);
+        assert_eq!(
+            session.snapshot()["outputs"]["A"]["background"],
+            json!({
+                "current":"local:/first.png", "revision":1, "path":"/frames/first.png"
+            })
+        );
+        session.sync_backgrounds();
+        assert!(session.outputs["A"].snapshot_control.is_none());
+        assert!(session.outputs["A"].background_deadline().is_none());
+
+        let output = session.outputs.get_mut("A").unwrap();
+        output.current = Some("local:/second.png".into());
+        output.revision = 10;
+        output.selection_id = 10;
+        session.sync_backgrounds();
+        let stale = session.outputs["A"].snapshot_control.as_ref().unwrap().id;
+        let output = session.outputs.get_mut("A").unwrap();
+        output.current = Some("local:/latest.png".into());
+        output.revision = 20;
+        output.selection_id = 20;
+        session.worker_reply("A", frame(stale, "/frames/stale.png"));
+        assert_eq!(
+            session.outputs["A"].background.as_ref().unwrap().revision,
+            1
+        );
+        session.sync_backgrounds();
+        let latest = session.outputs["A"].snapshot_control.as_ref().unwrap().id;
+        session.worker_reply("A", frame(latest, "/frames/latest.png"));
+        assert_eq!(
+            session.outputs["A"].background.as_ref().unwrap().revision,
+            20
+        );
+
+        // Changes to the same wallpaper settle without a recurring idle timer.
+        session.outputs.get_mut("A").unwrap().revision = 30;
+        session.sync_backgrounds();
+        assert!(session.outputs["A"].snapshot_control.is_none());
+        assert!(session.outputs["A"].background_deadline().unwrap() > Instant::now());
+        session.outputs.get_mut("A").unwrap().background_due = Some(Instant::now());
+        session.sync_backgrounds();
+        let failed = session.outputs["A"].snapshot_control.as_ref().unwrap().id;
+        let mut reply = frame(failed, "/frames/failed.png");
+        reply.ok = false;
+        reply.error = Some(Error::new("snapshot_failed", "fixture"));
+        session.worker_reply("A", reply);
+        assert_eq!(
+            session.outputs["A"].background.as_ref().unwrap().revision,
+            20
+        );
+        assert!(session.outputs["A"].background_error.is_some());
+        session.sync_backgrounds();
+        assert!(session.outputs["A"].snapshot_control.is_none());
+        session
+            .get_snapshot(Some(7), &json!({"output":"A"}))
+            .unwrap();
+        session
+            .start(
+                None,
+                vec!["A".into()],
+                None,
+                Transition::Cut,
+                &PlaybackPatch::default(),
+                &Values::new(),
+                false,
+            )
+            .unwrap();
+        let release = session.outputs["A"].pending.as_ref().unwrap().id;
+        let mut reply = frame(release, "/frames/unused.png");
+        reply.snapshot = None;
+        session.worker_reply("A", reply);
+        session.sync_backgrounds();
+        assert!(session.snapshot()["outputs"]["A"]["background"].is_null());
+        assert!(session.outputs["A"].snapshot_control.is_none());
+        assert!(session.outputs["A"].background_due.is_none());
+    }
+
+    #[test]
     fn stalled_snapshot_recovers_even_when_the_wallpaper_is_idle() {
         let root = tempfile::tempdir().unwrap();
         let mut session = session(root.path());
@@ -2597,7 +2820,7 @@ mod tests {
         output.worker = Some(Renderer::echo());
         output.snapshot_control = Some(SnapshotControl {
             id: 1,
-            client: 7,
+            clients: vec![7],
             revision: 0,
             deadline: Instant::now(),
         });

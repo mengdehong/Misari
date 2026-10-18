@@ -91,8 +91,12 @@ edge-scroll "top" width=4 output="eDP-1" {
     }
 }
 
-// 组合用法：将 Noctalia 的概览背景放入 Niri 的背景合成层。
+// 桌面和概览直接使用 wallpaperd 的实时壁纸表面。
+layout {
+    background-color "transparent"
+}
+
 layer-rule {
-    match namespace="^noctalia-backdrop$"
+    match namespace="^wallpaperd$"
     place-within-backdrop true
 }

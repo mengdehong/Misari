@@ -111,6 +111,8 @@ input {
 // Find more information on the wiki:
 // https://niri-wm.github.io/niri/Configuration:-Layout
 layout {
+    background-color "transparent"
+
     // Set gaps around windows in logical pixels.
     gaps 16
 
@@ -631,4 +633,10 @@ binds {
     // Powers off the monitors. To turn them back on, do any input like
     // moving the mouse or pressing any other key.
     Mod+Shift+P { power-off-monitors; }
+}
+
+// Reuse wallpaperd's live surface in the overview backdrop.
+layer-rule {
+    match namespace="^wallpaperd$"
+    place-within-backdrop true
 }

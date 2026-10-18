@@ -14,6 +14,24 @@ fn static_shm_snapshot_transition_and_worker_recovery() {
         .unwrap();
     rig.set(&red, "cut", 60);
     rig.wait_corner([255, 0, 0]);
+    let state = rig.wait_state(|state| {
+        let output = &state["outputs"]["winit"];
+        output["background"]["revision"] == output["revision"]
+    });
+    let background = image::open(
+        state["outputs"]["winit"]["background"]["path"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap()
+    .to_rgba8();
+    assert_eq!(background.get_pixel(0, 0).0, [255, 0, 0, 255]);
+    fs::write(rig.root().join("niri.kdl"),
+        "animations { off; }\nhotkey-overlay { skip-at-startup; }\nlayout { background-color \"transparent\"; }\nlayer-rule { match namespace=\"^wallpaperd$\"; place-within-backdrop true; }\n").unwrap();
+    rig.niri_action(&["load-config-file"]);
+    rig.niri_action(&["open-overview"]);
+    rig.wait_corner([255, 0, 0]);
+    rig.niri_action(&["close-overview"]);
     let before = rig.frames();
     thread::sleep(Duration::from_millis(300));
     assert_eq!(
@@ -29,6 +47,18 @@ fn static_shm_snapshot_transition_and_worker_recovery() {
     assert_eq!(pixels.get_pixel(0, 0).0, [255, 0, 0, 255]);
     rig.set(&blue, "fade", 60);
     rig.wait_corner([0, 0, 255]);
+    let state = rig.wait_state(|state| {
+        let output = &state["outputs"]["winit"];
+        output["background"]["revision"] == output["revision"]
+    });
+    let background = image::open(
+        state["outputs"]["winit"]["background"]["path"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap()
+    .to_rgba8();
+    assert_eq!(background.get_pixel(0, 0).0, [0, 0, 255, 255]);
     thread::sleep(Duration::from_millis(300));
     let before = rig.frames();
     thread::sleep(Duration::from_millis(300));
@@ -67,6 +97,11 @@ fn static_shm_snapshot_transition_and_worker_recovery() {
     });
     rig.wait_corner([0, 0, 255]);
     assert_eq!(rig.daemon.as_ref().unwrap().id(), daemon);
+    rig.ok(&["release"]);
+    rig.wait_state(|state| {
+        state["outputs"]["winit"]["current"].is_null()
+            && state["outputs"]["winit"]["background"].is_null()
+    });
 }
 
 #[test]

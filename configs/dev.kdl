@@ -1,8 +1,12 @@
 include "~/.config/niri/binds.kdl"
 
-// Place Noctalia's overview background within niri's backdrop.
+// Reuse wallpaperd's live surface in the overview backdrop.
+layout {
+    background-color "transparent"
+}
+
 layer-rule {
-    match namespace="^noctalia-backdrop$"
+    match namespace="^wallpaperd$"
     place-within-backdrop true
 }
 

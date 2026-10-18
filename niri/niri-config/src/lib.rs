@@ -2564,9 +2564,10 @@ mod tests {
         let mut default_config = Config::load_default();
         let empty_config = Config::parse_mem("").unwrap();
 
-        // Some notable omissions: the default config has some window rules, and an empty config
+        // Some notable omissions: the default config has window and layer rules, and an empty config
         // will not have any binds. Clear them out so they don't spam the diff.
         default_config.window_rules.clear();
+        default_config.layer_rules.clear();
         default_config.binds.0.clear();
 
         assert_snapshot!(
@@ -2598,6 +2599,15 @@ mod tests {
 
         -                0.6666666666666666,
         +                0.66667,
+
+        -            r: 0.25,
+        -            g: 0.25,
+        -            b: 0.25,
+        -            a: 1.0,
+        +            r: 0.0,
+        +            g: 0.0,
+        +            b: 0.0,
+        +            a: 0.0,
         "#,
         );
     }
