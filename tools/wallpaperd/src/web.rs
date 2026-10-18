@@ -10,7 +10,7 @@ mod enabled {
     //! CEF browser integration; browser execution is provided by the we-web library.
     use crate::{
         domain::Playback,
-        graphics::{Gpu, Target},
+        graphics::{DmaBufCache, Gpu, Target},
         pixels::Size,
         properties::Values,
     };
@@ -56,6 +56,7 @@ mod enabled {
     pub struct Web {
         browser: we_web::Renderer,
         pending_gpu: Option<frames::Frame>,
+        imports: DmaBufCache,
         accelerated: bool,
         gpu_seen: bool,
         started: Instant,
@@ -129,6 +130,7 @@ mod enabled {
             let web = Self {
                 browser,
                 pending_gpu: None,
+                imports: DmaBufCache::default(),
                 accelerated: platform.is_some(),
                 gpu_seen: false,
                 started: Instant::now(),
@@ -270,6 +272,7 @@ mod enabled {
                 self.state["size"] = size.clone();
                 self.dirty = true;
                 self.source = None;
+                self.imports.clear();
                 self.sequence = 0;
                 self.browser.send(json!({"size":size}), false)?;
             }
@@ -297,6 +300,7 @@ mod enabled {
                 let sequence = frame.info.sequence;
                 let result = if visible[2] == self.size.width && visible[3] == self.size.height {
                     gpu.copy_dma_buf(
+                        &mut self.imports,
                         self.source.as_ref().unwrap(),
                         &frame,
                         frame_damage(self.sequence, sequence, self.damage, self.size),

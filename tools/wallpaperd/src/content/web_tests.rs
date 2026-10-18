@@ -515,3 +515,60 @@ fn web_browser_resource_boundary_reload_and_invalid_controls() {
     // the worker or disturbing a valid browser.
     crate::web::tests::invalid_controls_leave_browser_alive(&mut web);
 }
+
+#[test]
+#[ignore = "requires WALLPAPERD_WEB_GPU=1, a Wayland desktop and hardware EGL/GLES 3"]
+fn web_browser_gpu_reuses_imported_pool_buffers() {
+    if std::env::var("WALLPAPERD_WEB_GPU").as_deref() != Ok("1") {
+        return;
+    }
+    let project = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("project.json"),
+        r#"{"type":"web","file":"index.html"}"#,
+    )
+    .unwrap();
+    fs::write(project.path().join("index.html"), r#"<!doctype html><body style="margin:0;overflow:hidden"><canvas id="c" width="128" height="64"></canvas><script>
+    const gl=c.getContext('webgl2');let tick=0;
+    function paint(){gl.clearColor((++tick%200)/255,0,1,1);gl.clear(gl.COLOR_BUFFER_BIT);requestAnimationFrame(paint)}paint();
+    </script>"#).unwrap();
+    let gpu = Gpu::headless(Size::new(128, 64).unwrap()).unwrap();
+    let selection = catalog::resolve(project.path().to_str().unwrap(), Fit::Cover).unwrap();
+    let (wake, _reader) = UnixStream::pair().unwrap();
+    let mut content = Content::load(&gpu, &selection, Playback::default(), &wake).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last = None;
+    let mut frames = 0;
+    while frames < 24 {
+        content.poll().unwrap();
+        content.render(&gpu).unwrap();
+        if content.ready() {
+            let pixel = content.export_frame(&gpu).unwrap().get_pixel(64, 32).0;
+            assert_eq!(
+                &pixel[1..],
+                &[0, 255, 255],
+                "import changed pixel format or origin"
+            );
+            if last != Some(pixel[0]) {
+                last = Some(pixel[0]);
+                frames += 1;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "GPU frames stalled: {}",
+            content.diagnostics()
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
+    let Engine::Web(web) = &content.engine else {
+        panic!("expected Web engine")
+    };
+    assert_eq!(web.transport(), "dmabuf");
+    let imports = gpu.dma_buf_import_count();
+    println!("{frames} changing GPU frames required {imports} EGL imports");
+    assert!(
+        imports <= 4,
+        "CEF pool buffers were re-imported for every frame: {imports} imports for {frames} frames"
+    );
+}

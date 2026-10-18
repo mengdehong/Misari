@@ -211,7 +211,11 @@ fn profile_resources(scene: bool) {
         fps: fps.unwrap_or(30),
         ..Playback::default()
     };
-    let mut content = Content::load(&gpu, &selection, playback, &wake).unwrap();
+    let properties = std::env::var_os("WALLPAPERD_BENCH_PROPERTIES")
+        .map(|path| serde_json::from_slice(&fs::read(path).unwrap()).unwrap())
+        .unwrap_or_default();
+    let mut content =
+        Content::load_with_properties(&gpu, &selection, playback, &wake, &properties).unwrap();
     let direct = std::env::var("WALLPAPERD_BENCH_DIRECT").as_deref() != Ok("false");
     let loading = Instant::now();
     while !content.ready() {
@@ -221,11 +225,19 @@ fn profile_resources(scene: bool) {
             "content did not become ready within the loading budget"
         );
     }
+    let warmup = std::env::var("WALLPAPERD_BENCH_WARMUP")
+        .map(|value| {
+            value
+                .parse::<f64>()
+                .expect("WALLPAPERD_BENCH_WARMUP seconds")
+        })
+        .unwrap_or(if scene { 3.0 } else { 1.0 });
+    assert!(warmup.is_finite() && warmup >= 0.0);
     drive(
         &mut content,
         &gpu,
         direct,
-        Duration::from_secs(if scene { 3 } else { 1 }),
+        Duration::from_secs_f64(warmup),
         fps,
     );
     let before = usage();
@@ -239,12 +251,16 @@ fn profile_resources(scene: bool) {
         json!({
             "asset": selection.asset_id, "direct": direct, "backend":content.backend(), "fps_limit":fps, "frames": frames, "seconds": seconds,
             "fps": frames as f64 / seconds,
+            "resolution": [gpu.size.width, gpu.size.height],
+            "warmup_s": warmup,
             "render_ms_mean":timings.iter().sum::<f64>()/timings.len() as f64,
             "render_ms_p95":timings[(timings.len()*95/100).min(timings.len()-1)],
             "cpu_percent": 100.0 * (after["cpu_seconds"].as_f64().unwrap() - before["cpu_seconds"].as_f64().unwrap()) / seconds,
             "before": before, "after": after,
         })
     );
+    #[cfg(feature = "web")]
+    println!("{}", json!({"dma_buf_imports": gpu.dma_buf_import_count()}));
     if scene {
         content
             .playback(Playback {

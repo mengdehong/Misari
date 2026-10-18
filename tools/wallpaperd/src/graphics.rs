@@ -107,6 +107,8 @@ pub struct Gpu {
     pub size: Size,
     pub native_display: *mut c_void,
     software: bool,
+    #[cfg(all(feature = "web", test))]
+    dma_buf_imports: std::cell::Cell<usize>,
 }
 
 impl Gpu {
@@ -266,6 +268,8 @@ impl Gpu {
                     size,
                     native_display,
                     software,
+                    #[cfg(all(feature = "web", test))]
+                    dma_buf_imports: std::cell::Cell::new(0),
                 })
             }
             Err(error) => {
@@ -563,8 +567,8 @@ pub struct Target {
 }
 
 impl Target {
-    pub fn new(gl: Rc<glow::Context>, size: Size) -> Result<Self> {
-        // SAFETY: allocation sizes have been bounded by Size; objects use the current context.
+    fn objects(gl: Rc<glow::Context>, size: Size) -> Result<Self> {
+        // SAFETY: both objects belong to the current context.
         unsafe {
             let texture = gl.create_texture().map_err(anyhow::Error::msg)?;
             let fbo = match gl.create_framebuffer() {
@@ -574,13 +578,22 @@ impl Target {
                     bail!(e);
                 }
             };
-            let target = Self {
+            Ok(Self {
                 gl,
                 texture,
                 fbo,
                 size,
-            };
-            target.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            })
+        }
+    }
+
+    pub fn new(gl: Rc<glow::Context>, size: Size) -> Result<Self> {
+        let target = Self::objects(gl, size)?;
+        // SAFETY: allocation sizes have been bounded by Size; objects use the current context.
+        unsafe {
+            target
+                .gl
+                .bind_texture(glow::TEXTURE_2D, Some(target.texture));
             target.gl.tex_parameter_i32(
                 glow::TEXTURE_2D,
                 glow::TEXTURE_MIN_FILTER,
@@ -617,7 +630,7 @@ impl Target {
                 glow::FRAMEBUFFER,
                 glow::COLOR_ATTACHMENT0,
                 glow::TEXTURE_2D,
-                Some(texture),
+                Some(target.texture),
                 0,
             );
             let complete =
@@ -703,13 +716,82 @@ fn image_factor(source: Size, target: Size, fit: Fit) -> (f32, f32) {
 }
 
 #[cfg(feature = "web")]
+pub use dmabuf::DmaBufCache;
+
+#[cfg(feature = "web")]
 mod dmabuf {
     //! Import CEF's borrowed GPU frame and finish copying before its callback returns.
     use super::*;
     use crate::web::frames::{ABGR8888, ARGB8888, Frame};
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, OwnedFd};
+
+    #[derive(Default)]
+    pub struct DmaBufCache {
+        buffers: Vec<(BufferKey, ImportedBuffer)>,
+    }
+
+    impl DmaBufCache {
+        pub fn clear(&mut self) {
+            self.buffers.clear();
+        }
+    }
+
+    #[derive(PartialEq, Eq)]
+    struct BufferKey {
+        size: [u32; 2],
+        format: u32,
+        modifier: u64,
+        plane_count: usize,
+        planes: [(u64, u64, u32, u64); 4],
+    }
+
+    impl BufferKey {
+        fn new(frame: &Frame) -> Result<Self> {
+            let mut planes = [(0, 0, 0, 0); 4];
+            for ((fd, plane), identity) in frame.fds.iter().zip(&frame.info.planes).zip(&mut planes)
+            {
+                let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                // SAFETY: fstat initializes this object on success; the frame owns fd.
+                anyhow::ensure!(
+                    unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } == 0,
+                    "identifying browser DMA-BUF: {}",
+                    std::io::Error::last_os_error()
+                );
+                let stat = unsafe { stat.assume_init() };
+                *identity = (stat.st_dev, stat.st_ino, plane.stride, plane.offset);
+            }
+            Ok(Self {
+                size: frame.info.size,
+                format: frame.info.format,
+                modifier: frame.info.modifier,
+                plane_count: frame.fds.len(),
+                planes,
+            })
+        }
+    }
+
+    struct ImportedBuffer {
+        target: Target,
+        image: egl::Image,
+        api: Rc<egl::DynamicInstance<egl::EGL1_5>>,
+        display: egl::Display,
+        last_sequence: u64,
+        // Keep inode identities alive even if CEF retires its copy of the pool.
+        _fds: Vec<OwnedFd>,
+    }
+
+    impl Drop for ImportedBuffer {
+        fn drop(&mut self) {
+            let _ = self.api.destroy_image(self.display, self.image);
+        }
+    }
 
     impl Gpu {
+        #[cfg(test)]
+        pub fn dma_buf_import_count(&self) -> usize {
+            self.dma_buf_imports.get()
+        }
+
         pub fn dma_buf_supported(&self) -> bool {
             !self.software
                 && self
@@ -728,7 +810,13 @@ mod dmabuf {
                     .is_some()
         }
 
-        pub fn copy_dma_buf(&self, target: &Target, frame: &Frame, damage: [u32; 4]) -> Result<()> {
+        pub fn copy_dma_buf(
+            &self,
+            cache: &mut DmaBufCache,
+            target: &Target,
+            frame: &Frame,
+            damage: [u32; 4],
+        ) -> Result<()> {
             let info = &frame.info;
             let size = Size::new(info.size[0], info.size[1])?;
             let [x, y, width, height] = info.visible;
@@ -758,6 +846,35 @@ mod dmabuf {
                     && frame.fds.len() == info.planes.len(),
                 "invalid DMA-BUF planes"
             );
+            let key = BufferKey::new(frame)?;
+            // Retired capture pools must not retain full-resolution images indefinitely.
+            cache
+                .buffers
+                .retain(|(_, buffer)| info.sequence.saturating_sub(buffer.last_sequence) < 4);
+            let index =
+                if let Some(index) = cache.buffers.iter().position(|(cached, _)| cached == &key) {
+                    index
+                } else {
+                    let buffer = self.import_dma_buf(frame, size)?;
+                    // ponytail: retain at most four capture buffers per browser. Larger
+                    // pools remain correct but re-import; increase only if measured.
+                    if cache.buffers.len() == 4 {
+                        cache.buffers.remove(0);
+                    }
+                    cache.buffers.push((key, buffer));
+                    cache.buffers.len() - 1
+                };
+            cache.buffers[index].1.last_sequence = info.sequence;
+            self.copy_dma_buf_image(
+                target,
+                &cache.buffers[index].1,
+                [x + dx, y + dy, dw, dh],
+                damage,
+            )
+        }
+
+        fn import_dma_buf(&self, frame: &Frame, size: Size) -> Result<ImportedBuffer> {
+            let info = &frame.info;
             let mut attributes = vec![
                 egl::WIDTH as egl::Attrib,
                 size.width as egl::Attrib,
@@ -807,8 +924,16 @@ mod dmabuf {
                 }
             }
             attributes.push(egl::ATTRIB_NONE);
+            let target = Target::objects(self.gl.clone(), size)?;
+            let fds = frame
+                .fds
+                .iter()
+                .map(|fd| fd.try_clone())
+                .collect::<std::io::Result<_>>()?;
             // SAFETY: DMA-BUF import requires EGL_NO_CONTEXT and a null client buffer.
             // The received descriptors remain owned until after the copy has completed.
+            #[cfg(test)]
+            self.dma_buf_imports.set(self.dma_buf_imports.get() + 1);
             let image = unsafe {
                 self.api.create_image(
                     self.display,
@@ -819,18 +944,20 @@ mod dmabuf {
                 )
             }
             .context("importing browser DMA-BUF")?;
-            let result = self.copy_dma_buf_image(target, image, [x + dx, y + dy, dw, dh], damage);
-            let destroyed = self
-                .api
-                .destroy_image(self.display, image)
-                .context("releasing browser EGLImage");
-            result.and(destroyed)
+            Ok(ImportedBuffer {
+                target,
+                image,
+                api: self.api.clone(),
+                display: self.display,
+                last_sequence: info.sequence,
+                _fds: fds,
+            })
         }
 
         fn copy_dma_buf_image(
             &self,
             target: &Target,
-            image: egl::Image,
+            source: &ImportedBuffer,
             [x, y, width, height]: [u32; 4],
             [dx, dy, dw, dh]: [u32; 4],
         ) -> Result<()> {
@@ -843,19 +970,14 @@ mod dmabuf {
                 unsafe { std::mem::transmute(bind_image) };
             // SAFETY: all GL objects below belong to this current worker context.
             unsafe {
-                let texture = self.gl.create_texture().map_err(anyhow::Error::msg)?;
-                let fbo = match self.gl.create_framebuffer() {
-                    Ok(fbo) => fbo,
-                    Err(error) => {
-                        self.gl.delete_texture(texture);
-                        return Err(anyhow::Error::msg(error));
-                    }
-                };
+                let texture = source.target.texture;
+                let fbo = source.target.fbo;
                 let scissor = self.gl.is_enabled(glow::SCISSOR_TEST);
                 let result = (|| -> Result<()> {
                     self.gl.active_texture(glow::TEXTURE0);
                     self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-                    bind_image(glow::TEXTURE_2D, image.as_ptr());
+                    // Rebind even a cached image to acquire the producer's latest contents.
+                    bind_image(glow::TEXTURE_2D, source.image.as_ptr());
                     self.gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(fbo));
                     self.gl.framebuffer_texture_2d(
                         glow::READ_FRAMEBUFFER,
@@ -899,8 +1021,6 @@ mod dmabuf {
                 }
                 self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
                 self.gl.bind_texture(glow::TEXTURE_2D, None);
-                self.gl.delete_framebuffer(fbo);
-                self.gl.delete_texture(texture);
                 result
             }
         }
