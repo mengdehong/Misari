@@ -243,6 +243,9 @@ impl Library {
     }
 
     pub fn members(&self, source: &str) -> Result<Vec<String>, Error> {
+        if matches!(source, "library" | "single") {
+            return Ok(Vec::new());
+        }
         if source == "favorites" {
             return Ok(self.favorites.iter().cloned().collect());
         }
@@ -257,9 +260,13 @@ impl Library {
         source: &str,
         names: &BTreeMap<String, String>,
     ) -> Result<Vec<String>, Error> {
-        let mut members = self.members(source)?;
+        let mut members = if source == "library" {
+            names.keys().cloned().collect()
+        } else {
+            self.members(source)?
+        };
         members.retain(|id| names.contains_key(id) && !self.hidden.contains(id));
-        if source == "favorites" {
+        if matches!(source, "favorites" | "library") {
             members.sort_by_cached_key(|id| {
                 (
                     self.titles
@@ -408,7 +415,7 @@ impl Default for Rotation {
     fn default() -> Self {
         Self {
             enabled: false,
-            source: "favorites".into(),
+            source: "library".into(),
             mode: Mode::Ordered,
             interval_seconds: 300,
             fit: Fit::Cover,
@@ -441,6 +448,9 @@ impl Rotation {
             rule.validate()?;
         }
         if self.enabled {
+            if self.source == "single" {
+                return Err(Error::new("bad_request", "single wallpaper cannot rotate"));
+            }
             library.members(&self.source)?;
         }
         Ok(())
@@ -472,6 +482,45 @@ impl Rotation {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn library_playback_uses_all_visible_assets_in_name_order() {
+        let mut library = Library::default();
+        library.hidden.insert("local:/hidden.jpg".into());
+        library
+            .titles
+            .insert("local:/z.jpg".into(), "A custom title".into());
+        let names = BTreeMap::from([
+            ("local:/b.jpg".into(), "B".into()),
+            ("local:/z.jpg".into(), "Z".into()),
+            ("local:/hidden.jpg".into(), "Hidden".into()),
+        ]);
+        let members = library.available_members("library", &names).unwrap();
+        assert_eq!(members, ["local:/z.jpg", "local:/b.jpg"]);
+        let rotation = Rotation::default();
+        assert!(!rotation.enabled);
+        assert_eq!(
+            rotation.next(&members, Some("local:/b.jpg"), 0),
+            Some("local:/z.jpg")
+        );
+        assert!(
+            Rotation {
+                enabled: true,
+                ..rotation
+            }
+            .validate(&library)
+            .is_ok()
+        );
+        assert!(
+            Rotation {
+                enabled: true,
+                source: "single".into(),
+                ..Default::default()
+            }
+            .validate(&library)
+            .is_err()
+        );
+    }
 
     #[test]
     fn custom_titles_persist_sort_and_restore() {

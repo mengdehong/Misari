@@ -57,6 +57,8 @@ struct Pending {
     deadline: Instant,
     playback: Playback,
     properties: Resolved,
+    rotation: Option<Rotation>,
+    history_cursor: Option<usize>,
 }
 
 struct Control {
@@ -372,8 +374,50 @@ struct Session {
 struct RotationRuntime {
     schedule_active: Option<bool>,
     due: Option<Instant>,
-    previous: Option<String>,
+    remaining: Option<Duration>,
+    history: Vec<String>,
+    cursor: usize,
     error: Option<Error>,
+}
+
+impl RotationRuntime {
+    fn record(&mut self, asset: &str, cursor: Option<usize>) {
+        if let Some(cursor) = cursor.filter(|&i| self.history.get(i).is_some_and(|id| id == asset))
+        {
+            self.cursor = cursor;
+        } else if self.history.get(self.cursor).is_none_or(|id| id != asset) {
+            self.history.truncate(self.cursor + 1);
+            self.history.push(asset.into());
+            if self.history.len() > 256 {
+                self.history.remove(0);
+            }
+            self.cursor = self.history.len() - 1;
+        }
+    }
+
+    fn history_step(&self, members: &[String], previous: bool) -> Option<usize> {
+        if previous {
+            (0..self.cursor)
+                .rev()
+                .find(|&i| members.contains(&self.history[i]))
+        } else {
+            (self.cursor + 1..self.history.len()).find(|&i| members.contains(&self.history[i]))
+        }
+    }
+
+    fn reset_timer(&mut self, settings: &Rotation, paused: bool) {
+        self.due = None;
+        self.remaining = None;
+        self.schedule_active = Some(settings.scheduled_now());
+        if settings.enabled {
+            let interval = Duration::from_secs(settings.interval_seconds);
+            if paused {
+                self.remaining = Some(interval);
+            } else {
+                self.due = Some(Instant::now() + interval);
+            }
+        }
+    }
 }
 
 enum AudioMute {
@@ -416,6 +460,7 @@ pub fn serve() -> Result<()> {
     };
     let catalog_names = catalog::list(&config, &store.library)
         .iter()
+        .filter(|asset| asset.error.is_none())
         .map(|a| (a.id.clone(), a.display_name().to_ascii_lowercase()))
         .collect();
     let mut session = Session {
@@ -699,7 +744,11 @@ impl Session {
             rotations: self.outputs.keys().map(|name| {
                 let settings = self.store.outputs.get(name).map(|o| o.rotation.clone()).unwrap_or_default();
                 let error = self.rotations.get(name).and_then(|r| r.error.as_ref()).or(self.outputs[name].error.as_ref());
-                (name.as_str(), json!({"settings":settings,"error":error}))
+                let members = self.store.library.available_members(&settings.source, &self.catalog_names).unwrap_or_default();
+                let runtime = self.rotations.get(name);
+                let can_previous = settings.mode != crate::library::Mode::Random
+                    || runtime.is_some_and(|r| r.history_step(&members, true).is_some());
+                (name.as_str(), json!({"settings":settings,"members":members,"can_previous":can_previous,"error":error}))
             }).collect(),
             outputs: self
                 .outputs
@@ -853,6 +902,7 @@ impl Session {
                 let assets = catalog::list(&self.config, &self.store.library);
                 self.catalog_names = assets
                     .iter()
+                    .filter(|asset| asset.error.is_none())
                     .map(|a| (a.id.clone(), a.display_name().to_ascii_lowercase()))
                     .collect();
                 self.server
@@ -874,13 +924,16 @@ impl Session {
                 let mut candidate = self.store.clone();
                 let created = candidate.library.edit(edit)?;
                 for output in candidate.outputs.values_mut() {
-                    if output.rotation.source != "favorites"
-                        && !candidate
-                            .library
-                            .playlists
-                            .contains_key(&output.rotation.source)
+                    if !matches!(
+                        output.rotation.source.as_str(),
+                        "favorites" | "library" | "single"
+                    ) && !candidate
+                        .library
+                        .playlists
+                        .contains_key(&output.rotation.source)
                     {
                         output.rotation.enabled = false;
+                        output.rotation.source = "single".into();
                     }
                 }
                 candidate
@@ -890,6 +943,7 @@ impl Session {
                 if sources_changed {
                     self.catalog_names = catalog::list(&self.config, &self.store.library)
                         .iter()
+                        .filter(|asset| asset.error.is_none())
                         .map(|a| (a.id.clone(), a.display_name().to_ascii_lowercase()))
                         .collect();
                 }
@@ -912,25 +966,46 @@ impl Session {
                 candidate
                     .save()
                     .map_err(|e| Error::new("save_failed", e.to_string()))?;
-                self.store = candidate;
+                let restart = request.params["restart"].as_bool().unwrap_or(true);
                 for name in &outputs {
-                    self.rotations.insert(
-                        name.clone(),
-                        RotationRuntime {
-                            due: settings.enabled.then(Instant::now),
-                            ..RotationRuntime::default()
-                        },
-                    );
+                    let previous = &self
+                        .store
+                        .outputs
+                        .get(name)
+                        .cloned()
+                        .unwrap_or_default()
+                        .rotation;
+                    let runtime = self.rotations.entry(name.clone()).or_default();
+                    if previous.source != settings.source {
+                        *runtime = RotationRuntime::default();
+                    }
+                    if restart
+                        || previous.enabled != settings.enabled
+                        || previous.interval_seconds != settings.interval_seconds
+                        || previous.source != settings.source
+                    {
+                        runtime
+                            .reset_timer(&settings, self.outputs[name].actual(self.policy).paused);
+                        if restart && settings.enabled && runtime.remaining.is_none() {
+                            runtime.due = Some(Instant::now());
+                        }
+                    }
+                    runtime.error = None;
                 }
+                self.store = candidate;
                 self.dirty = true;
                 self.server.reply(client, &success(outputs, None));
             }
-            "rotation_next" => {
+            "rotation_next" | "rotation_previous" => {
                 let outputs = self.targets(&request.params)?;
                 if outputs.len() != 1 {
                     return Err(Error::new("bad_request", "next requires one output"));
                 }
-                self.advance_rotation(&outputs[0], Some(client))?;
+                self.step_rotation(
+                    &outputs[0],
+                    Some(client),
+                    request.method == "rotation_previous",
+                )?;
             }
             "set_policy" => {
                 let policy: crate::store::RuntimePolicy = serde_json::from_value(request.params)
@@ -1010,7 +1085,66 @@ impl Session {
                 let selection = catalog::resolve(asset, fit)?;
                 let outputs = self.targets(&request.params)?;
                 let patch = self.playback_patch(&request.params, &outputs)?;
-                let properties = properties::patch(&request.params)?;
+                let patch_properties = properties::patch(&request.params)?;
+                let source = match request.params.get("source") {
+                    Some(Value::String(source)) => {
+                        if !self
+                            .store
+                            .library
+                            .available_members(source, &self.catalog_names)?
+                            .contains(&selection.asset_id)
+                        {
+                            return Err(Error::new(
+                                "bad_request",
+                                "wallpaper is not in this playback source",
+                            ));
+                        }
+                        source.clone()
+                    }
+                    None => {
+                        if self.catalog_names.contains_key(&selection.asset_id) {
+                            "library".into()
+                        } else {
+                            "single".into()
+                        }
+                    }
+                    Some(_) => return Err(Error::new("bad_request", "source must be a string")),
+                };
+                let rotations: BTreeMap<_, _> = outputs
+                    .iter()
+                    .map(|name| {
+                        let mut settings = self
+                            .store
+                            .outputs
+                            .get(name)
+                            .cloned()
+                            .unwrap_or_default()
+                            .rotation;
+                        settings.enabled = request.params.get("source").is_some()
+                            && settings.source == source
+                            && settings.enabled;
+                        settings.source = source.clone();
+                        settings.fit = if request.params.get("fit").is_none() {
+                            self.config.fit_for(name)
+                        } else {
+                            fit
+                        };
+                        settings.transition = transition;
+                        (name.clone(), settings)
+                    })
+                    .collect();
+                let mut properties = self
+                    .store
+                    .library
+                    .playlists
+                    .get(&source)
+                    .and_then(|playlist| playlist.properties.get(&selection.asset_id))
+                    .map(|saved| {
+                        Schema::load(&selection).map(|schema| schema.snapshot_patch(saved))
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                properties.extend(patch_properties);
                 self.start(
                     Some(client),
                     outputs.clone(),
@@ -1020,7 +1154,13 @@ impl Session {
                     &properties,
                     request.params.get("fit").is_none(),
                 )?;
-                self.stop_rotation(&outputs);
+                for name in &outputs {
+                    if let Some(pending) =
+                        self.outputs.get_mut(name).and_then(|o| o.pending.as_mut())
+                    {
+                        pending.rotation = Some(rotations[name].clone());
+                    }
+                }
             }
             "release" => {
                 let outputs = self.targets(&request.params)?;
@@ -1111,12 +1251,22 @@ impl Session {
                 .is_some_and(|o| o.rotation.enabled)
             {
                 runtime.due = None;
+                runtime.remaining = None;
                 runtime.error = None;
             }
         }
     }
 
     fn advance_rotation(&mut self, name: &str, client: Option<u64>) -> Result<(), Error> {
+        self.step_rotation(name, client, false)
+    }
+
+    fn step_rotation(
+        &mut self,
+        name: &str,
+        client: Option<u64>,
+        previous: bool,
+    ) -> Result<(), Error> {
         let output = &self.outputs[name];
         if output.pending.is_some() || output.control.is_some() || output.property_control.is_some()
         {
@@ -1134,21 +1284,39 @@ impl Session {
             .library
             .available_members(&settings.source, &self.catalog_names)?
             .into_iter()
-            .filter(|id| catalog::resolve(id, settings.fit).is_ok())
+            .filter(|id| {
+                catalog::resolve(id, settings.fit).is_ok_and(|selection| {
+                    catalog::kind(catalog::path(&selection)) != Some(catalog::Kind::WeApplication)
+                        || self.store.policy.allow_applications.unwrap_or(false)
+                })
+            })
             .collect();
-        let previous = self
-            .rotations
-            .get(name)
-            .and_then(|r| r.previous.as_deref())
-            .or(output.current.as_deref());
+        let current = output.current.as_deref();
+        let runtime = self.rotations.get(name);
+        let history_cursor = (settings.mode == crate::library::Mode::Random)
+            .then(|| runtime.and_then(|r| r.history_step(&members, previous)))
+            .flatten();
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .subsec_nanos() as u64;
-        let next = settings
-            .next(&members, previous, seed)
-            .ok_or_else(|| Error::new("empty_playlist", "播放来源没有可用素材"))?
-            .to_owned();
+        let next = if let Some(cursor) = history_cursor {
+            Some(runtime.unwrap().history[cursor].as_str())
+        } else if previous {
+            if settings.mode == crate::library::Mode::Random {
+                return Err(Error::new("no_history", "还没有上一张壁纸"));
+            }
+            members
+                .iter()
+                .position(|id| Some(id.as_str()) == current)
+                .and_then(|i| members.get((i + members.len() - 1) % members.len()))
+                .or_else(|| members.last())
+                .map(String::as_str)
+        } else {
+            settings.next(&members, current, seed)
+        }
+        .ok_or_else(|| Error::new("empty_playlist", "播放来源没有可用素材"))?
+        .to_owned();
         let selection = catalog::resolve(&next, settings.fit)?;
         let properties = if let Some(saved) = self
             .store
@@ -1171,12 +1339,9 @@ impl Session {
             &properties,
             false,
         )?;
-        let runtime = self.rotations.entry(name.into()).or_default();
-        runtime.previous = Some(next);
-        runtime.error = None;
-        runtime.due = settings
-            .enabled
-            .then(|| Instant::now() + Duration::from_secs(settings.interval_seconds));
+        if let Some(pending) = self.outputs.get_mut(name).and_then(|o| o.pending.as_mut()) {
+            pending.history_cursor = history_cursor;
+        }
         self.dirty = true;
         Ok(())
     }
@@ -1684,6 +1849,8 @@ impl Session {
                     + Duration::from_secs(if selection.is_some() { 60 } else { 10 }),
                 playback,
                 properties: properties.remove(&name).unwrap(),
+                rotation: None,
+                history_cursor: None,
             });
 
             let effective = entry.effective(playback, self.policy);
@@ -1869,6 +2036,7 @@ impl Session {
                 }
             }
             entry.revision = pending.id;
+            let previous = entry.current.clone();
             entry.current = pending.selection.as_ref().map(|s| s.asset_id.clone());
             entry.kind = pending.kind;
             entry.playback = pending.playback;
@@ -1877,6 +2045,24 @@ impl Session {
                 .watchdog
                 .accepted(entry.runtime.active, Instant::now());
             let saved = self.store.outputs.entry(name.into()).or_default();
+            let source_changed = pending
+                .rotation
+                .as_ref()
+                .is_some_and(|settings| settings.source != saved.rotation.source);
+            if let Some(settings) = pending.rotation {
+                saved.rotation = settings;
+            }
+            if let Some(current) = &entry.current {
+                let runtime = self.rotations.entry(name.into()).or_default();
+                if source_changed {
+                    *runtime = RotationRuntime::default();
+                } else if let Some(previous) = previous {
+                    runtime.record(&previous, None);
+                }
+                runtime.record(current, pending.history_cursor);
+                runtime.error = None;
+                runtime.reset_timer(&saved.rotation, entry.actual(self.policy).paused);
+            }
             entry.properties = pending.properties.values;
             entry.property_warnings = pending.properties.warnings;
             if let Some(selection) = &pending.selection {
@@ -2169,6 +2355,16 @@ impl Session {
         }
         for (name, runtime) in &mut self.rotations {
             let settings = &self.store.outputs[name].rotation;
+            if settings.enabled {
+                if self.outputs[name].actual(self.policy).paused {
+                    if let Some(due) = runtime.due.take() {
+                        runtime.remaining = Some(due.saturating_duration_since(Instant::now()));
+                    }
+                    continue;
+                } else if let Some(remaining) = runtime.remaining.take() {
+                    runtime.due = Some(Instant::now() + remaining);
+                }
+            }
             if settings.enabled && !settings.schedule.is_empty() {
                 let active = settings.scheduled_now();
                 if active && runtime.schedule_active != Some(true) {
@@ -3193,6 +3389,8 @@ mod tests {
                 ..Playback::default()
             },
             properties: Resolved::default(),
+            rotation: None,
+            history_cursor: None,
         });
         let pause = PlaybackPatch {
             paused: Some(true),
@@ -3397,6 +3595,157 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&session.store).unwrap()).unwrap();
         assert_eq!(restored.policy.pause_on_fullscreen, Some(false));
     }
+    #[test]
+    fn manual_playback_history_commits_only_after_loading_and_pause_freezes_rotation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = session(root.path());
+        let mut output = Output::new(&SavedOutput::default(), Playback::default());
+        output.worker = Some(Renderer::echo());
+        session.outputs.insert("A".into(), output);
+        let assets: Vec<_> = ["a.jpg", "b.jpg", "c.jpg"]
+            .into_iter()
+            .map(|name| {
+                let path = root.path().join(name);
+                std::fs::write(&path, b"fixture").unwrap();
+                let id = format!("local:{}", path.display());
+                session.catalog_names.insert(id.clone(), name.into());
+                id
+            })
+            .collect();
+        let ack = |session: &mut Session, ok| {
+            let id = session.outputs["A"].pending.as_ref().unwrap().id;
+            session.worker_reply(
+                "A",
+                WorkerReply {
+                    id,
+                    ok,
+                    error: (!ok).then(|| Error::new("load_failed", "fixture")),
+                    runtime: None,
+                    snapshot: None,
+                    progress: None,
+                    probe: None,
+                },
+            );
+        };
+        let apply = |session: &mut Session, id: &str, source: Option<&str>| {
+            let mut params = json!({"asset_id":id,"output":"A"});
+            if let Some(source) = source {
+                params["source"] = json!(source);
+            }
+            session
+                .dispatch(
+                    1,
+                    Request {
+                        api: domain::API,
+                        method: "apply".into(),
+                        params,
+                    },
+                )
+                .unwrap();
+        };
+        apply(&mut session, &assets[0], None);
+        ack(&mut session, true);
+        assert_eq!(session.store.outputs["A"].rotation.source, "library");
+        assert!(!session.store.outputs["A"].rotation.enabled);
+        session.advance_rotation("A", None).unwrap();
+        assert_eq!(
+            session.outputs["A"]
+                .pending
+                .as_ref()
+                .unwrap()
+                .selection
+                .as_ref()
+                .unwrap()
+                .asset_id,
+            assets[1]
+        );
+        ack(&mut session, true);
+        assert!(
+            session.rotations["A"].due.is_none(),
+            "manual next must not enable a timer"
+        );
+        session.advance_rotation("A", None).unwrap();
+        ack(&mut session, false);
+        assert_eq!(session.rotations["A"].history, assets[..2]);
+        session.store.outputs.get_mut("A").unwrap().rotation.mode = crate::library::Mode::Random;
+        session.step_rotation("A", None, true).unwrap();
+        ack(&mut session, true);
+        assert_eq!(session.outputs["A"].current.as_ref(), Some(&assets[0]));
+        session.advance_rotation("A", None).unwrap();
+        ack(&mut session, true);
+        assert_eq!(
+            session.outputs["A"].current.as_ref(),
+            Some(&assets[1]),
+            "next retraces random history after previous"
+        );
+        session.advance_rotation("A", None).unwrap();
+        let next = &session.outputs["A"]
+            .pending
+            .as_ref()
+            .unwrap()
+            .selection
+            .as_ref()
+            .unwrap()
+            .asset_id;
+        assert_ne!(next, &assets[1], "random must avoid immediate repeats");
+        ack(&mut session, true);
+
+        session.store.library.playlists.insert(
+            "playlist:1".into(),
+            crate::library::Playlist {
+                name: "Test".into(),
+                members: assets[..2].to_vec(),
+                properties: BTreeMap::new(),
+            },
+        );
+        apply(&mut session, &assets[0], Some("playlist:1"));
+        ack(&mut session, false);
+        assert_eq!(session.store.outputs["A"].rotation.source, "library");
+        apply(&mut session, &assets[0], Some("playlist:1"));
+        ack(&mut session, true);
+        assert_eq!(session.store.outputs["A"].rotation.source, "playlist:1");
+        assert_eq!(session.rotations["A"].history, [assets[0].clone()]);
+
+        session.store.outputs.get_mut("A").unwrap().rotation.enabled = true;
+        session.rotations.get_mut("A").unwrap().due =
+            Some(Instant::now() + Duration::from_secs(42));
+        session.outputs.get_mut("A").unwrap().playback.paused = true;
+        session.expire();
+        let remaining = session.rotations["A"].remaining.unwrap();
+        assert!(remaining > Duration::from_secs(40));
+        assert!(session.rotations["A"].due.is_none());
+        session.outputs.get_mut("A").unwrap().playback.paused = false;
+        session.expire();
+        assert!(session.rotations["A"].due.unwrap() > Instant::now() + Duration::from_secs(40));
+        assert!(session.rotations["A"].remaining.is_none());
+        apply(&mut session, &assets[2], None);
+        ack(&mut session, true);
+        assert_eq!(session.store.outputs["A"].rotation.source, "library");
+        assert!(
+            !session.store.outputs["A"].rotation.enabled,
+            "direct apply returns to manual library playback"
+        );
+        let temporary = root.path().join("outside-library.jpg");
+        std::fs::write(&temporary, b"fixture").unwrap();
+        apply(
+            &mut session,
+            &format!("local:{}", temporary.display()),
+            None,
+        );
+        ack(&mut session, true);
+        assert_eq!(session.store.outputs["A"].rotation.source, "single");
+        assert!(
+            session.snapshot()["rotations"]["A"]["members"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            session.advance_rotation("A", None).unwrap_err().code,
+            "empty_playlist"
+        );
+    }
+
     #[test]
     fn scheduled_rotation_is_owned_by_daemon_without_frontend() {
         let root = tempfile::tempdir().unwrap();
