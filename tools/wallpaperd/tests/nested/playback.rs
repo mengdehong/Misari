@@ -1,6 +1,131 @@
 use super::*;
 
 #[test]
+#[ignore = "requires Wayland, private PipeWire/Pulse servers, parec, paplay and WALLPAPERD_TEST_NIRI"]
+fn other_audio_scene_switch_preserves_mute_without_burst() {
+    let mut rig = Rig::new();
+    let server = rig.audio_server();
+    let scene = rust_scene_fixture(rig.root());
+    let tone = scene.join("tone.wav");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=80:sample_rate=48000:duration=4",
+            "-y",
+        ])
+        .arg(&tone)
+        .output()
+        .unwrap();
+    assert!(generated.status.success());
+    let entry = scene.join("scene.json");
+    let mut data: Value = serde_json::from_slice(&fs::read(&entry).unwrap()).unwrap();
+    data["objects"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": 99, "sound": ["tone.wav"], "volume": 1, "playbackmode": "loop"
+        }));
+    fs::write(&entry, serde_json::to_vec(&data).unwrap()).unwrap();
+    let shader = rig.root().join("silent.frag");
+    fs::write(
+        &shader,
+        "void mainImage(out vec4 c,in vec2 p){c=vec4(0,0,0,1);}",
+    )
+    .unwrap();
+    rig.set(&shader, "cut", 30);
+    rig.ok(&["playback", "--mute", "false"]);
+    // A silent external stream engages the real auto-mute policy without
+    // contaminating the monitor recording with another application's PCM.
+    let silence = rig.root().join("silence.f32");
+    File::create(&silence)
+        .unwrap()
+        .set_len(48000 * 2 * 4 * 120)
+        .unwrap();
+    let mut external = server.play(&silence);
+    rig.wait_state(|s| {
+        s["audio_policy"]["other_audio_active"] == true
+            && s["outputs"]["winit"]["effective_mute"] == true
+    });
+    let recording = rig.root().join("switch.f32");
+    let mut monitor = OwnedProcess(
+        Command::new("parec")
+            .args([
+                "--raw",
+                "--format=float32le",
+                "--rate=48000",
+                "--channels=2",
+                "--latency-msec=10",
+                "--device=wallpaperd_test_a.monitor",
+            ])
+            .env("PULSE_SERVER", server.address())
+            .stdout(File::create(&recording).unwrap())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while server.source_outputs().as_array().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "PCM monitor did not start");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let scene_id = format!("we:{}", scene.display());
+    for transition in ["cut", "fade"] {
+        rig.set(&scene, transition, 30);
+        rig.wait_state(|s| {
+            s["outputs"]["winit"]["current"] == scene_id
+                && s["outputs"]["winit"]["pending"].is_null()
+        });
+        thread::sleep(Duration::from_millis(100));
+        rig.set(&shader, "cut", 30);
+        rig.wait_state(|s| s["outputs"]["winit"]["pending"].is_null());
+    }
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        external.0.try_wait().unwrap().is_none(),
+        "auto-mute fixture stopped early"
+    );
+    let pcm = fs::read(&recording).unwrap();
+    let samples = pcm.as_chunks::<4>().0;
+    assert!(samples.len() > 4800, "empty PCM recording");
+    let peak = samples
+        .iter()
+        .map(|s| f32::from_le_bytes(*s).abs())
+        .fold(0f32, f32::max);
+    let audible = samples
+        .iter()
+        .filter(|s| f32::from_le_bytes(**s).abs() > 0.001)
+        .count();
+    eprintln!(
+        "scene switches: peak={peak:.6}, audible_ms={:.2}",
+        audible as f64 / 96.0
+    );
+    // Prove the same scene and monitor actually carry audio when auto-mute clears.
+    drop(external);
+    rig.wait_state(|s| s["outputs"]["winit"]["effective_mute"] == false);
+    rig.set(&scene, "cut", 30);
+    thread::sleep(Duration::from_millis(500));
+    monitor.0.kill().unwrap();
+    monitor.0.wait().unwrap();
+    let control = fs::read(&recording).unwrap();
+    let control_peak = control[pcm.len()..]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|s| f32::from_le_bytes(*s).abs())
+        .fold(0f32, f32::max);
+    assert!(
+        control_peak > 0.01,
+        "unmuted positive control was silent: {control_peak}"
+    );
+    assert!(peak < 0.001, "auto-muted scene switch emitted audible PCM");
+}
+
+#[test]
 #[ignore = "requires Wayland, private PipeWire/PulseAudio servers, paplay and WALLPAPERD_TEST_NIRI"]
 fn other_audio_mutes_without_pausing_and_preserves_user_choice() {
     let mut rig = Rig::new();

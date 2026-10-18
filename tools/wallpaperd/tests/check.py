@@ -22,7 +22,7 @@ GROUPS = {
     "properties": (["--test", "nested", "rust_properties_"], ["weston"]),
     "mouse": (["--test", "nested", "mouse_"], ["weston", "weston-simple-shm"]),
     "library": (["--test", "nested", "library_import_"], ["weston"]),
-    "audio": (["--test", "nested", "other_audio"], ["weston", *AUDIO]),
+    "audio": (["--test", "nested", "other_audio"], ["weston", "ffmpeg", "parec", *AUDIO]),
     "web-integration": (["--test", "nested", "web_project_"], ["weston"]),
     "web": (["--bin", "wallpaperd", "web_browser"], []),
     "web-audio": (["--test", "web_audio"], ["pipewire", "pipewire-pulse", "wireplumber", "pactl", "parec"]),
