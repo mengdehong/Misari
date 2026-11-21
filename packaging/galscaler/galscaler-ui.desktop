@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=GalScaler
+Comment=Launch and upscale Windows visual novels, and stream them over LAN
+Comment[zh_CN]=启动 Windows Galgame、增强画质并串流到手机
+Exec=/usr/bin/galscaler-ui
+Icon=applications-games
+Terminal=false
+Categories=Game;
+StartupNotify=true
+StartupWMClass=galscaler-ui

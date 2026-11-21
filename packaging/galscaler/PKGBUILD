@@ -1,0 +1,47 @@
+# shellcheck shell=bash
+# shellcheck disable=SC2034,SC2154
+pkgname=galscaler
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Windows visual novel launcher with upscaling and LAN streaming'
+arch=('x86_64')
+url='https://github.com/mengdehong/Misari'
+license=('LicenseRef-Unspecified' 'ISC' 'MIT' 'LGPL-3.0-or-later')
+depends=(
+  'ffmpeg' 'glibc' 'gtk3' 'libdatachannel' 'libgcc' 'libglvnd'
+  'libplacebo>=7' 'libva' 'libxkbcommon' 'opus' 'systemd' 'wayland' 'xorg-xwayland'
+)
+makedepends=('clang' 'git' 'go' 'libdrm' 'lld' 'pkgconf' 'rust>=1.96' 'wine')
+optdepends=(
+  'umu-launcher: run Windows games with Proton'
+  'curl: find and download covers from VNDB'
+  'iproute2: select the LAN streaming address'
+  'pipewire-audio: capture game audio for streaming'
+  'pipewire-pulse: PulseAudio server for game audio capture'
+  'libpulse: control and capture the streaming audio sink'
+  'avahi: announce the streaming server to Android clients'
+)
+options=('!debug' '!lto')
+
+# Run makepkg from this repository to build the current GalScaler checkout.
+build() {
+  cd "$startdir/../../tools/galscaler" || return
+  export RUSTFLAGS="$RUSTFLAGS --remap-path-prefix=$srcdir=."
+  cargo build --locked --release --bins --target-dir "$srcdir/target"
+
+  cd ui || return
+  GOTOOLCHAIN=local go build -mod=readonly -trimpath -buildmode=pie -o "$srcdir/galscaler-ui" .
+}
+
+package() {
+  local project="$startdir/../../tools/galscaler"
+  local licenses="$pkgdir/usr/share/licenses/$pkgname"
+
+  install -d "$pkgdir/usr/bin"
+  install -m755 "$srcdir/target/release/galscaler" "$srcdir/target/release/galscalerd" \
+    "$srcdir/galscaler-ui" "$pkgdir/usr/bin/"
+  install -Dm644 "$startdir/galscaler-ui.desktop" "$pkgdir/usr/share/applications/galscaler-ui.desktop"
+  install -Dm644 "$project/src/shaders/CuNNy.LICENSE" "$licenses/CuNNy"
+  install -Dm644 "$project/ui/assets/LICENSE" "$licenses/Lucide"
+  sed -n '/^\/\/!DESC/q; s|^// *||p' "$project/src/shaders/anime4k-restore.glsl" > "$licenses/Anime4K"
+}
