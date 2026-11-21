@@ -9,6 +9,7 @@ mod previews;
 mod services;
 mod view;
 
+use engine::{DEFAULT_UI_SCALE, MAX_UI_SCALE, MIN_UI_SCALE};
 use filters::{Filters, Group};
 use iced::{Element, Subscription, Task, Theme, keyboard, widget, window};
 use serde_json::{Value, json};
@@ -28,6 +29,10 @@ enum Page {
     Settings,
 }
 impl Page {
+    fn is_remote(self) -> bool {
+        matches!(self, Self::Discover | Self::Workshop)
+    }
+
     fn title(self) -> &'static str {
         match self {
             Self::Library => "我的壁纸",
@@ -40,6 +45,14 @@ impl Page {
         }
     }
 }
+
+#[derive(Clone, Copy, Debug)]
+enum Zoom {
+    In,
+    Out,
+    Reset,
+}
+
 #[derive(Clone, Debug)]
 enum Message {
     Navigate(Page),
@@ -59,7 +72,8 @@ enum Message {
     Sort(String),
     Page(i32),
     GridResized(iced::Size),
-    GridScrolled(usize),
+    GridScrolled(f32),
+    RetryMore,
     Loaded(Result<Value, String>),
     Refresh,
     RefreshLibrary,
@@ -104,7 +118,6 @@ enum Message {
     ServicePoll(Result<Value, String>),
     ExploreLoaded(Result<Value, String>),
     ThumbnailLoaded(u64, String, Option<widget::image::Handle>),
-    RemotePreviewDeadline(u64),
     SizeLoaded(u64, String, Option<u64>),
     PlaylistSelect(String),
     PlaylistName(String),
@@ -132,8 +145,8 @@ enum Message {
     PlaybackInterval(u64),
     Dismiss,
     ExpireNotice(Instant),
+    Zoom(Zoom),
     Key(keyboard::Key, keyboard::Modifiers),
-    Screenshot(window::Screenshot),
 }
 
 struct Notice {
@@ -162,15 +175,8 @@ enum RemoteLoad {
     #[default]
     Idle,
     Searching,
-    Preparing(RemoteResults),
-}
-
-struct RemoteResults {
-    revision: u64,
-    preview_deadline: Option<Instant>,
-    items: Vec<Value>,
-    page: usize,
-    pages: usize,
+    Appending,
+    AppendFailed,
 }
 
 struct ThemeFade {
@@ -192,6 +198,7 @@ struct App {
     drafts: BTreeMap<String, String>,
     color_editor: Option<color_picker::Editor>,
     theme: Theme,
+    ui_scale: u16,
     theme_fade: Option<ThemeFade>,
     theme_preview: Option<widget::image::Handle>,
     ambient: Option<widget::image::Handle>,
@@ -206,7 +213,6 @@ struct App {
     filter_tag_search: String,
     sort: String,
     page_index: usize,
-    page_size: usize,
     output: String,
     fit: String,
     loading: bool,
@@ -216,9 +222,9 @@ struct App {
     service: Value,
     remote: Vec<Value>,
     remote_load: RemoteLoad,
-    displayed_remote_page: usize,
-    grid_columns: usize,
-    grid_row: usize,
+    remote_query: Option<Value>,
+    grid: view::Grid,
+    grid_offset: f32,
     recommendations: Vec<Value>,
     previews: previews::Previews,
     asset_sizes: BTreeMap<String, AssetSize>,
@@ -241,8 +247,6 @@ struct App {
     schedule_enabled: bool,
     schedule_start: String,
     schedule_end: String,
-    screenshot: Option<String>,
-    screenshot_tick: u8,
 }
 fn strv<'a>(v: &'a Value, k: &str) -> &'a str {
     v[k].as_str().unwrap_or("")
@@ -259,11 +263,43 @@ fn load_task() -> Task<Message> {
     Task::perform(blocking(engine::load), Message::Loaded)
 }
 
+fn zoom_shortcut(event: &keyboard::Event) -> Option<Zoom> {
+    let keyboard::Event::KeyPressed {
+        modified_key,
+        modifiers,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    if !modifiers.control() || modifiers.alt() || modifiers.logo() {
+        return None;
+    }
+    match modified_key.as_ref() {
+        keyboard::Key::Character("+" | "=") => Some(Zoom::In),
+        keyboard::Key::Character("-") => Some(Zoom::Out),
+        keyboard::Key::Character("0") => Some(Zoom::Reset),
+        _ => None,
+    }
+}
+
+fn keyboard_message(event: keyboard::Event, status: iced::event::Status) -> Option<Message> {
+    if let Some(zoom) = zoom_shortcut(&event) {
+        return Some(Message::Zoom(zoom));
+    }
+    match event {
+        keyboard::Event::KeyPressed { key, modifiers, .. }
+            if status == iced::event::Status::Ignored =>
+        {
+            Some(Message::Key(key, modifiers))
+        }
+        _ => None,
+    }
+}
+
 impl App {
-    fn new() -> (Self, Task<Message>) {
-        let args: Vec<_> = std::env::args().collect();
-        let option = |key: &str| args.windows(2).find(|p| p[0] == key).map(|p| p[1].clone());
-        let page = match option("--page").as_deref() {
+    fn new(page: Option<&str>) -> (Self, Task<Message>) {
+        let page = match page {
             Some("workshop") => Page::Workshop,
             Some("discover") => Page::Discover,
             Some("downloads") => Page::Downloads,
@@ -285,6 +321,7 @@ impl App {
             drafts: BTreeMap::new(),
             color_editor: None,
             theme: palette::default_theme(),
+            ui_scale: engine::load_ui_scale(),
             theme_fade: None,
             theme_preview: None,
             ambient: None,
@@ -304,7 +341,6 @@ impl App {
             }
             .into(),
             page_index: 0,
-            page_size: 12,
             output: "全部显示器".into(),
             fit: "填充".into(),
             loading: true,
@@ -314,9 +350,9 @@ impl App {
             service: json!({}),
             remote: vec![],
             remote_load: RemoteLoad::Idle,
-            displayed_remote_page: 1,
-            grid_columns: 4,
-            grid_row: 0,
+            remote_query: None,
+            grid: view::Grid::new(iced::Size::new(1080.0, 720.0)),
+            grid_offset: 0.0,
             recommendations: vec![],
             previews: previews::Previews::default(),
             asset_sizes: BTreeMap::new(),
@@ -339,8 +375,6 @@ impl App {
             schedule_enabled: false,
             schedule_start: "08:00".into(),
             schedule_end: "23:00".into(),
-            screenshot: option("--screenshot"),
-            screenshot_tick: 0,
         };
         (
             app,
@@ -681,79 +715,66 @@ impl App {
     fn search_task(&mut self) -> Task<Message> {
         self.search_revision += 1;
         self.remote_load = RemoteLoad::Searching;
+        self.remote.clear();
+        self.remote_page = 1;
+        self.remote_pages = 1;
+        self.grid_offset = 0.0;
+        self.selected = None;
         self.previews.cancel_pending();
-        self.service_task(json!({"action":"search","text":self.search,"filters":self.filters,"scope":if self.page==Page::Workshop{self.scope.as_str()}else{"全部作品"},"sort":self.sort,"page":self.remote_page,"source":if self.page==Page::Discover && !self.filters.tag_groups().iter().any(|group| group.len() > 1){"discover"}else{"steam"}}))
+        let query = json!({
+            "action": "search",
+            "text": self.search,
+            "filters": self.filters,
+            "scope": if self.page == Page::Workshop { self.scope.as_str() } else { "全部作品" },
+            "sort": self.sort,
+            "page": 1,
+            "source": if self.page == Page::Discover
+                && !self.filters.tag_groups().iter().any(|group| group.len() > 1)
+            {
+                "discover"
+            } else {
+                "steam"
+            }
+        });
+        self.remote_query = Some(query.clone());
+        self.service_task(query)
     }
     fn remote_loading(&self) -> bool {
-        !matches!(self.remote_load, RemoteLoad::Idle)
+        matches!(
+            self.remote_load,
+            RemoteLoad::Searching | RemoteLoad::Appending
+        )
     }
 
-    fn publish_remote_if_ready(&mut self) -> Task<Message> {
-        let mut timer = None;
-        let ready = match &mut self.remote_load {
-            RemoteLoad::Preparing(next) if next.revision == self.search_revision => {
-                let row = &next.items[..next.items.len().min(self.grid_columns.max(1))];
-                let ready = row
-                    .iter()
-                    .filter(|item| matches!(self.previews.get(item), Some(Some(_))))
-                    .count();
-                // A slow thumbnail must not hold the whole query. Retain the old
-                // grid until at least one image arrives rather than flashing blanks.
-                let complete = ready * 3 >= row.len() * 2
-                    || row.iter().all(|item| self.previews.finished(item))
-                    || (ready > 0
-                        && next
-                            .preview_deadline
-                            .is_some_and(|deadline| Instant::now() >= deadline));
-                if !complete && ready > 0 && next.preview_deadline.is_none() {
-                    let deadline = Instant::now() + Duration::from_millis(800);
-                    next.preview_deadline = Some(deadline);
-                    timer = Some((next.revision, deadline));
-                }
-                complete
-            }
-            _ => false,
-        };
-        if !ready {
-            return match timer {
-                Some((revision, deadline)) => Task::perform(
-                    async move {
-                        tokio::time::sleep_until(deadline.into()).await;
-                        revision
-                    },
-                    Message::RemotePreviewDeadline,
-                ),
-                None => Task::none(),
-            };
+    fn load_more(&mut self, retry: bool) -> Task<Message> {
+        if !self.page.is_remote() || self.remote_page >= self.remote_pages {
+            return Task::none();
         }
-        let RemoteLoad::Preparing(next) =
-            std::mem::replace(&mut self.remote_load, RemoteLoad::Idle)
-        else {
-            unreachable!()
+        let needs_more = if retry {
+            matches!(self.remote_load, RemoteLoad::AppendFailed)
+        } else {
+            let visible = self.grid.visible_rows(self.grid_offset);
+            let rows = self.remote.len().div_ceil(self.grid.columns);
+            matches!(self.remote_load, RemoteLoad::Idle)
+                && (self.remote.len() < self.grid.page_size()
+                    || self.grid.max_offset(self.remote.len()) == 0.0
+                    || (self.grid_offset > 0.0 && rows <= visible.end + 2))
         };
-        self.remote = next.items;
-        self.remote_pages = next.pages;
-        self.remote_page = next.page;
-        self.displayed_remote_page = next.page;
-        self.grid_row = 0;
-        Task::batch([
-            widget::operation::snap_to("wallpaper-grid", widget::operation::RelativeOffset::START),
-            self.previews.load(self.preview_items()),
-        ])
+        if !needs_more {
+            return Task::none();
+        }
+        let Some(mut query) = self.remote_query.clone() else {
+            return Task::none();
+        };
+        query["page"] = json!(self.remote_page + 1);
+        query["_append"] = json!(true);
+        self.remote_load = RemoteLoad::Appending;
+        self.service_task(query)
     }
 
     fn accept_service(&mut self, value: Value) {
         if let Some(states) = value["item_states"].as_object() {
-            let pending = match &mut self.remote_load {
-                RemoteLoad::Preparing(next) => next.items.as_mut_slice(),
-                _ => &mut [],
-            };
-            for item in self
-                .remote
-                .iter_mut()
-                .chain(&mut self.recommendations)
-                .chain(pending)
-            {
+            for item in self.remote.iter_mut().chain(&mut self.recommendations) {
                 if let Some(state) = states.get(strv(item, "id"))
                     && let (Some(item), Some(state)) = (item.as_object_mut(), state.as_object())
                 {
@@ -767,39 +788,30 @@ impl App {
         let mut items: Vec<Value> = match self.page {
             Page::Library => {
                 let filtered = self.filtered();
+                let page_size = self.grid.page_size();
                 let page = self
                     .page_index
-                    .min(filtered.len().div_ceil(self.page_size).saturating_sub(1));
+                    .min(filtered.len().div_ceil(page_size).saturating_sub(1));
                 filtered
                     .into_iter()
-                    .skip(page * self.page_size)
-                    .take(self.page_size)
+                    .skip(page * page_size)
+                    .take(page_size)
                     .cloned()
                     .collect()
             }
             Page::Discover | Page::Workshop => {
-                let (items, row) = match &self.remote_load {
-                    RemoteLoad::Preparing(next) => (&next.items, 0),
-                    RemoteLoad::Searching => {
-                        return self
-                            .remote
-                            .iter()
-                            .filter(|item| self.previews.get(item).is_some())
-                            .cloned()
-                            .collect();
-                    }
-                    RemoteLoad::Idle => (&self.remote, self.grid_row),
-                };
-                let first = row * self.grid_columns;
-                items
+                let rows = self.grid.visible_rows(self.grid_offset);
+                let columns = self.grid.columns;
+                let first = rows.start * columns;
+                self.remote
                     .iter()
                     .skip(first)
-                    .take(self.page_size + self.grid_columns)
+                    .take((rows.len() + 1) * columns)
                     .chain(
-                        items
+                        self.remote
                             .iter()
-                            .skip(first.saturating_sub(self.grid_columns))
-                            .take(first.min(self.grid_columns)),
+                            .skip(first.saturating_sub(columns))
+                            .take(first.min(columns)),
                     )
                     .cloned()
                     .collect()
@@ -810,8 +822,8 @@ impl App {
                 .collect(),
             _ => Vec::new(),
         };
-        let mut priority = if matches!(self.page, Page::Discover | Page::Workshop) {
-            let first_row = items.len().min(self.grid_columns);
+        let mut priority = if self.page.is_remote() {
+            let first_row = items.len().min(self.grid.columns);
             items.drain(..first_row).collect()
         } else {
             Vec::new()
@@ -941,19 +953,29 @@ impl App {
                 | Message::RefreshLibrary
                 | Message::Output(_)
         );
+        let check_more = matches!(
+            message,
+            Message::GridResized(_) | Message::GridScrolled(_) | Message::ServiceDone(..)
+        );
         let task = self.update_inner(message);
+        let more = if check_more {
+            self.load_more(false)
+        } else {
+            Task::none()
+        };
         if self.color_editor.is_some() && !self.can_edit_properties() {
             self.color_editor = None;
         }
         if refresh_previews {
             Task::batch([
                 task,
+                more,
                 self.previews.load(self.preview_items()),
                 self.size_task(),
                 self.theme_task(),
             ])
         } else {
-            Task::batch([task, self.theme_task()])
+            Task::batch([task, more, self.theme_task()])
         }
     }
     fn update_inner(&mut self, message: Message) -> Task<Message> {
@@ -961,7 +983,7 @@ impl App {
             Message::Navigate(page) => {
                 self.search_revision += 1;
                 self.remote_load = RemoteLoad::Idle;
-                self.grid_row = 0;
+                self.grid_offset = 0.0;
                 self.service_commands
                     .retain(|action| !matches!(strv(action, "action"), "search" | "detail"));
                 self.page = page;
@@ -974,9 +996,8 @@ impl App {
                 self.selected = None;
                 self.delete_confirmation = None;
                 self.notice = None;
-                if matches!(page, Page::Discover | Page::Workshop) {
+                if page.is_remote() {
                     self.sort = "热门".into();
-                    self.remote_page = 1;
                     let search = self.search_task();
                     if page == Page::Discover && self.recommendations.is_empty() {
                         return Task::batch([
@@ -1004,13 +1025,11 @@ impl App {
 
             Message::Scope(scope) => {
                 self.scope = scope;
-                self.remote_page = 1;
                 return self.search_task();
             }
 
             Message::SearchNow => {
-                if matches!(self.page, Page::Discover | Page::Workshop) {
-                    self.remote_page = 1;
+                if self.page.is_remote() {
                     return self.search_task();
                 }
             }
@@ -1045,9 +1064,8 @@ impl App {
                     _ => unreachable!(),
                 }
                 self.page_index = 0;
-                self.grid_row = 0;
-                if matches!(self.page, Page::Discover | Page::Workshop) {
-                    self.remote_page = 1;
+                self.grid_offset = 0.0;
+                if self.page.is_remote() {
                     return self.search_task();
                 }
                 return widget::operation::scroll_to(
@@ -1059,42 +1077,52 @@ impl App {
             Message::Sort(v) => {
                 self.sort = v;
                 self.page_index = 0;
-                self.remote_page = 1;
-                if matches!(self.page, Page::Discover | Page::Workshop) {
+                if self.page.is_remote() {
                     return self.search_task();
                 }
             }
 
             Message::GridResized(size) => {
-                self.grid_columns = view::grid_columns(size.width);
-                let page_size = view::grid_page_size(size);
-                if page_size != self.page_size {
-                    let first = self.page_index * self.page_size;
-                    self.page_size = page_size;
+                let previous = self.grid;
+                self.grid = view::Grid::new(size);
+                let page_size = self.grid.page_size();
+                if self.page == Page::Library && page_size != previous.page_size() {
+                    let first = self.page_index * previous.page_size();
                     self.page_index = (first / page_size)
                         .min(self.filtered().len().div_ceil(page_size).saturating_sub(1));
                 }
-                return self.publish_remote_if_ready();
+                if self.page.is_remote() && self.grid_offset > 0.0 {
+                    let row = self.grid_offset / previous.row_stride();
+                    let item = row.floor() as usize * previous.columns;
+                    let offset =
+                        ((item / self.grid.columns) as f32 + row.fract()) * self.grid.row_stride();
+                    let offset = offset.min(self.grid.max_offset(self.remote.len()));
+                    if offset != self.grid_offset {
+                        self.grid_offset = offset;
+                        return widget::operation::scroll_to(
+                            "wallpaper-grid",
+                            widget::scrollable::AbsoluteOffset { x: 0.0, y: offset },
+                        );
+                    }
+                }
             }
 
-            Message::GridScrolled(row) => {
-                if row != self.grid_row {
-                    self.grid_row = row;
+            Message::GridScrolled(offset) => {
+                let old_rows = self.grid.visible_rows(self.grid_offset);
+                self.grid_offset = offset;
+                if self.page.is_remote() && old_rows != self.grid.visible_rows(offset) {
                     return self.previews.load(self.preview_items());
                 }
             }
 
             Message::Page(delta) => {
-                if matches!(self.page, Page::Discover | Page::Workshop) {
-                    self.remote_page = (self.remote_page as i32 + delta).max(1) as usize;
-                    return self.search_task();
-                } else {
-                    self.page_index = (self.page_index as i32 + delta).max(0) as usize;
-                }
+                self.page_index = self.page_index.saturating_add_signed(delta as isize);
             }
 
+            Message::RetryMore => return self.load_more(true),
+
             Message::Refresh => {
-                if matches!(self.page, Page::Discover | Page::Workshop) {
+                if self.page.is_remote() {
                     self.previews.retry_failed();
                     return self.search_task();
                 }
@@ -1127,8 +1155,7 @@ impl App {
                             return self.properties_task();
                         }
 
-                        if matches!(self.page, Page::Discover | Page::Workshop)
-                            && self.remote.is_empty()
+                        if self.page.is_remote() && self.remote.is_empty() && !self.remote_loading()
                         {
                             let search = self.search_task();
                             if self.page == Page::Discover && self.recommendations.is_empty() {
@@ -1189,21 +1216,6 @@ impl App {
                         }),
                         Message::ServicePoll,
                     ));
-                }
-
-                if self.screenshot.is_some() {
-                    self.screenshot_tick = self.screenshot_tick.saturating_add(1);
-                    if self.screenshot_tick >= 4
-                        && !self.loading
-                        && !self.service_busy
-                        && self.previews.pending == 0
-                    {
-                        tasks.push(
-                            window::oldest()
-                                .and_then(window::screenshot)
-                                .map(Message::Screenshot),
-                        );
-                    }
                 }
 
                 return Task::batch(tasks);
@@ -1425,7 +1437,7 @@ impl App {
                     self.page_index = self.page_index.min(
                         self.filtered()
                             .len()
-                            .div_ceil(self.page_size)
+                            .div_ceil(self.grid.page_size())
                             .saturating_sub(1),
                     );
                 }
@@ -1667,15 +1679,35 @@ impl App {
                 match result {
                     Ok(v) => {
                         if kind == "search" && revision == self.search_revision {
-                            self.remote_load = RemoteLoad::Preparing(RemoteResults {
-                                revision,
-                                preview_deadline: None,
-                                items: array(&v["items"]).to_vec(),
-                                pages: v["total_pages"].as_u64().unwrap_or(1).max(1) as usize,
-                                page: v["page"].as_u64().unwrap_or(self.remote_page as u64)
-                                    as usize,
-                            });
-                            tasks.push(self.publish_remote_if_ready());
+                            let appending = matches!(self.remote_load, RemoteLoad::Appending);
+                            let mut seen: std::collections::BTreeSet<_> = self
+                                .remote
+                                .iter()
+                                .map(|item| strv(item, "id").to_owned())
+                                .collect();
+                            self.remote.extend(
+                                array(&v["items"])
+                                    .iter()
+                                    .filter(|item| seen.insert(strv(item, "id").to_owned()))
+                                    .cloned(),
+                            );
+                            self.remote_page = v["page"]
+                                .as_u64()
+                                .unwrap_or((self.remote_page + usize::from(appending)) as u64)
+                                .max(self.remote_page as u64)
+                                as usize;
+                            self.remote_pages = v["total_pages"]
+                                .as_u64()
+                                .unwrap_or(1)
+                                .clamp(1, services::MAX_SEARCH_PAGE)
+                                as usize;
+                            self.remote_load = RemoteLoad::Idle;
+                            if !appending {
+                                tasks.push(widget::operation::snap_to(
+                                    "wallpaper-grid",
+                                    widget::operation::RelativeOffset::START,
+                                ));
+                            }
                         } else if kind == "search" {
                         } else if kind == "detail" {
                             let item = &v["item"];
@@ -1704,7 +1736,12 @@ impl App {
                     }
                     Err(e) if kind != "search" || revision == self.search_revision => {
                         if kind == "search" {
-                            self.remote_load = RemoteLoad::Idle;
+                            self.remote_load = if matches!(self.remote_load, RemoteLoad::Appending)
+                            {
+                                RemoteLoad::AppendFailed
+                            } else {
+                                RemoteLoad::Idle
+                            };
                         }
                         self.notice = Some(Notice::new(true, e));
                     }
@@ -1729,14 +1766,8 @@ impl App {
                 }
             }
 
-            Message::RemotePreviewDeadline(revision) => {
-                if revision == self.search_revision {
-                    return self.publish_remote_if_ready();
-                }
-            }
             Message::ThumbnailLoaded(generation, source, handle) => {
                 self.previews.accept(generation, source, handle);
-                return self.publish_remote_if_ready();
             }
 
             Message::ServicePoll(result) => {
@@ -1999,7 +2030,7 @@ else{
                             .iter()
                             .position(|item| strv(item, "id") == current)
                             .unwrap_or(0)
-                            / self.page_size;
+                            / self.grid.page_size();
                         return Task::batch([navigate, self.update(Message::Select(current))]);
                     }
                     return navigate;
@@ -2030,6 +2061,19 @@ else{
                     .is_some_and(|notice| now >= notice.expires_at)
                 {
                     self.notice = None;
+                }
+            }
+            Message::Zoom(zoom) => {
+                let scale = match zoom {
+                    Zoom::In => (self.ui_scale + 10).min(MAX_UI_SCALE),
+                    Zoom::Out => (self.ui_scale - 10).max(MIN_UI_SCALE),
+                    Zoom::Reset => DEFAULT_UI_SCALE,
+                };
+                if scale != self.ui_scale {
+                    self.ui_scale = scale;
+                    if let Err(error) = engine::save_ui_scale(scale) {
+                        self.notice = Some(Notice::new(true, format!("无法保存界面缩放：{error}")));
+                    }
                 }
             }
             Message::Key(key, modifiers) => match key {
@@ -2095,22 +2139,6 @@ else{
                 }
                 _ => {}
             },
-
-            Message::Screenshot(shot) => {
-                if let Some(path) = self.screenshot.take() {
-                    if let Err(e) = image::save_buffer(
-                        &path,
-                        &shot.rgba,
-                        shot.size.width,
-                        shot.size.height,
-                        image::ColorType::Rgba8,
-                    ) {
-                        eprintln!("screenshot: {e}");
-                    } else {
-                        println!("screenshot: {path}");
-                    }
-                }
-            }
         }
 
         Task::none()
@@ -2129,10 +2157,8 @@ else{
             } else {
                 Subscription::none()
             },
-            keyboard::listen().filter_map(|e| match e {
-                keyboard::Event::KeyPressed { key, modifiers, .. } => {
-                    Some(Message::Key(key, modifiers))
-                }
+            iced::event::listen_with(|event, status, _| match event {
+                iced::Event::Keyboard(event) => keyboard_message(event, status),
                 _ => None,
             }),
         ])
@@ -2141,7 +2167,7 @@ else{
         view::view(self)
     }
 }
-fn main() -> iced::Result {
+pub fn run(page: Option<String>, diagnose: bool) -> iced::Result {
     motion::set_reduced(engine::reduced_motion());
     // SAFETY: initialization runs before Iced, Tokio or the Steam worker creates threads.
     unsafe {
@@ -2149,16 +2175,15 @@ fn main() -> iced::Result {
         std::env::set_var("SteamGameId", "431960");
     }
 
-    if std::env::args().any(|v| v == "--diagnose") {
-        println!("{}",serde_json::to_string_pretty(&json!({"engine":engine::diagnose(),"steam":services::execute(json!({"action":"status"}))})).unwrap());
+    if diagnose {
+        let report = json!({
+            "engine": engine::diagnose(),
+            "steam": services::diagnose(),
+        });
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
         return Ok(());
     }
-    let args: Vec<_> = std::env::args().collect();
-    let page = args
-        .windows(2)
-        .find(|p| p[0] == "--page")
-        .map(|p| p[1].clone());
-    let _instance = match engine::single_instance(page) {
+    let _instance = match engine::single_instance(page.clone()) {
         Ok(Some(file)) => file,
         Ok(None) => return Ok(()),
         Err(error) => {
@@ -2170,9 +2195,11 @@ fn main() -> iced::Result {
             return Ok(());
         }
     };
-    iced::application(App::new, App::update, App::view)
+    let boot = move || App::new(page.as_deref());
+    iced::application(boot, App::update, App::view)
         .title("Misari · 壁纸")
         .theme(|app: &App| app.theme.clone())
+        .scale_factor(|app: &App| f32::from(app.ui_scale) / 100.0)
         .default_font(iced::Font::with_name("Noto Sans CJK SC"))
         .font(icons::FONT_BYTES)
         .window(window::Settings {
@@ -2186,4 +2213,153 @@ fn main() -> iced::Result {
         })
         .subscription(App::subscription)
         .run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zoom_shortcuts_work_when_a_widget_has_captured_the_key() {
+        let pressed = |key: &str, modified: &str, modifiers| keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character(key.into()),
+            modified_key: keyboard::Key::Character(modified.into()),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Equal),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        };
+        let captured = iced::event::Status::Captured;
+        let ctrl = keyboard::Modifiers::CTRL;
+        assert!(matches!(
+            keyboard_message(
+                pressed("=", "+", ctrl | keyboard::Modifiers::SHIFT),
+                captured
+            ),
+            Some(Message::Zoom(Zoom::In))
+        ));
+        assert!(matches!(
+            keyboard_message(pressed("=", "=", ctrl), captured),
+            Some(Message::Zoom(Zoom::In))
+        ));
+        assert!(matches!(
+            keyboard_message(pressed("-", "-", ctrl), captured),
+            Some(Message::Zoom(Zoom::Out))
+        ));
+        assert!(matches!(
+            keyboard_message(pressed("0", "0", ctrl), captured),
+            Some(Message::Zoom(Zoom::Reset))
+        ));
+        assert!(keyboard_message(pressed("1", "1", ctrl), captured).is_none());
+        assert!(
+            keyboard_message(pressed("=", "=", ctrl | keyboard::Modifiers::ALT), captured)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn workshop_fills_a_large_viewport_from_the_submitted_query() {
+        let (mut app, _) = App::new(None);
+        app.loading = false;
+        let _ = app.update(Message::Navigate(Page::Workshop));
+        let _ = app.update(Message::Search("ocean".into()));
+        let _ = app.update(Message::SearchNow);
+        let revision = app.search_revision;
+        let _ = app.update(Message::Search("unsubmitted".into()));
+        let _ = app.update(Message::GridResized(iced::Size::new(3524.0, 1936.0)));
+        let _ = app.update(Message::ServiceDone(
+            "search".into(),
+            revision - 1,
+            Ok(json!({"items":[{"id":"stale"}],"page":1,"total_pages":4})),
+        ));
+        assert!(app.remote.is_empty());
+
+        // Observe the next request in the existing service queue while a detail request runs.
+        let _ = app.update(Message::Service(json!({"action":"detail","id":"1"})));
+        let items = (1..=50)
+            .map(|id| json!({"id":id.to_string()}))
+            .collect::<Vec<_>>();
+        let _ = app.update(Message::ServiceDone(
+            "search".into(),
+            revision,
+            Ok(json!({"items":items,"page":1,"total_pages":4})),
+        ));
+
+        assert_eq!(app.remote.len(), 50);
+        let next = app.service_commands.front().unwrap();
+        assert_eq!(next["page"], 2);
+        assert_eq!(next["text"], "ocean");
+
+        let _ = app.update(Message::ServiceDone(
+            "detail".into(),
+            revision,
+            Ok(json!({})),
+        ));
+        let items = (50..=99)
+            .map(|id| json!({"id":id.to_string()}))
+            .collect::<Vec<_>>();
+        let _ = app.update(Message::ServiceDone(
+            "search".into(),
+            revision,
+            Ok(json!({"items":items,"page":2,"total_pages":4})),
+        ));
+        assert_eq!(app.remote.len(), 99);
+        assert_eq!(app.remote[49]["id"], "50");
+        assert_eq!(app.remote[50]["id"], "51");
+        assert!(!app.service_busy, "two pages fill this viewport");
+
+        let _ = app.update(Message::Navigate(Page::Library));
+        let catalog = (1..=110)
+            .map(|id| json!({"id":format!("local:{id}"),"title":id.to_string(),"kind":"image"}))
+            .collect::<Vec<_>>();
+        let _ = app.update(Message::Loaded(Ok(json!({"catalog":catalog}))));
+        assert_eq!(
+            app.preview_items().len(),
+            96,
+            "the unchanged viewport also sizes the library"
+        );
+    }
+
+    #[test]
+    fn discover_keeps_results_and_position_when_loading_more_is_retried() {
+        let (mut app, _) = App::new(None);
+        app.loading = false;
+        let _ = app.update(Message::Navigate(Page::Discover));
+        let revision = app.search_revision;
+        let _ = app.update(Message::GridResized(iced::Size::new(1440.0, 800.0)));
+        let items = (1..=50)
+            .map(|id| json!({"id":id.to_string()}))
+            .collect::<Vec<_>>();
+        let _ = app.update(Message::ServiceDone(
+            "search".into(),
+            revision,
+            Ok(json!({"items":items,"page":1,"total_pages":2})),
+        ));
+        assert!(!app.service_busy);
+
+        let _ = app.update(Message::GridScrolled(app.grid.row_stride() * 5.0));
+        assert!(matches!(app.remote_load, RemoteLoad::Appending));
+        let _ = app.update(Message::ServiceDone(
+            "search".into(),
+            revision,
+            Err("offline".into()),
+        ));
+        let _ = app.update(Message::GridResized(iced::Size::new(1810.0, 800.0)));
+        assert_eq!(app.grid.visible_rows(app.grid_offset).start, 4);
+        assert_eq!(app.remote.len(), 50);
+        assert!(!app.service_busy);
+
+        let offset = app.grid_offset;
+        let _ = app.update(Message::RetryMore);
+        assert!(matches!(app.remote_load, RemoteLoad::Appending));
+        let _ = app.update(Message::ServiceDone(
+            "search".into(),
+            revision,
+            Ok(json!({"items":[{"id":"51"}],"page":2,"total_pages":2})),
+        ));
+        assert_eq!(app.remote[50]["id"], "51");
+        assert_eq!(app.grid_offset, offset);
+        assert!(!app.service_busy);
+    }
 }

@@ -1,0 +1,770 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>GalScaler</title>
+<style>
+  :root {
+    font: 16px/1.5 system-ui, "Noto Sans CJK SC", sans-serif;
+    color: #e5e9f0;
+    background: #23272e;
+    --muted: #a6adba;
+    --panel: #2d323b;
+    --line: #3e4451;
+    --accent: #79bdf2;
+    --live: #98c379;
+    --error: #f0939b;
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; }
+  header, main { max-width: 48rem; margin-inline: auto; padding-inline: 1.25rem; }
+  header {
+    min-height: 4.25rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid var(--line);
+  }
+  header strong { font-size: 1.2rem; letter-spacing: -.035em; }
+  header strong span { color: var(--accent); }
+  #connection { color: var(--muted); font-size: .875rem; }
+  #connection::before {
+    display: inline-block;
+    width: .45rem;
+    height: .45rem;
+    margin-right: .4rem;
+    border-radius: 50%;
+    background: currentColor;
+    vertical-align: .1em;
+    content: "";
+  }
+  #connection[data-online="true"] { color: var(--live); }
+  main { padding-block: 2.5rem; }
+  h1, h2, p { margin: 0; }
+  h1 { font-size: clamp(1.75rem, 6vw, 2.25rem); letter-spacing: -.035em; }
+  h2 { font-size: 1rem; overflow-wrap: anywhere; }
+  label { display: block; margin: 1.5rem 0 .5rem; font-size: .875rem; color: var(--muted); }
+  input, button { font: inherit; border-radius: .625rem; min-height: 2.75rem; }
+  input {
+    display: block;
+    width: 100%;
+    padding: .6rem .75rem;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    color: inherit;
+  }
+  button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: .5rem .75rem;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    color: inherit;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  button:disabled { cursor: default; opacity: .55; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #17212c; }
+  button.secondary { background: transparent; }
+  .icon-button { min-width: 2.75rem; padding: .5rem; }
+  .icon {
+    width: 1.125rem;
+    height: 1.125rem;
+    flex: none;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    vertical-align: -.2em;
+    pointer-events: none;
+  }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+  form { max-width: 24rem; }
+  .connect-fields { display: flex; gap: .5rem; }
+  .connect-fields input { min-width: 0; }
+  .title { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
+  .muted { color: var(--muted); font-size: .875rem; }
+  .error { color: var(--error); overflow-wrap: anywhere; }
+  [role="alert"]:not(:empty) { margin-block: .75rem; }
+  ul { list-style: none; padding: 0; margin: 1rem 0; display: grid; gap: .625rem; }
+  li {
+    min-height: 5rem;
+    padding: .875rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: .625rem 1rem;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: .875rem;
+  }
+  .game-info { min-width: 0; flex: 1 1 10rem; }
+  .actions { display: flex; gap: .5rem; margin-left: auto; }
+  .state { color: var(--accent); }
+  .state[data-state="running"] { color: var(--live); }
+  .state[data-state="failed"], .state[data-state="interrupted"] { color: var(--error); }
+  dialog {
+    width: min(42rem, calc(100% - 2rem));
+    max-height: 82vh;
+    padding: 1rem;
+    color: inherit;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: .875rem;
+  }
+  dialog::backdrop { background: #171a20cc; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+  #discovery { display: flex; flex-wrap: wrap; gap: .375rem; margin-top: .5rem; }
+  #discovery button { min-height: 2.25rem; font-size: .875rem; }
+  #player {
+    position: fixed; inset: 0; z-index: 1;
+    background: #090b0f; overflow: hidden; overscroll-behavior: none;
+    -webkit-user-select: none; user-select: none;
+  }
+  #picture, #touch { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #picture { object-fit: contain; }
+  #touch { touch-action: none; user-select: none; }
+  #loading {
+    position: absolute; inset: 50% 1rem auto; transform: translateY(-50%);
+    text-align: center; pointer-events: none;
+  }
+  #controls {
+    position: absolute; top: max(.65rem, env(safe-area-inset-top));
+    left: max(.65rem, env(safe-area-inset-left)); right: max(.65rem, env(safe-area-inset-right));
+    display: flex; align-items: flex-start; justify-content: space-between;
+    gap: .5rem; pointer-events: none;
+  }
+  .bar {
+    display: flex; flex-wrap: wrap; justify-content: flex-end;
+    border: 1px solid #ffffff2b; border-radius: .8rem; padding: .1875rem;
+    background: #181d29ce; backdrop-filter: blur(12px); pointer-events: auto;
+  }
+  .bar button {
+    border: 0; background: transparent; padding: .5rem;
+    touch-action: manipulation;
+  }
+  .bar button:active, .bar button[aria-pressed="true"] { background: #ffffff29; }
+  #skip { touch-action: none; }
+  #gesture-help { font-size: .95rem; }
+</style>
+<!--
+  Lucide Icons, ISC License.
+  Copyright (c) for portions of Lucide are held by Cole Bemis 2013-2022 as part of Feather (MIT).
+  All other copyright (c) for Lucide are held by Lucide Contributors 2022.
+
+  Permission to use, copy, modify, and/or distribute this software for any
+  purpose with or without fee is hereby granted, provided that the above
+  copyright notice and this permission notice appear in all copies.
+
+  THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+  WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+  MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+  ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+  WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+  ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+-->
+<svg hidden aria-hidden="true">
+  <symbol id="icon-plug" viewBox="0 0 24 24">
+    <path d="M12 22v-5" /><path d="M9 8V2" /><path d="M15 8V2" />
+    <path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z" />
+  </symbol>
+  <symbol id="icon-unplug" viewBox="0 0 24 24">
+    <path d="m19 5 3-3" /><path d="m2 22 3-3" />
+    <path d="M6.3 20.3a2.4 2.4 0 0 0 3.4 0L12 18l-6-6-2.3 2.3a2.4 2.4 0 0 0 0 3.4Z" />
+    <path d="M7.5 13.5 10 11" /><path d="M10.5 16.5 13 14" />
+    <path d="m12 6 6 6 2.3-2.3a2.4 2.4 0 0 0 0-3.4l-2.6-2.6a2.4 2.4 0 0 0-3.4 0Z" />
+  </symbol>
+  <symbol id="icon-file-text" viewBox="0 0 24 24">
+    <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
+    <path d="M14 2v4a2 2 0 0 0 2 2h4" /><path d="M10 9H8" /><path d="M16 13H8" /><path d="M16 17H8" />
+  </symbol>
+  <symbol id="icon-square" viewBox="0 0 24 24">
+    <rect width="18" height="18" x="3" y="3" rx="2" />
+  </symbol>
+  <symbol id="icon-cast" viewBox="0 0 24 24">
+    <path d="M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6" />
+    <path d="M2 12a9 9 0 0 1 8 8" /><path d="M2 16a5 5 0 0 1 4 4" /><line x1="2" x2="2.01" y1="20" y2="20" />
+  </symbol>
+  <symbol id="icon-x" viewBox="0 0 24 24">
+    <path d="M18 6 6 18" /><path d="m6 6 12 12" />
+  </symbol>
+  <symbol id="icon-arrow-left" viewBox="0 0 24 24">
+    <path d="m12 19-7-7 7-7" /><path d="M19 12H5" />
+  </symbol>
+  <symbol id="icon-ellipsis" viewBox="0 0 24 24">
+    <circle cx="5" cy="12" r="1" /><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" />
+  </symbol>
+  <symbol id="icon-speaker" viewBox="0 0 24 24">
+    <path d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z" />
+  </symbol>
+  <symbol id="icon-volume-2" viewBox="0 0 24 24">
+    <use href="#icon-speaker" /><path d="M16 9a5 5 0 0 1 0 6" /><path d="M19.364 18.364a9 9 0 0 0 0-12.728" />
+  </symbol>
+  <symbol id="icon-volume-x" viewBox="0 0 24 24">
+    <use href="#icon-speaker" /><line x1="22" x2="16" y1="9" y2="15" /><line x1="16" x2="22" y1="9" y2="15" />
+  </symbol>
+  <symbol id="icon-history" viewBox="0 0 24 24">
+    <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+    <path d="M3 3v5h5" /><path d="M12 7v5l4 2" />
+  </symbol>
+  <symbol id="icon-fast-forward" viewBox="0 0 24 24">
+    <polygon points="13 19 22 12 13 5 13 19" /><polygon points="2 19 11 12 2 5 2 19" />
+  </symbol>
+  <symbol id="icon-menu" viewBox="0 0 24 24">
+    <line x1="4" x2="20" y1="12" y2="12" /><line x1="4" x2="20" y1="6" y2="6" /><line x1="4" x2="20" y1="18" y2="18" />
+  </symbol>
+  <symbol id="icon-circle-help" viewBox="0 0 24 24">
+    <circle cx="12" cy="12" r="10" /><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" /><path d="M12 17h.01" />
+  </symbol>
+</svg>
+<header>
+  <strong>Gal<span>Scaler</span></strong>
+  <span id="connection" role="status">未连接</span>
+</header>
+<main>
+  <form id="connect">
+    <h1>连接 GalScaler</h1>
+    <div id="host-fields" hidden>
+      <label for="host">电脑地址</label>
+      <input id="host" placeholder="192.168.1.20:9771" inputmode="url" autocapitalize="none" spellcheck="false">
+      <div id="discovery"></div>
+    </div>
+    <label for="key">访问令牌</label>
+    <div class="connect-fields">
+      <input id="key" name="key" type="password" required minlength="32" autocapitalize="none" spellcheck="false">
+      <button type="submit" class="primary icon-button" aria-label="连接" title="连接">
+        <svg class="icon" aria-hidden="true"><use href="#icon-plug" /></svg>
+      </button>
+    </div>
+    <p id="connect-error" class="error" role="alert"></p>
+  </form>
+  <section id="library" hidden>
+    <div class="title">
+      <div><h1>游戏库</h1><p id="count" class="muted"></p></div>
+      <button id="disconnect" class="secondary icon-button" aria-label="断开" title="断开">
+        <svg class="icon" aria-hidden="true"><use href="#icon-unplug" /></svg>
+      </button>
+    </div>
+    <label for="search">搜索游戏</label>
+    <input id="search" type="search">
+    <p id="error" class="error" role="alert"></p>
+    <ul id="games"></ul>
+    <p id="empty" class="muted" hidden></p>
+  </section>
+</main>
+<template id="game">
+  <li>
+    <div class="game-info">
+      <h2></h2>
+      <p class="muted"><span class="state"></span><span class="quality"></span></p>
+      <p class="error" hidden></p>
+    </div>
+    <div class="actions">
+      <button data-op="log" class="secondary icon-button" aria-label="查看游戏日志" title="查看游戏日志">
+        <svg class="icon" aria-hidden="true"><use href="#icon-file-text" /></svg>
+      </button>
+      <button data-op="stop" class="secondary icon-button" aria-label="结束游戏" title="结束游戏" hidden>
+        <svg class="icon" aria-hidden="true"><use href="#icon-square" /></svg>
+      </button>
+      <button data-op="play" class="primary icon-button" aria-label="开始串流" title="开始串流">
+        <svg class="icon" aria-hidden="true"><use href="#icon-cast" /></svg>
+      </button>
+    </div>
+  </li>
+</template>
+<dialog id="log" aria-labelledby="log-title">
+  <div class="title">
+    <h2 id="log-title">游戏日志</h2>
+    <button class="secondary icon-button" aria-label="关闭日志" title="关闭日志">
+      <svg class="icon" aria-hidden="true"><use href="#icon-x" /></svg>
+    </button>
+  </div>
+  <pre></pre>
+</dialog>
+<section id="player" aria-label="游戏画面" hidden>
+  <video id="picture" autoplay playsinline></video>
+  <div id="touch" aria-label="游戏触控"></div>
+  <p id="loading" role="status">正在连接游戏…</p>
+  <div id="controls">
+    <div class="bar">
+      <button id="back" class="icon-button" aria-label="返回游戏库" title="返回游戏库">
+        <svg class="icon" aria-hidden="true"><use href="#icon-arrow-left" /></svg>
+      </button>
+    </div>
+    <div class="bar">
+      <button id="more" class="icon-button" aria-label="播放器控制" aria-expanded="true" aria-controls="actions" title="播放器控制">
+        <svg class="icon" aria-hidden="true"><use href="#icon-ellipsis" /></svg>
+      </button>
+      <div id="actions" class="bar" style="display:contents">
+        <button id="mute" class="icon-button" aria-label="静音" aria-pressed="false" title="静音">
+          <svg class="icon" aria-hidden="true"><use href="#icon-volume-2" /></svg>
+        </button>
+        <button id="history" class="icon-button" aria-label="回看剧情" title="回看剧情">
+          <svg class="icon" aria-hidden="true"><use href="#icon-history" /></svg>
+        </button>
+        <button id="skip" class="icon-button" aria-label="按住快进" title="按住快进">
+          <svg class="icon" aria-hidden="true"><use href="#icon-fast-forward" /></svg>
+        </button>
+        <button id="menu" class="icon-button" aria-label="游戏菜单" title="游戏菜单">
+          <svg class="icon" aria-hidden="true"><use href="#icon-menu" /></svg>
+        </button>
+        <button id="help" class="icon-button" aria-label="手势说明" title="手势说明">
+          <svg class="icon" aria-hidden="true"><use href="#icon-circle-help" /></svg>
+        </button>
+      </div>
+    </div>
+  </div>
+</section>
+<dialog id="gesture-help" aria-labelledby="gesture-title">
+  <div class="title">
+    <h2 id="gesture-title">触控手势</h2>
+    <button class="secondary icon-button" aria-label="关闭手势说明" title="关闭手势说明">
+      <svg class="icon" aria-hidden="true"><use href="#icon-x" /></svg>
+    </button>
+  </div>
+  <p>轻点选择或推进剧情。长按打开右键菜单。上下滑动滚动回看，横向拖动模拟鼠标拖拽。按住
+    <svg class="icon" aria-label="快进" role="img"><use href="#icon-fast-forward" /></svg>可连续快进。</p>
+</dialog>
+<script>
+  const $ = (id) => document.getElementById(id);
+  const form = $('connect'), library = $('library'), list = $('games'), log = $('log');
+  const search = $('search'), error = $('error'), connectError = $('connect-error');
+  const cards = new Map(), pending = new Set();
+  const states = {
+    starting: '正在启动', running: '正在运行', stopping: '正在停止',
+    exited: '已结束', failed: '启动失败', interrupted: '会话中断',
+  };
+  const active = (state) => ['starting', 'running', 'stopping'].includes(state);
+  let token = '', games = [], sessions = new Map(), revision = 0, refreshing = false;
+
+  const mobile = window.mygo?.call;
+  async function request(key, path, fields) {
+    let status, reply;
+    if (mobile) {
+      ({ status, reply } = await mobile('Mobile.Request', path, key, fields));
+    } else {
+      const response = await fetch(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key },
+        body: JSON.stringify(fields),
+        signal: AbortSignal.timeout(14000),
+      });
+      status = response.status;
+      reply = await response.json();
+    }
+    if (!reply.ok) {
+      const failure = new Error(reply.error || '请求失败');
+      failure.status = status;
+      throw failure;
+    }
+    return reply.result;
+  }
+
+  const rpc = (key, op, fields) => request(key, '/api/v1/rpc', { op, ...fields });
+
+  if (mobile) {
+    const host = $('host'), discovery = $('discovery');
+    $('host-fields').hidden = false;
+    host.required = true;
+    host.value = localStorage.getItem('galscaler-host') || '';
+    let discovering = false;
+    async function discover() {
+      if (form.hidden || discovering || document.hidden) return;
+      discovering = true;
+      try {
+        const servers = await mobile('Mobile.Discover');
+        discovery.replaceChildren(...(servers || []).map(({ name, address }) => {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'secondary';
+          button.textContent = name;
+          button.addEventListener('click', () => { host.value = address; $('key').focus(); });
+          return button;
+        }));
+      } catch {} finally { discovering = false; }
+    }
+    discover();
+    setInterval(discover, 4500);
+  }
+
+  function setConnected(online) {
+    $('connection').dataset.online = online;
+    $('connection').textContent = online ? '已连接' : '未连接';
+  }
+
+  function disconnect(message = '') {
+    leavePlayer();
+    token = '';
+    ++revision;
+    pending.clear();
+    cards.clear();
+    list.replaceChildren();
+    form.hidden = false;
+    library.hidden = true;
+    if (log.open) log.close();
+    setConnected(false);
+    connectError.textContent = message;
+    $('key').focus();
+  }
+
+  function render() {
+    const query = search.value.trim().toLowerCase();
+    const visible = games.filter(({ name }) => name.toLowerCase().includes(query));
+    const running = games.filter(({ id }) => active(sessions.get(id)?.state)).length;
+    $('count').textContent = `${games.length} 款游戏 · ${running} 个活动会话`;
+    $('empty').hidden = visible.length > 0;
+    $('empty').textContent = query ? '没有符合搜索条件的游戏。' : '可在桌面端添加游戏。';
+    const visibleIds = new Set(visible.map(({ id }) => id));
+    for (const [id, card] of cards) {
+      if (!visibleIds.has(id)) {
+        card.remove();
+        cards.delete(id);
+      }
+    }
+    visible.forEach((game, index) => {
+      let card = cards.get(game.id);
+      if (!card) {
+        card = $('game').content.firstElementChild.cloneNode(true);
+        for (const button of card.querySelectorAll('button')) {
+          button.addEventListener('click', () => command(game.id, button.dataset.op));
+        }
+        cards.set(game.id, card);
+      }
+      const session = sessions.get(game.id);
+      const state = session?.state ?? '';
+      const busy = pending.has(game.id);
+      const status = card.querySelector('.state');
+      const details = card.querySelector('.error');
+      const [logs, stop, play] = card.querySelectorAll('button');
+      card.querySelector('h2').textContent = game.name;
+      status.dataset.state = state;
+      status.textContent = states[state] ?? '未运行';
+      const quality = game.enhancement;
+      card.querySelector('.quality').textContent = quality.enabled
+        ? ` · ${quality.filter} · ${quality.output.height}p` : ' · 原始画质';
+      details.textContent = session?.error ?? '';
+      details.hidden = !session?.error;
+      logs.hidden = !session;
+      logs.disabled = busy;
+      stop.hidden = !active(state);
+      stop.disabled = busy || state === 'stopping';
+      play.title = active(state) ? '进入串流' : '开始串流';
+      play.setAttribute('aria-label', play.title);
+      play.disabled = busy || state === 'stopping' || (active(state) && !session?.streaming);
+      if (list.children[index] !== card) list.insertBefore(card, list.children[index] ?? null);
+    });
+  }
+
+  async function snapshot(key) {
+    const [library, status] = await Promise.all([rpc(key, 'list'), rpc(key, 'status')]);
+    return [library, new Map(status.sessions.map((session) => [session.game_id, session]))];
+  }
+
+  async function refresh() {
+    if (!token || refreshing || pending.size || document.hidden || player) return;
+    refreshing = true;
+    const key = token, current = revision;
+    try {
+      const data = await snapshot(key);
+      if (current !== revision) return;
+      [games, sessions] = data;
+      setConnected(true);
+      render();
+    } catch (failure) {
+      if (key !== token) return;
+      if (failure.status === 401) disconnect(failure.message);
+      else setConnected(false);
+    } finally {
+      refreshing = false;
+    }
+  }
+
+  async function command(id, op) {
+    const key = token;
+    ++revision;
+    pending.add(id);
+    error.textContent = '';
+    render();
+    try {
+      if (op === 'play') {
+        if (!active(sessions.get(id)?.state)) {
+          sessions.set(id, await rpc(key, 'launch_stream', { id }));
+        }
+        if (key === token) await playGame(id, key);
+        return;
+      }
+      const result = await rpc(key, op, { id });
+      if (key !== token) return;
+      if (op === 'log') {
+        log.querySelector('pre').textContent = result.text || '日志为空。';
+        log.showModal();
+      } else {
+        sessions.set(id, result);
+      }
+    } catch (failure) {
+      if (key !== token) return;
+      if (failure.status === 401) disconnect(failure.message);
+      else error.textContent = failure.message;
+    } finally {
+      pending.delete(id);
+      if (key === token) render();
+    }
+  }
+
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const input = $('key'), button = form.querySelector('button[type="submit"]');
+    button.disabled = true;
+    connectError.textContent = '';
+    try {
+      const key = input.value.trim();
+      if (mobile) {
+        const address = await mobile('Mobile.Connect', $('host').value);
+        localStorage.setItem('galscaler-host', address);
+      }
+      [games, sessions] = await snapshot(key);
+      token = key;
+      input.value = '';
+      error.textContent = '';
+      search.value = '';
+      form.hidden = true;
+      library.hidden = false;
+      setConnected(true);
+      render();
+      $('disconnect').focus();
+    } catch (failure) {
+      connectError.textContent = failure.message;
+    } finally {
+      button.disabled = false;
+    }
+  });
+  const playerView = $('player'), picture = $('picture'), touch = $('touch'), loading = $('loading');
+  const mute = $('mute'), muteIcon = mute.querySelector('use');
+  let player = null, gesture = null, lastPoint = { x: .5, y: .5 };
+
+  function setMuted(muted) {
+    picture.muted = muted;
+    mute.setAttribute('aria-pressed', String(muted));
+    mute.title = muted ? '取消静音' : '静音';
+    muteIcon.setAttribute('href', muted ? '#icon-volume-x' : '#icon-volume-2');
+  }
+
+  function send(message) {
+    const dc = player?.dc;
+    if (dc?.readyState !== 'open') return;
+    if (message.type === 'pointer' && !message.button && dc.bufferedAmount > 2048) return;
+    dc.send(JSON.stringify(message));
+  }
+
+  function viewport() {
+    const rect = playerView.getBoundingClientRect();
+    return {
+      width: Math.max(64, Math.round(rect.width * devicePixelRatio)),
+      height: Math.max(64, Math.round(rect.height * devicePixelRatio)),
+    };
+  }
+
+  function leavePlayer(message = '') {
+    if (!player) return;
+    const current = player;
+    cancelGesture();
+    send({ type: 'release' });
+    player = null;
+    current.abort.abort();
+    current.pc.close();
+    picture.srcObject = null;
+    playerView.hidden = true;
+    clearInterval(current.heartbeat);
+    clearTimeout(current.deadline);
+    if ($('gesture-help').open) $('gesture-help').close();
+    if (mobile) mobile('Mobile.Playing', false).catch(() => {});
+    error.textContent = message;
+    refresh();
+  }
+
+  async function playGame(id, key) {
+    leavePlayer();
+    if (!window.RTCPeerConnection) throw new Error('当前 WebView 无法播放 WebRTC');
+    const pc = new RTCPeerConnection({ iceServers: [] });
+    const dc = pc.createDataChannel('controls', { negotiated: true, id: 0 });
+    const current = { pc, dc, abort: new AbortController() };
+    player = current;
+    const media = new MediaStream();
+    picture.srcObject = media;
+    loading.hidden = false;
+    loading.textContent = '正在连接游戏…';
+    setMuted(false);
+    playerView.hidden = false;
+    lastPoint = { x: .5, y: .5 };
+    if (mobile) mobile('Mobile.Playing', true).catch(() => {});
+    try {
+      pc.ontrack = ({ track }) => {
+        if (player !== current) return;
+        media.addTrack(track);
+        picture.play().catch((failure) => {
+          if (player !== current || failure.name !== 'NotAllowedError') return;
+          setMuted(true);
+          picture.play().catch(() => {});
+        });
+      };
+      pc.onconnectionstatechange = () => {
+        if (player === current && ['failed', 'closed'].includes(pc.connectionState)) {
+          leavePlayer('串流连接已断开');
+        }
+      };
+      dc.onopen = () => {
+        if (player !== current) return;
+        send(viewport());
+        current.heartbeat = setInterval(() => send(viewport()), 4000);
+      };
+      dc.onmessage = ({ data }) => {
+        if (player !== current) return;
+        try {
+          const { error } = JSON.parse(data);
+          if (error) leavePlayer(error);
+        } catch {}
+      };
+      dc.onclose = () => {
+        if (player === current) leavePlayer('游戏串流已结束');
+      };
+      current.deadline = setTimeout(() => {
+        if (player === current && !picture.videoWidth) leavePlayer('等待游戏画面超时，请查看会话日志');
+      }, 25000);
+      pc.addTransceiver('video', { direction: 'recvonly' });
+      pc.addTransceiver('audio', { direction: 'recvonly' });
+      await pc.setLocalDescription(await pc.createOffer());
+      await new Promise((resolve, reject) => {
+        const cleanup = () => {
+          clearTimeout(timer);
+          pc.removeEventListener('icegatheringstatechange', done);
+          current.abort.signal.removeEventListener('abort', aborted);
+        };
+        const done = () => {
+          if (pc.iceGatheringState !== 'complete') return;
+          cleanup();
+          resolve();
+        };
+        const aborted = () => { cleanup(); reject(new Error('已离开串流')); };
+        const timer = setTimeout(() => { cleanup(); reject(new Error('局域网连接协商超时')); }, 4500);
+        pc.addEventListener('icegatheringstatechange', done);
+        current.abort.signal.addEventListener('abort', aborted, { once: true });
+        if (current.abort.signal.aborted) aborted();
+        else done();
+      });
+      const answer = await request(key, '/api/v1/stream/' + id, { sdp: pc.localDescription.sdp, ...viewport() });
+      if (player === current) await pc.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
+    } catch (failure) {
+      if (player === current) leavePlayer(failure.message);
+    }
+  }
+
+  new ResizeObserver(() => {
+    if (player) {
+      cancelGesture();
+      send(viewport());
+    }
+  }).observe(playerView);
+  picture.addEventListener('playing', () => { loading.hidden = true; });
+  $('back').addEventListener('click', () => leavePlayer());
+  window.addEventListener('pagehide', () => leavePlayer());
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      cancelGesture();
+      send({ type: 'release' });
+    }
+  });
+
+  function point(event, clamp = false) {
+    const rect = picture.getBoundingClientRect(), { videoWidth: w, videoHeight: h } = picture;
+    if (!w || !h) return null;
+    const scale = Math.min(rect.width / w, rect.height / h);
+    const x = (event.clientX - rect.left - (rect.width - w * scale) / 2) / (w * scale);
+    const y = (event.clientY - rect.top - (rect.height - h * scale) / 2) / (h * scale);
+    if (!clamp && (x < 0 || x >= 1 || y < 0 || y >= 1)) return null;
+    return { x: Math.min(.999999, Math.max(0, x)), y: Math.min(.999999, Math.max(0, y)) };
+  }
+  function pointer(point, button, pressed) {
+    lastPoint = point;
+    send({ type: 'pointer', ...point, button, pressed });
+  }
+  function click(point, button) {
+    pointer(point, button, true);
+    pointer(point, button, false);
+  }
+  function cancelGesture() {
+    if (!gesture) return;
+    clearTimeout(gesture.timer);
+    if (gesture.mode === 'drag') pointer(lastPoint, 'left', false);
+    gesture = null;
+  }
+  touch.addEventListener('pointerdown', event => {
+    if (!event.isPrimary || gesture) return;
+    const at = point(event);
+    if (!at) return;
+    touch.setPointerCapture(event.pointerId);
+    const g = { id: event.pointerId, at, x: event.clientX, y: event.clientY, wheel: 0, mode: 'tap' };
+    gesture = g;
+    g.timer = setTimeout(() => {
+      if (gesture === g) {
+        g.mode = 'menu';
+        click(g.at, 'right');
+      }
+    }, 460);
+  });
+  touch.addEventListener('pointermove', event => {
+    const g = gesture;
+    if (!g || g.id !== event.pointerId) return;
+    const dx = event.clientX - g.x, dy = event.clientY - g.y;
+    if (g.mode === 'tap' && Math.hypot(dx, dy) > 12) {
+      clearTimeout(g.timer);
+      g.mode = Math.abs(dx) > Math.abs(dy) ? 'drag' : 'wheel';
+      if (g.mode === 'drag') pointer(g.at, 'left', true);
+      else pointer(g.at);
+    }
+    if (g.mode === 'drag') pointer(point(event, true) || lastPoint);
+    if (g.mode === 'wheel') {
+      const wheel = Math.trunc(dy / 24);
+      if (wheel !== g.wheel) send({ type: 'scroll', steps: Math.max(-8, Math.min(8, g.wheel - wheel)) });
+      g.wheel = wheel;
+    }
+  });
+  touch.addEventListener('pointerup', event => {
+    const g = gesture;
+    if (!g || g.id !== event.pointerId) return;
+    if (g.mode === 'tap') click(point(event) || g.at, event.button === 2 ? 'right' : 'left');
+    cancelGesture();
+  });
+  touch.addEventListener('lostpointercapture', cancelGesture);
+  playerView.addEventListener('contextmenu', event => event.preventDefault());
+  $('more').addEventListener('click', () => {
+    const actions = $('actions');
+    actions.hidden = !actions.hidden;
+    $('more').setAttribute('aria-expanded', String(!actions.hidden));
+  });
+  mute.addEventListener('click', () => {
+    setMuted(!picture.muted);
+    if (!picture.muted) picture.play().catch(() => {});
+  });
+  $('history').addEventListener('click', () => { pointer(lastPoint); send({ type: 'scroll', steps: -3 }); });
+  $('menu').addEventListener('click', () => click(lastPoint, 'right'));
+  $('skip').addEventListener('pointerdown', event => {
+    $('skip').setPointerCapture(event.pointerId);
+    send({ type: 'key', key: 'control', pressed: true });
+  });
+  $('skip').addEventListener('lostpointercapture', () => send({ type: 'key', key: 'control', pressed: false }));
+  $('help').addEventListener('click', () => $('gesture-help').showModal());
+  $('gesture-help').querySelector('button').addEventListener('click', () => $('gesture-help').close());
+
+  search.addEventListener('input', render);
+  $('disconnect').addEventListener('click', () => disconnect());
+  log.querySelector('button').addEventListener('click', () => log.close());
+  document.addEventListener('visibilitychange', refresh);
+  setInterval(refresh, 2500);
+</script>
+</html>

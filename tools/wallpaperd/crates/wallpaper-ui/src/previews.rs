@@ -23,7 +23,6 @@ pub struct Previews {
     cached_bytes: usize,
     generation: u64,
     task: Option<iced::task::Handle>,
-    pub pending: usize,
 }
 
 fn source(item: &Value) -> Option<Cow<'_, str>> {
@@ -47,7 +46,6 @@ impl Previews {
             task.abort();
         }
         self.generation += 1;
-        self.pending = 0;
         self.sources.clear();
     }
 
@@ -93,7 +91,6 @@ impl Previews {
             }
         }
         work.retain(|(source, _)| !self.images.contains_key(source));
-        self.pending = work.len();
         let generation = self.generation;
         let (task, handle) = Task::run(requests(work, generation), |message| message).abortable();
         self.task = Some(handle.abort_on_drop());
@@ -102,7 +99,6 @@ impl Previews {
 
     pub fn accept(&mut self, generation: u64, source: String, handle: Option<image::Handle>) {
         if generation == self.generation && self.sources.contains(&source) {
-            self.pending = self.pending.saturating_sub(1);
             let size = |handle: &Option<image::Handle>| match handle {
                 Some(image::Handle::Rgba { width, height, .. }) => {
                     *width as usize * *height as usize * 4
@@ -244,11 +240,10 @@ mod tests {
         let mut previews = Previews::default();
         let item = json!({"thumbnail":"first.png"});
         let _ = previews.load(vec![item.clone(), item.clone()]);
-        assert_eq!(previews.pending, 1);
+        assert_eq!(previews.sources, ["first.png"]);
         let generation = previews.generation;
         let handle = image::Handle::from_rgba(1, 1, vec![255; 4]);
         previews.accept(generation, "first.png".into(), Some(handle.clone()));
-        assert_eq!(previews.pending, 0);
         let _ = previews.load(vec![item.clone()]);
         assert_eq!(
             previews.get(&item).unwrap().as_ref().unwrap().id(),
@@ -262,14 +257,13 @@ mod tests {
             previews.get(&item).unwrap().as_ref().unwrap().id(),
             handle.id()
         );
-        assert_eq!(previews.pending, 1);
         previews.accept(previews.generation, "next.png".into(), None);
         assert!(matches!(previews.get(&next), Some(None)));
-        previews.clear();
-        assert_eq!(previews.pending, 0);
+        previews.retry_failed();
         assert!(previews.get(&next).is_none());
-        let _ = previews.load(vec![next]);
-        assert_eq!(previews.pending, 1, "refresh retries failed previews");
+        assert!(previews.get(&item).is_some());
+        previews.clear();
+        assert!(previews.get(&item).is_none());
     }
 
     #[test]
@@ -279,7 +273,7 @@ mod tests {
         let mut cover = grid.clone();
         cover["cover_previews"] = json!([]);
         let _ = previews.load(vec![grid.clone(), cover.clone()]);
-        assert_eq!(previews.pending, 2);
+        assert_eq!(previews.sources.len(), 2);
         let small = image::Handle::from_rgba(1, 1, vec![0; 4]);
         previews.accept(
             previews.generation,

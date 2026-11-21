@@ -21,6 +21,7 @@ const APP: AppId = AppId(431960);
 const WAIT: Duration = Duration::from_secs(20);
 const THUMBNAIL_SIZE: (u32, u32) = (480, 320);
 const COVER_SIZE: (u32, u32) = (960, 640);
+pub const MAX_SEARCH_PAGE: u64 = 10_000;
 type Reply = Result<Value, String>;
 struct Message {
     action: Value,
@@ -42,7 +43,7 @@ pub fn execute(action: Value) -> Reply {
     let worker = WORKER.get_or_init(|| {
         let (tx, rx) = mpsc::channel::<Message>();
         thread::spawn(move || {
-            let mut service = Steam::new();
+            let mut service = Steam::new(false);
             loop {
                 match rx.recv_timeout(Duration::from_millis(250)) {
                     Ok(message) => {
@@ -70,6 +71,10 @@ pub fn execute(action: Value) -> Reply {
         .map_err(|_| "Steam 响应超时，请检查 Steam 客户端连接后重试。".to_string())?
 }
 
+pub fn diagnose() -> Reply {
+    Steam::new(true).status()
+}
+
 fn validate_action(action: &Value) -> Result<(), String> {
     Filters::from_action(action)?;
     if action["text"]
@@ -80,7 +85,7 @@ fn validate_action(action: &Value) -> Result<(), String> {
     }
     if action["page"]
         .as_u64()
-        .is_some_and(|page| page == 0 || page > 10000)
+        .is_some_and(|page| !(1..=MAX_SEARCH_PAGE).contains(&page))
     {
         return Err("页码必须在 1 到 10000 之间。".into());
     }
@@ -193,10 +198,10 @@ struct Steam {
 }
 
 impl Steam {
-    fn new() -> Self {
+    fn new(read_only: bool) -> Self {
         let (tx, download_results) = mpsc::channel();
         let mut error = None;
-        // main sets SteamAppId/SteamGameId before it starts any worker threads.
+        // The UI sets SteamAppId and SteamGameId before initializing the SDK.
         let client = match Client::init() {
             Ok(client) => Some(client),
             Err(reason) => {
@@ -225,8 +230,6 @@ impl Steam {
                 job.status = "queued".into();
             }
         }
-        let read_only = std::env::args().any(|arg| arg == "--diagnose")
-            || std::env::var("MISARI_READ_ONLY").as_deref() == Ok("1");
         let current_account = client
             .as_ref()
             .map(|client| client.user().steam_id().raw().to_string());
@@ -279,14 +282,6 @@ impl Steam {
     }
 
     fn execute(&mut self, action: Value, discovery: Option<Value>) -> Reply {
-        if self.read_only
-            && !matches!(
-                action["action"].as_str().unwrap_or("status"),
-                "status" | "search" | "detail" | "explore"
-            )
-        {
-            return Err("当前实例为只读验证模式，Steam 账号和下载状态不会被修改。".into());
-        }
         if let Some(client) = &self.client {
             let account_id = client.user().steam_id().raw();
             if self.account_id != account_id {
@@ -306,7 +301,9 @@ impl Steam {
                 } else {
                     self.search(&action)?
                 };
-                self.items.clear();
+                if action["_append"] != true {
+                    self.items.clear();
+                }
                 if let Some(items) = result["items"].as_array_mut() {
                     for item in items {
                         self.decorate(item);

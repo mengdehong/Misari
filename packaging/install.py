@@ -35,7 +35,7 @@ def steam_library(target, profile):
         f"*/steamworks-sys-{version}/lib/steam/redistributable_bin/linux64/libsteam_api.so"
     ))
     if not candidates:
-        raise RuntimeError("找不到此构建使用的 Steam SDK 运行库，请先构建 misari-wallpaper。")
+        raise RuntimeError("找不到此构建使用的 Steam SDK 运行库，请先构建启用 ui 的 wallpaperd。")
     return candidates[0]
 
 
@@ -79,16 +79,15 @@ def main():
     prefix = args.prefix.expanduser().resolve()
     manifests = [ROOT / "niri/Cargo.toml", MANIFEST]
     commands = []
-    for manifest, binaries in zip(manifests, (["niri"], ["wallpaperd", "misari-wallpaper"])):
+    for manifest, binary in zip(manifests, ("niri", "wallpaperd")):
         command = ["cargo", "build", "--locked"]
         if args.profile == "release":
             command.append("--release")
         if args.target_dir:
             command.extend(["--target-dir", str(args.target_dir.expanduser().resolve())])
         if manifest == MANIFEST:
-            command.extend(["-p", "wallpaperd", "-p", "wallpaper-ui", "--features", "wallpaperd/web"])
-        for binary in binaries:
-            command.extend(["--bin", binary])
+            command.extend(["--features", "ui,web"])
+        command.extend(["--bin", binary])
         commands.append((manifest.parent, command))
     if args.dry_run:
         for directory, command in commands:
@@ -102,16 +101,27 @@ def main():
     target = targets[1]
     binaries = {
         "niri": targets[0] / args.profile / "niri",
-        **{name: target / args.profile / name for name in ("misari-wallpaper", "wallpaperd")},
+        "wallpaperd": target / args.profile / "wallpaperd",
     }
     for name, path in binaries.items():
         if not path.is_file():
             raise RuntimeError(f"尚未构建 {name}：{path}")
     library = steam_library(target, args.profile)
-    app = prefix / "lib/misari-wallpaper"
-    launcher = prefix / "bin/misari-wallpaper"
-    cef = prefix / "lib/wallpaperd/web"
-    release = target / args.profile
+    if args.skip_build:
+        env = dict(os.environ)
+        library_path = env.get("LD_LIBRARY_PATH")
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(
+            [str(library.parent), library_path] if library_path else [str(library.parent)]
+        )
+        result = subprocess.run([binaries["wallpaperd"], "ui", "--help"], env=env, stdout=subprocess.DEVNULL)
+        if result.returncode:
+            raise RuntimeError("已有 wallpaperd 无法运行 UI，请重新构建后安装。")
+    wallpaperd = prefix / "bin/wallpaperd"
+    runtime = prefix / "lib/wallpaperd"
+    cef = runtime / "web"
+    cef_source = target / args.profile
+    if not (cef_source / "libcef.so").is_file():
+        cef_source = cef_source / "build"
     runtime_files = [
         "libcef.so", "libvk_swiftshader.so", "libvulkan.so.1",
         "chrome_100_percent.pak", "chrome_200_percent.pak", "resources.pak",
@@ -119,30 +129,29 @@ def main():
         "chrome-sandbox", "LICENSE.txt", "CREDITS.html",
     ]
     for name in runtime_files + ["locales/en-US.pak"]:
-        if not (release / name).is_file():
-            raise RuntimeError(f"缺少 Web 运行库文件：{release / name}，请先构建启用 web 的 wallpaperd。")
+        if not (cef_source / name).is_file():
+            raise RuntimeError(f"缺少 Web 运行库文件：{cef_source / name}，请先构建启用 web 的 wallpaperd。")
+    atomic_copy(library, runtime / "libsteam_api.so", 0o755)
+    atomic_copy(ROOT / "tools/wallpaperd/crates/wallpaper-ui/assets/lucide/LICENSE", runtime / "LICENSE.lucide", 0o644)
+    for name in runtime_files:
+        atomic_copy(cef_source / name, cef / name, 0o755 if name == "chrome-sandbox" else 0o644)
+    for source in (cef_source / "locales").glob("*.pak"):
+        atomic_copy(source, cef / "locales" / source.name, 0o644)
     for name, source in binaries.items():
-        destination = app / name if name == "misari-wallpaper" else prefix / "bin" / name
-        atomic_copy(source, destination, 0o755)
-    # The UI locates wallpaperd beside itself; keep only one installed binary.
-    sibling = app / "wallpaperd"
-    sibling.unlink(missing_ok=True)
-    sibling.symlink_to("../../bin/wallpaperd")
-    atomic_copy(library, app / "libsteam_api.so", 0o755)
-    atomic_copy(ROOT / "tools/wallpaperd/crates/wallpaper-ui/assets/lucide/LICENSE", app / "LICENSE.lucide", 0o644)
-    script = (
-        "#!/bin/sh\n"
-        f'exec {shlex.quote(str(app / "misari-wallpaper"))} "$@"\n'
-    )
-    atomic_write(launcher, script.encode(), 0o755)
+        atomic_copy(source, prefix / "bin" / name, 0o755)
     desktop = (ROOT / "packaging/misari-wallpaper.desktop").read_text()
-    desktop = desktop.replace("Exec=misari-wallpaper", f"Exec={desktop_argument(str(launcher))}")
+    desktop = desktop.replace("Exec=wallpaperd ", f"Exec={desktop_argument(str(wallpaperd))} ")
     atomic_write(prefix / "share/applications/io.misari.wallpaper.desktop", desktop.encode())
     atomic_copy(ROOT / "packaging/misari-wallpaper.svg", prefix / "share/icons/hicolor/scalable/apps/io.misari.wallpaper.svg", 0o644)
-    for name in runtime_files:
-        atomic_copy(release / name, cef / name, 0o755 if name == "chrome-sandbox" else 0o644)
-    for source in (release / "locales").glob("*.pak"):
-        atomic_copy(source, cef / "locales" / source.name, 0o644)
+
+    # Remove files installed by earlier wallpaper releases.
+    (prefix / "bin/misari-wallpaper").unlink(missing_ok=True)
+    old_app = prefix / "lib/misari-wallpaper"
+    if old_app.is_dir() and not old_app.is_symlink():
+        for name in ("misari-wallpaper", "wallpaperd", "libsteam_api.so", "LICENSE.lucide"):
+            (old_app / name).unlink(missing_ok=True)
+        if not any(old_app.iterdir()):
+            old_app.rmdir()
 
     resources = ROOT / "niri/resources"
     session = (resources / "niri-session").read_text().replace("exec niri --session", f"exec {shlex.quote(str(prefix / 'bin/niri'))} --session")

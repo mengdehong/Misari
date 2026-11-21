@@ -9,6 +9,7 @@ members = ["crates/wallpaper-media", "crates/we-scene", "crates/we-web", "crates
 resolver = "3"
 
 [features]
+ui = ["dep:wallpaper-ui"]
 web = ["dep:we-web"]
 
 [dependencies]
@@ -36,6 +37,7 @@ zbus = { version = "5", default-features = false, features = ["async-io", "block
 we-scene = { path = "crates/we-scene" }
 we-web = { path = "crates/we-web", optional = true }
 wallpaper-media = { path = "crates/wallpaper-media" }
+wallpaper-ui = { path = "crates/wallpaper-ui", optional = true }
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 url = "2"
 unicode-width = "0.2"

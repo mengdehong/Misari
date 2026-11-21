@@ -1,0 +1,9 @@
+{
+  "mobile": {
+    "id": "discovery",
+    "android": {
+      "sources": ["Discovery.kt"],
+      "class": "GalScalerDiscovery"
+    }
+  }
+}

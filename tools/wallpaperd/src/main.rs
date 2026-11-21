@@ -48,6 +48,16 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Serve,
+    /// Open the wallpaper manager.
+    #[cfg(feature = "ui")]
+    Ui {
+        /// Open a specific page.
+        #[arg(long)]
+        page: Option<String>,
+        /// Print the service and Steam status.
+        #[arg(long)]
+        diagnose: bool,
+    },
     /// List wallpapers by name and type; pipes retain the full JSON response.
     List {
         /// Print the full JSON response, including paths and project metadata.
@@ -180,6 +190,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Serve => session::serve(),
+        #[cfg(feature = "ui")]
+        Command::Ui { page, diagnose } => Ok(wallpaper_ui::run(page, diagnose)?),
         Command::RenderWorker { output } => {
             // This is a fresh child entry, before any application threads/CEF initialization.
             unsafe {

@@ -22,6 +22,10 @@ static START: Mutex<()> = Mutex::new(());
 static ACTIVATIONS: OnceLock<Mutex<mpsc::Receiver<String>>> = OnceLock::new();
 const ACTIVATION_LIMIT: usize = 128;
 
+pub const DEFAULT_UI_SCALE: u16 = 100;
+pub const MIN_UI_SCALE: u16 = 80;
+pub const MAX_UI_SCALE: u16 = 150;
+
 fn activation_name(page: Option<String>) -> Result<String, String> {
     let page = page.unwrap_or_else(|| "open".into());
     match page.as_str() {
@@ -176,18 +180,35 @@ fn home() -> PathBuf {
         .unwrap_or_default()
 }
 
+fn ui_scale_path() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".config"))
+        .join("misari/wallpaper-ui-scale")
+}
+
+pub fn load_ui_scale() -> u16 {
+    fs::read_to_string(ui_scale_path())
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .filter(|value| (MIN_UI_SCALE..=MAX_UI_SCALE).contains(value))
+        .unwrap_or(DEFAULT_UI_SCALE)
+}
+
+pub fn save_ui_scale(scale: u16) -> std::io::Result<()> {
+    let path = ui_scale_path();
+    fs::create_dir_all(path.parent().unwrap())?;
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    fs::write(&temporary, format!("{scale}\n"))?;
+    fs::rename(temporary, path)
+}
+
 fn socket_path() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".local/run"))
         .join("misari/wallpaperd.sock")
-}
-
-fn daemon() -> Option<PathBuf> {
-    let sibling = std::env::current_exe().ok()?.with_file_name("wallpaperd");
-    [sibling, home().join(".local/bin/wallpaperd")]
-        .into_iter()
-        .find(|path| path.is_file())
 }
 
 fn connect(start: bool) -> Result<UnixStream, String> {
@@ -207,7 +228,7 @@ fn connect(start: bool) -> Result<UnixStream, String> {
         return Ok(stream);
     }
     let executable =
-        daemon().ok_or("未找到壁纸服务。请重新安装 Misari，或将 wallpaperd 放在应用旁。")?;
+        std::env::current_exe().map_err(|error| format!("无法定位 wallpaperd：{error}"))?;
     let mut child = Command::new(executable)
         .arg("serve")
         .stdin(Stdio::null())
@@ -694,7 +715,7 @@ fn prepare_thumbnail(path: &Path) -> Result<PathBuf, String> {
 /// Read-only diagnostics deliberately do not auto-start or alter the daemon.
 pub fn diagnose() -> Value {
     let response = exchange("get", json!({}), false);
-    json!({"application":"Misari","socket":socket_path(),"daemon_executable":daemon(),
+    json!({"application":"Misari","socket":socket_path(),"daemon_executable":std::env::current_exe().ok(),
         "wayland_display":std::env::var("WAYLAND_DISPLAY").ok(),
         "session_type":std::env::var("XDG_SESSION_TYPE").ok(),
         "steam_installed":home().join("Share/Steam/steamapps/common/wallpaper_engine").is_dir(),

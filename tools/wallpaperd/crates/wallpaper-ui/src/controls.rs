@@ -481,6 +481,51 @@ impl<'a, Message: Clone + 'a> From<Checkbox<'a, Message>> for Element<'a, Messag
     }
 }
 
+pub fn switch_row<'a, Message: Clone + 'a>(
+    label: &'a str,
+    value: bool,
+    message: Message,
+) -> Element<'a, Message> {
+    use iced::widget::{self, toggler};
+
+    let indicator = toggler(value).size(20).style(move |theme, _| {
+        let mut style = toggler::default(theme, toggler::Status::Active { is_toggled: value });
+        if !value {
+            style.background = palette::CARD.into();
+            style.background_border_color = palette::MUTED.scale_alpha(0.35);
+            style.background_border_width = 1.0;
+            style.foreground = palette::MUTED.into();
+        }
+        style
+    });
+    let row = iced::widget::button(
+        widget::row![widget::text(label).size(14).width(Length::Fill), indicator]
+            .spacing(12)
+            .align_y(iced::Alignment::Center),
+    )
+    .padding([10, 16])
+    .width(Length::Fill)
+    .on_press(message.clone())
+    .style(|_, status| button::Style {
+        background: match status {
+            button::Status::Hovered => Some(palette::WASH.scale_alpha(0.12).into()),
+            button::Status::Pressed => Some(palette::WASH.scale_alpha(0.07).into()),
+            _ => None,
+        },
+        text_color: palette::TEXT,
+        border: iced::Border {
+            radius: 8.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    Control::new(row.into(), true, move |key| {
+        activate_key(key).then(|| message.clone())
+    })
+    .into()
+}
+
 pub struct PickList<'a, T: ToString + PartialEq + Clone, Message> {
     inner: iced::widget::PickList<'a, T, Vec<T>, T, Message>,
     options: Vec<T>,

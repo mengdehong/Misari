@@ -1,11 +1,13 @@
-use crate::controls::{button, checkbox, pick_list, slider, text_input};
+use crate::controls::{button, checkbox, pick_list, slider, switch_row, text_input};
+use crate::engine::{DEFAULT_UI_SCALE, MAX_UI_SCALE, MIN_UI_SCALE};
 use crate::filters::{GROUPS, Group};
 use crate::icons::{Icon, icon};
-use crate::{App, Message, Page, array, strv};
+use crate::{App, Message, Page, RemoteLoad, Zoom, array, strv, zoom_shortcut};
 use iced::{
     Alignment, Border, Color, Element,
     Length::{Fill, Fixed, Shrink},
     Theme,
+    advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, renderer, widget::Tree},
     widget::{self, Column, Row, Space, column, container, image, progress_bar, row, text},
 };
 use serde_json::{Value, json};
@@ -193,12 +195,10 @@ fn preview<'a>(app: &App, item: &Value, height: f32, fade: bool) -> Element<'a, 
     let preview = app.previews.get(item);
     let handle = preview.and_then(Clone::clone);
     let cover = item["cover_previews"].is_array();
-    let label = if matches!(preview, Some(None)) {
-        "预览暂不可用"
-    } else if cover || item["preview_url"].is_string() || item["thumbnail"].is_string() {
-        ""
-    } else {
-        "暂无预览"
+    let label = match preview {
+        Some(None) => "预览暂不可用",
+        None if app.previews.finished(item) => "暂无预览",
+        _ => "",
     };
     widget::stack![
         container(muted(label))
@@ -611,7 +611,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
                 .padding(20),
         );
     }
-    container(layers)
+    container(layers.push(Element::new(ZoomKeys)))
         .width(Fill)
         .height(Fill)
         .style(|_| container::Style {
@@ -620,6 +620,50 @@ pub fn view(app: &App) -> Element<'_, Message> {
         })
         .into()
 }
+
+struct ZoomKeys;
+
+impl Widget<Message, Theme, iced::Renderer> for ZoomKeys {
+    fn size(&self) -> iced::Size<iced::Length> {
+        iced::Size::new(Shrink, Shrink)
+    }
+
+    fn layout(&mut self, _: &mut Tree, _: &iced::Renderer, _: &layout::Limits) -> layout::Node {
+        layout::Node::new(iced::Size::ZERO)
+    }
+
+    fn draw(
+        &self,
+        _: &Tree,
+        _: &mut iced::Renderer,
+        _: &Theme,
+        _: &renderer::Style,
+        _: Layout<'_>,
+        _: mouse::Cursor,
+        _: &iced::Rectangle,
+    ) {
+    }
+
+    fn update(
+        &mut self,
+        _: &mut Tree,
+        event: &iced::Event,
+        _: Layout<'_>,
+        _: mouse::Cursor,
+        _: &iced::Renderer,
+        _: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        _: &iced::Rectangle,
+    ) {
+        // Capture before the text fields can insert the character. The subscription handles zoom.
+        if let iced::Event::Keyboard(event) = event
+            && zoom_shortcut(event).is_some()
+        {
+            shell.capture_event();
+        }
+    }
+}
+
 fn sidebar(app: &App) -> Element<'_, Message> {
     if app.filters_open && matches!(app.page, Page::Library | Page::Discover | Page::Workshop) {
         return crate::motion::enter(filter_panel(app), "filters", iced::Vector::new(-8.0, 0.0));
@@ -723,21 +767,6 @@ fn sidebar(app: &App) -> Element<'_, Message> {
                 }),
             )
         };
-    }
-    if !collapsed {
-        let logged = app.service["account"]["logged_in"] == true;
-        nav = nav.push(Space::new().height(15)).push(
-            row![
-                text("●").size(10).color(MUTED),
-                text(if logged {
-                    strv(&app.service["account"], "name")
-                } else {
-                    "连接 Steam"
-                })
-                .size(12)
-            ]
-            .spacing(8),
-        );
     }
     let pane = container(nav)
         .id("navigation-pane")
@@ -966,24 +995,16 @@ fn filter_panel(app: &App) -> Element<'_, Message> {
 }
 
 fn browser(app: &App) -> Element<'_, Message> {
-    let remote = matches!(app.page, Page::Discover | Page::Workshop);
+    let remote = app.page.is_remote();
     let values = if remote {
         app.remote.iter().collect::<Vec<_>>()
     } else {
         app.filtered()
     };
     let count = values.len();
-    let page_size = app.page_size;
-    let pages = if remote {
-        app.remote_pages
-    } else {
-        count.div_ceil(page_size)
-    };
-    let page = if remote {
-        app.displayed_remote_page.saturating_sub(1)
-    } else {
-        app.page_index.min(pages.saturating_sub(1))
-    };
+    let page_size = app.grid.page_size();
+    let pages = count.div_ceil(page_size);
+    let page = app.page_index.min(pages.saturating_sub(1));
     let title = row![
         text(app.page.title()).size(28).width(Fill),
         icon_button(Icon::Refresh, "刷新", Some(Message::Refresh)),
@@ -1047,32 +1068,42 @@ fn browser(app: &App) -> Element<'_, Message> {
         }
         controls = controls.push(search).push(filter_button);
         if remote {
-            controls = controls.push(primary("搜索", Message::SearchNow, !app.service_busy));
+            controls = controls.push(primary("搜索", Message::SearchNow, true));
         }
-        let pagination = row![
-            icon_button(
-                Icon::ArrowLeft,
-                "上一页",
-                (page > 0 && !app.loading && !app.service_busy && !app.remote_loading())
-                    .then_some(Message::Page(-1))
-            ),
-            container(muted(format!("{} / {}", page + 1, pages.max(1)))).center_x(76),
-            icon_button(
-                Icon::ArrowRight,
-                "下一页",
-                (page + 1 < pages && !app.loading && !app.service_busy && !app.remote_loading())
-                    .then_some(Message::Page(1))
-            )
-        ]
-        .spacing(6)
-        .align_y(Alignment::Center);
-        controls = controls
-            .push(
-                pick_list(sorts, Some(app.sort.clone()), Message::Sort)
-                    .padding(11)
-                    .width(112),
-            )
-            .push(pagination);
+        controls = controls.push(
+            pick_list(sorts, Some(app.sort.clone()), Message::Sort)
+                .padding(11)
+                .width(112),
+        );
+        if remote {
+            match app.remote_load {
+                RemoteLoad::Appending => controls = controls.push(muted("正在加载更多…")),
+                RemoteLoad::AppendFailed if count > 0 => {
+                    controls = controls.push(secondary("重试加载更多", Message::RetryMore));
+                }
+                _ => {}
+            }
+        } else {
+            controls = controls.push(
+                row![
+                    icon_button(
+                        Icon::ArrowLeft,
+                        "上一页",
+                        (page > 0 && !app.loading && !app.service_busy)
+                            .then_some(Message::Page(-1))
+                    ),
+                    container(muted(format!("{} / {}", page + 1, pages.max(1)))).center_x(76),
+                    icon_button(
+                        Icon::ArrowRight,
+                        "下一页",
+                        (page + 1 < pages && !app.loading && !app.service_busy)
+                            .then_some(Message::Page(1))
+                    )
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            );
+        }
         let minimum_width = if app.page == Page::Workshop {
             760.0
         } else if remote {
@@ -1125,13 +1156,9 @@ fn browser(app: &App) -> Element<'_, Message> {
     {
         body = body.push(recommendations(app));
     }
-    if app.loading || (remote && app.remote_loading() && app.remote.is_empty()) {
-        return container(body.push(loading()))
-            .padding(28)
-            .height(Fill)
-            .into();
-    }
-    if count == 0 {
+    let grid = if app.loading || (remote && app.remote_loading() && count == 0) {
+        loading()
+    } else if count == 0 {
         let (title, desc) = if remote {
             (
                 "暂时没有可显示的作品",
@@ -1145,70 +1172,51 @@ fn browser(app: &App) -> Element<'_, Message> {
         } else {
             ("没有找到匹配的壁纸", "试试移除部分筛选条件，或更换关键词。")
         };
-        return container(body.push(empty(
-            title,
-            desc,
-            Some((
-                if active_count > 0 {
-                    "清除筛选"
-                } else if remote {
-                    "重试搜索"
-                } else {
-                    "刷新资源库"
-                },
-                if active_count > 0 {
-                    Message::ClearFilters
-                } else if remote {
-                    Message::SearchNow
-                } else {
-                    Message::Refresh
-                },
-            )),
-        )))
-        .padding(28)
-        .height(Fill)
-        .into();
-    }
-    let items: Vec<_> = if remote {
-        values
+        let action = if remote && matches!(app.remote_load, RemoteLoad::AppendFailed) {
+            ("重试加载更多", Message::RetryMore)
+        } else if active_count > 0 {
+            ("清除筛选", Message::ClearFilters)
+        } else if remote {
+            ("重试搜索", Message::SearchNow)
+        } else {
+            ("刷新资源库", Message::Refresh)
+        };
+        empty(title, desc, Some(action))
     } else {
-        values
-            .into_iter()
-            .skip(page * page_size)
-            .take(page_size)
-            .collect()
-    };
-    let grid = widget::responsive(move |size| {
-        let cols = grid_columns(size.width);
-        let mut grid = Column::new().spacing(22);
-        for chunk in items.chunks(cols) {
-            let mut line = Row::new().spacing(16);
-            for item in chunk {
-                line = line.push(wallpaper_card(app, item));
+        widget::responsive(move |size| {
+            let items = if remote {
+                values.as_slice()
+            } else {
+                let start = page * page_size;
+                &values[start..(start + page_size).min(count)]
+            };
+            let layout = Grid::new(size);
+            let mut grid = Column::new().spacing(ROW_GAP);
+            for chunk in items.chunks(layout.columns) {
+                let mut line = Row::new().spacing(COLUMN_GAP);
+                for item in chunk {
+                    line = line.push(wallpaper_card(app, item, layout.preview_height));
+                }
+                for _ in chunk.len()..layout.columns {
+                    line = line.push(Space::new().width(Fill));
+                }
+                grid = grid.push(line);
             }
-            for _ in chunk.len()..cols {
-                line = line.push(Space::new().width(Fill));
-            }
-            grid = grid.push(line);
-        }
-        scrollable(grid.padding(iced::Padding {
-            bottom: 148.0,
-            ..Default::default()
-        }))
-        .id("wallpaper-grid")
-        .on_scroll(|viewport| {
-            Message::GridScrolled((viewport.absolute_offset().y / 242.0) as usize)
+            scrollable(grid.padding(iced::Padding {
+                bottom: GRID_BOTTOM,
+                ..Default::default()
+            }))
+            .id("wallpaper-grid")
+            .on_scroll(|viewport| Message::GridScrolled(viewport.absolute_offset().y))
+            .height(Fill)
+            .into()
         })
-        .height(Fill)
         .into()
-    });
-    body = body.push(
-        widget::sensor(grid)
-            .on_show(Message::GridResized)
-            .on_resize(Message::GridResized),
-    );
+    };
+    body = body.push(widget::sensor(grid).on_resize(Message::GridResized));
     container(body).padding(28).height(Fill).into()
 }
+
 fn recommendations(app: &App) -> Element<'_, Message> {
     const COLUMNS: usize = 3;
     const GAP: f32 = 12.0;
@@ -1294,16 +1302,56 @@ fn recommendation_card<'a>(
     .into()
 }
 
-pub fn grid_columns(width: f32) -> usize {
-    let columns = ((width + 16.0) / (220.0 + 16.0)).floor();
-    columns.max(1.0) as usize
+const COLUMN_GAP: f32 = 16.0;
+const ROW_GAP: f32 = 22.0;
+const GRID_BOTTOM: f32 = 148.0;
+const CARD_PADDING: f32 = 5.0;
+const CARD_GAP: f32 = 10.0;
+const CARD_INFO_HEIGHT: f32 = 40.0;
+
+#[derive(Clone, Copy)]
+pub struct Grid {
+    pub columns: usize,
+    preview_height: f32,
+    viewport_height: f32,
 }
-pub fn grid_page_size(size: iced::Size) -> usize {
-    // Include a partial bottom row so the grid fills the available height.
-    let rows = (size.height / 242.0).ceil().max(1.0) as usize;
-    grid_columns(size.width) * rows
+
+impl Grid {
+    pub fn new(size: iced::Size) -> Self {
+        let columns = ((size.width + COLUMN_GAP) / (270.0 + COLUMN_GAP))
+            .floor()
+            .max(1.0) as usize;
+        let card_width = (size.width + COLUMN_GAP) / columns as f32 - COLUMN_GAP;
+        Self {
+            columns,
+            preview_height: (card_width - 2.0 * CARD_PADDING).max(1.0) * 9.0 / 16.0,
+            viewport_height: size.height,
+        }
+    }
+
+    pub fn row_stride(self) -> f32 {
+        self.preview_height + CARD_INFO_HEIGHT + CARD_GAP + 2.0 * CARD_PADDING + ROW_GAP
+    }
+
+    pub fn visible_rows(self, offset: f32) -> std::ops::Range<usize> {
+        let stride = self.row_stride();
+        let height = (self.viewport_height - GRID_BOTTOM).max(1.0);
+        let first = (offset / stride).floor() as usize;
+        let end = ((offset + height) / stride).ceil() as usize;
+        first..end
+    }
+
+    pub fn page_size(self) -> usize {
+        self.visible_rows(0.0).end * self.columns
+    }
+
+    pub fn max_offset(self, count: usize) -> f32 {
+        let rows = count.div_ceil(self.columns) as f32;
+        (rows * self.row_stride() - ROW_GAP + GRID_BOTTOM - self.viewport_height).max(0.0)
+    }
 }
-fn wallpaper_card<'a>(app: &'a App, item: &'a Value) -> Element<'a, Message> {
+
+fn wallpaper_card<'a>(app: &'a App, item: &'a Value, preview_height: f32) -> Element<'a, Message> {
     let id = strv(item, "id");
     let selected = app.selected.as_deref() == Some(id);
     let title = app.local_title(item);
@@ -1344,8 +1392,9 @@ fn wallpaper_card<'a>(app: &'a App, item: &'a Value) -> Element<'a, Message> {
             })
     ]
     .spacing(4)
+    .height(CARD_INFO_HEIGHT)
     .padding([0, 3]);
-    let mut thumbnail = widget::stack![preview(app, item, 156.0, true)];
+    let mut thumbnail = widget::stack![preview(app, item, preview_height, true)];
     if selected {
         let accent = app.theme.palette().primary;
         thumbnail = thumbnail.push(
@@ -1364,8 +1413,8 @@ fn wallpaper_card<'a>(app: &'a App, item: &'a Value) -> Element<'a, Message> {
             .padding(9),
         );
     }
-    button(column![thumbnail, info].spacing(10))
-        .padding(5)
+    button(column![thumbnail, info].spacing(CARD_GAP))
+        .padding(CARD_PADDING)
         .width(Fill)
         .on_press(Message::Select(id.into()))
         .card(id, selected)
@@ -2865,136 +2914,149 @@ fn displays(app: &App) -> Element<'_, Message> {
         .into()
 }
 fn settings(app: &App) -> Element<'_, Message> {
-    let mut content = column![
-        text("设置").size(28),
-        Space::new().height(8),
-        heading("播放与性能")
-    ]
-    .spacing(18);
-    for (key, label, description, default) in [
-        (
-            "pause_on_session",
-            "锁屏、休眠或切换会话时暂停",
-            "解锁后恢复；手动暂停的内容会继续保持暂停。",
-            true,
-        ),
-        (
-            "pause_on_fullscreen",
-            "全屏应用时暂停",
-            "为全屏游戏和视频释放资源。",
-            true,
-        ),
-        (
-            "mute_on_other_audio",
-            "其他应用播放声音时静音",
-            "其他声音结束后，恢复原来的音量设置。",
-            true,
-        ),
-        (
-            "pause_on_battery",
-            "使用电池时暂停",
-            "电源状态不可用时，不触发这个策略。",
-            false,
-        ),
-    ] {
-        let enabled = app.state["policy_settings"][key]
-            .as_bool()
-            .unwrap_or(default);
-        content = content.push(
-            container(
-                column![
-                    checkbox(enabled)
-                        .label(label)
-                        .on_toggle(move |v| Message::Command("set_policy", json!({key:v}))),
-                    muted(description)
-                ]
-                .spacing(8),
-            )
-            .padding(18)
-            .width(Fill)
-            .style(box_style(PANEL)),
-        );
-    }
-    let fps = app.current_output()["fps"].as_u64().unwrap_or(30) as u32;
-    content = content.push(
-        row![
-            text("壁纸帧率").size(14),
-            Space::new().width(Fill),
-            pick_list(vec![15_u32, 24, 30, 60, 90, 120], Some(fps), |v| {
-                Message::Playback(json!({"fps":v}))
-            })
-            .padding(10),
-            muted("FPS")
-        ]
-        .spacing(12)
-        .align_y(Alignment::Center),
-    );
-    content = content
-        .push(widget::rule::horizontal(1))
-        .push(heading("Steam 账号"));
-    let account = &app.service["account"];
-    content = content
-        .push(
-            text(if account["logged_in"] == true {
-                format!("已连接 · {}", strv(account, "name"))
-            } else {
-                "Steam 尚未连接".into()
-            })
-            .size(15),
+    let zoom = row![
+        secondary("−", Message::Zoom(Zoom::Out))
+            .on_press_maybe((app.ui_scale > MIN_UI_SCALE).then_some(Message::Zoom(Zoom::Out))),
+        container(text(format!("{}%", app.ui_scale)).size(14)).center_x(52),
+        secondary("+", Message::Zoom(Zoom::In))
+            .on_press_maybe((app.ui_scale < MAX_UI_SCALE).then_some(Message::Zoom(Zoom::In))),
+        secondary("重置", Message::Zoom(Zoom::Reset)).on_press_maybe(
+            (app.ui_scale != DEFAULT_UI_SCALE).then_some(Message::Zoom(Zoom::Reset))
         )
-        .push(muted(
-            "使用官方 Steam 客户端完成登录、Steam Guard 与许可证授权。Misari 不收集密码。",
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    let interface = settings_section("界面", [settings_row(text("界面缩放").size(14), zoom)]);
+
+    let fps = app.current_output()["fps"].as_u64().unwrap_or(30) as u32;
+    let mut playback = vec![settings_row(
+        text("壁纸帧率（FPS）").size(14),
+        pick_list(vec![15_u32, 24, 30, 60, 90, 120], Some(fps), |v| {
+            Message::Playback(json!({"fps": v}))
+        })
+        .width(76),
+    )];
+    let policy = &app.state["policy_settings"];
+    for (key, label, default) in [
+        ("pause_on_session", "锁屏、休眠或切换会话时暂停", true),
+        ("pause_on_fullscreen", "有全屏窗口时暂停", true),
+        ("pause_on_battery", "使用电池时暂停", false),
+        ("mute_on_other_audio", "其他应用发声时静音", true),
+    ] {
+        let enabled = policy[key].as_bool().unwrap_or(default);
+        playback.push(switch_row(
+            label,
+            enabled,
+            Message::Command("set_policy", json!({key: !enabled})),
         ));
-    if let Some(error) = account["error"].as_str() {
-        content = content.push(text(error).size(12).color(Color::from_rgb8(231, 181, 111)));
     }
-    content = content
-        .push(secondary(
-            "打开 Steam",
-            Message::Open("steam://open/main".into()),
-        ))
-        .push(widget::rule::horizontal(1))
-        .push(heading("播放能力"));
+
+    let account = &app.service["account"];
+    let mut account_status = column![
+        text(if account["logged_in"] == true {
+            format!("已连接 · {}", strv(account, "name"))
+        } else {
+            "未连接".into()
+        })
+        .size(14)
+    ]
+    .spacing(4);
+    if let Some(error) = account["error"].as_str() {
+        account_status = account_status.push(muted(error));
+    }
+    let steam = settings_section(
+        "Steam 账号",
+        [settings_row(
+            account_status,
+            secondary("打开 Steam", Message::Open("steam://open/main".into())),
+        )],
+    );
+
+    let mut compatibility = Vec::new();
     for (key, label) in [
-        ("rust_scene", "场景 · Rust 原生渲染"),
-        ("libmpv", "视频 · libmpv"),
-        ("cef", "网页 · Chromium / CEF"),
+        ("rust_scene", "场景壁纸"),
+        ("libmpv", "视频壁纸"),
+        ("cef", "网页壁纸"),
     ] {
         let backend = &app.state["backends"][key];
-        content = content.push(row![
-            text(label).size(13).width(Fill),
-            badge(if backend["available"] == true {
-                "已就绪"
-            } else {
-                "不可用"
-            })
-        ]);
-        if backend["available"] != true {
-            content = content.push(muted(
-                backend["error"].as_str().unwrap_or("请检查引擎安装。"),
-            ));
-        }
+        let status = muted(match backend["available"].as_bool() {
+            Some(true) => "已就绪",
+            Some(false) => "不可用",
+            None => "—",
+        });
+        let status: Element<'_, Message> = match backend["error"].as_str() {
+            Some(error) if backend["available"] == false => {
+                widget::tooltip(status, muted(error), widget::tooltip::Position::Top)
+                    .padding(8)
+                    .style(palette::glass)
+                    .into()
+            }
+            _ => status.into(),
+        };
+        compatibility.push(settings_row(text(label).size(14), status));
     }
-    content = content
-        .push(widget::rule::horizontal(1))
-        .push(heading("应用型项目"));
+    let allow_apps = policy["allow_applications"] == true;
+    compatibility.push(switch_row(
+        "允许应用壁纸运行 Windows 程序",
+        allow_apps,
+        Message::Command("set_policy", json!({"allow_applications": !allow_apps})),
+    ));
     let application = &app.state["backends"]["application"];
-    content=content.push(checkbox(app.state["policy_settings"]["allow_applications"]==true).label("启用 Wine 应用兼容后端").on_toggle(|v|Message::Command("set_policy",json!({"allow_applications":v})))).push(muted("应用项目会运行其中的 Windows 程序。仅应用你信任的项目；兼容后端暂不支持声音、属性、输入或跨屏同步。"));
-    if let Some(reason) = application["reason"].as_str() {
-        content = content.push(muted(reason));
+    if allow_apps
+        && application["installed"] == false
+        && let Some(reason) = application["reason"].as_str()
+    {
+        compatibility.push(container(muted(reason)).padding([10, 16]).into());
     }
-    content = content
-        .push(widget::rule::horizontal(1))
-        .push(heading("键盘操作"))
-        .push(muted(
-            "Tab / Shift Tab 切换控件 · Enter / 空格操作 · 方向键调整选项
-Ctrl 1–7 切换页面 · Ctrl F 搜索 · Ctrl R 刷新 · Ctrl I 导入 · Ctrl P 暂停 · Esc 关闭详情",
-        ));
-    container(scrollable(content.padding(iced::Padding {
-        right: 16.0,
-        ..Default::default()
-    })))
-    .padding(32)
+
+    let content = column![
+        text("设置").size(28),
+        interface,
+        settings_section("播放与性能", playback),
+        steam,
+        settings_section("兼容性", compatibility)
+    ]
+    .spacing(20);
+    scrollable(
+        container(container(content).width(Fill).max_width(720))
+            .center_x(Fill)
+            .padding([28, 32]),
+    )
     .height(Fill)
+    .into()
+}
+
+fn settings_row<'a>(
+    label: impl Into<Element<'a, Message>>,
+    control: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    row![container(label).width(Fill), control.into()]
+        .spacing(12)
+        .padding([10, 16])
+        .align_y(Alignment::Center)
+        .into()
+}
+
+fn settings_section<'a>(
+    title: &'a str,
+    rows: impl IntoIterator<Item = Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let mut body = Column::new();
+    for (index, row) in rows.into_iter().enumerate() {
+        if index > 0 {
+            body = body.push(widget::rule::horizontal(1).style(|_| widget::rule::Style {
+                color: LINE,
+                radius: 0.0.into(),
+                fill_mode: widget::rule::FillMode::Padded(16),
+                snap: true,
+            }));
+        }
+        body = body.push(row);
+    }
+    column![
+        text(title).size(16),
+        container(body).width(Fill).style(box_style(PANEL))
+    ]
+    .spacing(8)
     .into()
 }

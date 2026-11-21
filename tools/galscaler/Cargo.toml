@@ -1,0 +1,38 @@
+[package]
+name = "galscaler"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+default-run = "galscaler"
+
+[[bin]]
+name = "galscalerd"
+path = "src/daemon.rs"
+required-features = ["daemon"]
+
+[features]
+default = ["daemon"]
+daemon = ["dep:axum", "dep:cc", "dep:pkg-config", "dep:smithay", "dep:subtle", "dep:tempfile", "dep:tracing-subscriber", "tokio/process", "tokio/signal", "tokio/sync"]
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", optional = true, default-features = false, features = ["http1", "json", "tokio", "ws"] }
+clap = { version = "4.6", default-features = false, features = ["derive", "env", "std", "help", "usage", "error-context"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+smithay = { git = "https://github.com/Smithay/smithay.git", rev = "79bbed5e1199090d787115614847a79c76607181", optional = true, default-features = false, features = ["backend_winit", "backend_drm", "desktop", "wayland_frontend", "xwayland"] }
+subtle = { version = "2", optional = true, default-features = false }
+tempfile = { version = "3", optional = true }
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time"] }
+tracing-subscriber = { version = "0.3", optional = true, default-features = false, features = ["fmt", "env-filter"] }
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+pkg-config = { version = "0.3", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = "debuginfo"
