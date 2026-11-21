@@ -58,6 +58,8 @@ use crate::utils::{center, get_monotonic_time, CastSessionId, ResizeEdge};
 
 pub mod backend_ext;
 pub mod click_grab;
+#[cfg(feature = "xdp-gnome-remote-desktop")]
+pub mod dbus_remote_desktop_backend;
 pub mod edge_scroll;
 pub mod move_grab;
 pub mod pick_color_grab;
@@ -295,9 +297,7 @@ impl State {
             let desc = TabletDescriptor::from(&device);
             tablet_seat.add_wp_tablet(&self.niri.display_handle, &desc);
         }
-        if device.has_capability(DeviceCapability::Touch) && self.niri.seat.get_touch().is_none() {
-            self.niri.seat.add_touch();
-        }
+        self.refresh_wayland_device_caps();
     }
 
     fn on_device_removed(&mut self, device: impl Device) {
@@ -314,8 +314,22 @@ impl State {
                 tablet_seat.clear_tools();
             }
         }
-        if device.has_capability(DeviceCapability::Touch) && self.niri.touch.is_empty() {
-            self.niri.seat.remove_touch();
+        self.refresh_wayland_device_caps();
+    }
+
+    pub fn refresh_wayland_device_caps(&mut self) {
+        #[cfg(feature = "xdp-gnome-remote-desktop")]
+        let remote_desktop_needs_touch = self.niri.remote_desktop.needs_touch_cap();
+        #[cfg(not(feature = "xdp-gnome-remote-desktop"))]
+        let remote_desktop_needs_touch = false;
+
+        let touch_needed = !self.niri.touch.is_empty() || remote_desktop_needs_touch;
+        match (touch_needed, self.niri.seat.get_touch().is_some()) {
+            (true, false) => {
+                self.niri.seat.add_touch();
+            }
+            (false, true) => self.niri.seat.remove_touch(),
+            _ => (),
         }
     }
 
@@ -4438,6 +4452,10 @@ impl State {
         evt: &impl AbsolutePositionEvent<I>,
         fallback_output: Option<&Output>,
     ) -> Option<Point<f64, Logical>> {
+        if let Some(origin) = evt.device().absolute_position_origin(self) {
+            return Some(Point::from((evt.x() + origin.x, evt.y() + origin.y)));
+        }
+
         let output = evt.device().output(self);
         let output = output.filter(|output| self.niri.output_exists(output));
         let output = output.as_ref().or(fallback_output)?;

@@ -572,12 +572,11 @@ impl PipeWire {
                             Fourcc::Xrgb8888
                         };
 
-                        let max_frame_rate = format.max_framerate();
-                        let min_frame_time = Duration::from_micros(
-                            1_000_000 * u64::from(max_frame_rate.denom)
-                                / u64::from(max_frame_rate.num),
+                        inner.min_time_between_frames = negotiated_frame_interval(
+                            format.framerate(),
+                            format.max_framerate(),
+                            inner.refresh,
                         );
-                        inner.min_time_between_frames = min_frame_time;
 
                         // We have following cases when param_changed:
                         //
@@ -1937,9 +1936,49 @@ fn clear_shmbuf(buffer: &Shmbuf) {
     buffer.mapping.clear();
 }
 
+fn negotiated_frame_interval(rate: Fraction, max_rate: Fraction, refresh: u32) -> Duration {
+    // PipeWire allows a variable rate and an omitted maximum. In that case, use
+    // the capture target's refresh rate, which Niri stores in millihertz.
+    let output_rate = Fraction {
+        num: refresh,
+        denom: 1000,
+    };
+    [rate, max_rate, output_rate]
+        .into_iter()
+        .find(|rate| rate.num != 0 && rate.denom != 0)
+        .map_or(Duration::ZERO, |rate| {
+            Duration::from_micros(1_000_000 * u64::from(rate.denom) / u64::from(rate.num))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_interval_handles_unspecified_pipewire_rates() {
+        let variable = Fraction { num: 0, denom: 1 };
+        let missing = Fraction { num: 0, denom: 0 };
+        let thirty_fps = Fraction { num: 30, denom: 1 };
+        let sixty_fps = Fraction { num: 60, denom: 1 };
+
+        assert_eq!(
+            negotiated_frame_interval(variable, missing, 60_000),
+            Duration::from_micros(16_666),
+        );
+        assert_eq!(
+            negotiated_frame_interval(variable, thirty_fps, 60_000),
+            Duration::from_micros(33_333),
+        );
+        assert_eq!(
+            negotiated_frame_interval(thirty_fps, sixty_fps, 60_000),
+            Duration::from_micros(33_333),
+        );
+        assert_eq!(
+            negotiated_frame_interval(variable, missing, 0),
+            Duration::ZERO,
+        );
+    }
 
     #[test]
     fn shm_layout_uses_spa_representable_dimensions() {
