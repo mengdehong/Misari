@@ -8,13 +8,10 @@ Misari 是个人维护的 Linux 桌面项目，基于 niri：窗口横向排列�
 
 | 组件 | 能做什么 |
 | --- | --- |
-| [niri](niri/docs/README.md)（fork 版） | 排列窗口，在不同工作区之间切换。工作区可以理解为用来分组放置窗口的多个桌面。 |
-| [Noctalia](https://noctalia.dev/) | 使用状态栏、应用启动器、控制中心和锁屏界面。 |
+| [niri](niri/docs/README.md)（fork 版） | 排列窗口，在不同工作区之间切换。 |
 | [wallpaperd](tools/wallpaperd/README.md) | 在后台播放壁纸，记住每块屏幕的选择和播放设置。 |
 
-## 窗口管理新增功能
-
-点击功能名称可以查看配置方法和使用示例。
+## niri 新增功能
 
 - [查找与切换窗口](docs/feat/window-selection.md)：按应用或标题找到窗口，并切换过去。
 - [切换或打开应用](docs/feat/window-focus-or-spawn.md)：应用已有窗口时切换过去，没有时打开应用。
@@ -25,8 +22,10 @@ Misari 是个人维护的 Linux 桌面项目，基于 niri：窗口横向排列�
 - [屏幕边缘滚动](docs/feat/edge-scroll.md)：在屏幕边缘滚动鼠标或触摸板，切换工作区，或配合 Noctalia 调整音量、亮度。
 - **单独按键触发操作**：单独短按或长按 Super 等按键可以执行不同操作，仍可将它用于组合快捷键。
 - **最近窗口切换**：快速切换最近使用的窗口，也可只切换当前工作区或同一应用的窗口。
+- **Agent 桌面操作**支持在后台和锁屏时对指定窗口截图、点击、滚动和输入中文。用 `niri msg agent` 按截图坐标操作并获取回执，用 `niri-agent-ui` 查找控件。你可以点击 Agent 启动的窗口临时接管，切走后你和 Agent 各自保留剪贴板内容。
+- **远程桌面**支持 Mutter 兼容接口。搭配 UU 远程的 Linux 被控端，可通过 UU 远程连接并操作 Misari 桌面。实现移植自 [niri PR #1966](https://github.com/niri-wm/niri/pull/1966)。
 
-这些功能需要配置快捷键或窗口规则，示例见 [example.kdl](configs/example.kdl)。
+窗口管理功能的快捷键和窗口规则示例见 [example.kdl](configs/example.kdl)。
 
 ## 壁纸能做什么
 
@@ -44,7 +43,10 @@ Misari 是个人维护的 Linux 桌面项目，基于 niri：窗口横向排列�
 Misari 安装包提供的命令仍叫 `niri`，安装时会与官方 `niri` 包冲突。如果已经使用 niri，安装前请留意这一点。
 
 1. 按 [niri 安装与配置说明](niri/docs/README.md) 准备桌面。个人配置放在 `~/.config/niri/config.kdl`；可从 [默认配置](niri/resources/default-config.kdl) 开始，再按需加入上面的功能示例。
-2. 从 [Noctalia 官网](https://noctalia.dev/) 查看安装指南，配置状态栏、应用启动器和其他桌面界面。
-3. 如果需要动态壁纸，按 [wallpaperd 安装说明](tools/wallpaperd/README.md#快速上手) 安装并启动壁纸服务。
+2. 如果需要动态壁纸，按 [wallpaperd 安装说明](tools/wallpaperd/README.md#快速上手) 安装并启动壁纸服务。
 
 保存 niri 配置后会自动生效。修改后可在终端运行 `niri validate` 检查配置是否有误。
+
+## 致谢
+
+感谢 shorin-niri 项目。Misari 的 Agent 功能移植自[shorin-niri 项目](https://github.com/SHORiN-KiWATA/shorin-niri)
