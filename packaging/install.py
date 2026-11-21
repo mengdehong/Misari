@@ -69,7 +69,7 @@ def desktop_argument(value):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="构建并安装 Misari、nirius 和壁纸客户端（含 Web 支持）")
+    parser = argparse.ArgumentParser(description="构建并安装 Misari 和壁纸客户端（含 Web 支持）")
     parser.add_argument("--profile", choices=("release", "debug"), default="release")
     parser.add_argument("--prefix", type=Path, default=Path.home() / ".local")
     parser.add_argument("--target-dir", type=Path)
@@ -77,9 +77,9 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     prefix = args.prefix.expanduser().resolve()
-    manifests = [ROOT / "niri/Cargo.toml", ROOT / "nirius/Cargo.toml", MANIFEST]
+    manifests = [ROOT / "niri/Cargo.toml", MANIFEST]
     commands = []
-    for manifest, binaries in zip(manifests, (["niri"], ["nirius"], ["wallpaperd", "misari-wallpaper"])):
+    for manifest, binaries in zip(manifests, (["niri"], ["wallpaperd", "misari-wallpaper"])):
         command = ["cargo", "build", "--locked"]
         if args.profile == "release":
             command.append("--release")
@@ -99,10 +99,9 @@ def main():
         for directory, command in commands:
             subprocess.run(command, cwd=directory, check=True)
     targets = [args.target_dir.expanduser().resolve() if args.target_dir else target_directory(manifest) for manifest in manifests]
-    target = targets[2]
+    target = targets[1]
     binaries = {
         "niri": targets[0] / args.profile / "niri",
-        "nirius": targets[1] / args.profile / "nirius",
         **{name: target / args.profile / name for name in ("misari-wallpaper", "wallpaperd")},
     }
     for name, path in binaries.items():
