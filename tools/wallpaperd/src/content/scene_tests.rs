@@ -128,6 +128,44 @@ mod scene_tests {
 
         #[test]
         #[ignore = "requires EGL/GLES and WE common shaders"]
+        fn sprite_shader_uses_the_current_atlas_frame_uvs() {
+            let root = fixture(json!({
+                "scene.json": {"general":{"orthogonalprojection":{"width":2,"height":2}},"objects":[{"id":1,"image":"image.json","size":"2 2","origin":"1 1 0"}]},
+                "image.json": {"material":"material.json"},
+                "material.json": {"passes":[{"shader":"genericimage4","textures":["atlas"],"combos":{"SPRITESHEET":1}}]}
+            }));
+            let red = [255, 0, 0, 255];
+            let green = [0, 255, 0, 255];
+            let blue = [0, 0, 255, 255];
+            let yellow = [255, 255, 0, 255];
+            let first = [red, green, blue, yellow];
+            let second = [blue, yellow, green, red];
+            let mut atlas = tex_header([0, 6, 2, 4, 2, 4, 0], [1, 1, 2, 4, 32]);
+            atlas.extend(first.into_iter().chain(second).flatten());
+            atlas.extend(b"TEXS0002\0");
+            atlas.extend(2u32.to_le_bytes());
+            for y in [0., 2.] {
+                atlas.extend(0u32.to_le_bytes());
+                for value in [1.0f32, 0., y, 2., 0., 0., 2.] {
+                    atlas.extend(value.to_le_bytes());
+                }
+            }
+            std::fs::write(root.path().join("materials/atlas.tex"), atlas).unwrap();
+
+            let (gpu, target) = canvas(2, 2);
+            let mut scene = rendered(&root, &gpu, &target);
+            for (time, expected) in [(0., first), (1.25, second), (2.25, first)] {
+                let image = scene.frame(time);
+                assert_eq!(
+                    image.as_raw().as_slice(),
+                    expected.as_flattened(),
+                    "at {time}s"
+                );
+            }
+        }
+
+        #[test]
+        #[ignore = "requires EGL/GLES and WE common shaders"]
         fn native_property_timelines_bezier_relative_script_seek_pause_and_values_pixels() {
             let root = tempfile::tempdir().unwrap();
             let path = root.path().join("scene.pkg");

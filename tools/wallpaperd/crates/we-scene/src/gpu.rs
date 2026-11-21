@@ -940,6 +940,8 @@ impl Pass {
                 "g_ScreenSize",
                 "g_TexelSize",
                 "g_TexelSizeHalf",
+                "g_Texture0Rotation",
+                "g_Texture0Translation",
                 "g_ModelMatrixInverse",
                 "g_ModelMatrix",
                 "g_NormalModelMatrix",
@@ -1140,12 +1142,32 @@ impl Pass {
                 .uniform_2_f32(self.builtin("g_TexelSize"), 1.0 / w, 1.0 / h);
             self.gl
                 .uniform_2_f32(self.builtin("g_TexelSizeHalf"), 0.5 / w, 0.5 / h);
+            let atlas_uv = self.domain == MaterialDomain::Image && mesh.last_frame.is_some();
+            if self.domain == MaterialDomain::Image {
+                // Animated quads already carry atlas UVs. Restore the default for other meshes.
+                let diagonal = if atlas_uv { 1. } else { 0. };
+                self.gl.uniform_4_f32(
+                    self.builtin("g_Texture0Rotation"),
+                    diagonal,
+                    0.,
+                    0.,
+                    diagonal,
+                );
+                self.gl
+                    .uniform_2_f32(self.builtin("g_Texture0Translation"), 0., 0.);
+            }
             // Uniform storage belongs to this program and survives program switches.
             // Authored constants only need uploading after a committed change;
             // frame inputs and model tint must still be restored on every draw.
             let uniforms_dirty = self.uniforms_dirty.replace(false);
             for ((uniform, location, dynamic), values) in self.uniforms.iter().zip(&self.values) {
-                if !uniforms_dirty && !dynamic {
+                if (!uniforms_dirty && !dynamic)
+                    || atlas_uv
+                        && matches!(
+                            uniform.name.as_str(),
+                            "g_Texture0Rotation" | "g_Texture0Translation"
+                        )
+                {
                     continue;
                 }
                 match (uniform.kind.as_str(), values.as_slice()) {
