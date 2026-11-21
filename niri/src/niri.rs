@@ -137,6 +137,7 @@ use crate::frame_clock::FrameClock;
 use crate::handlers::image_copy_capture::{
     self as image_copy_capture_impl, CaptureBuffer, ImageCopyCursorSession, ImageCopySession,
 };
+use crate::handlers::virtual_keyboard::VirtualKeyboardKeymap;
 use crate::handlers::{configure_lock_surface, XDG_ACTIVATION_TOKEN_TIMEOUT};
 use crate::input::edge_scroll::EdgeScroll;
 use crate::input::pick_color_grab::PickColorGrab;
@@ -257,6 +258,14 @@ pub struct ScreenshotOptions {
 struct ScreenshotResult {
     image: Option<Arc<[u8]>>,
     path: Result<Option<String>, String>,
+}
+
+/// Parts of the seat keyboard state that get reset when its keymap is replaced.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SavedKeyboardState {
+    pub layout: Option<KeyboardLayout>,
+    pub caps_lock: Option<bool>,
+    pub num_lock: Option<bool>,
 }
 
 pub struct Niri {
@@ -392,6 +401,10 @@ pub struct Niri {
     pub ext_data_control_state: ExtDataControlState,
     pub popups: PopupManager,
     pub popup_grab: Option<PopupGrabState>,
+    /// The agent seat, unless turned off in the config. Only read at startup, since clients like
+    /// GTK 3 ignore seats that appear later.
+    #[cfg(feature = "agent")]
+    pub agent: Option<crate::agent::AgentState>,
     pub presentation_state: PresentationState,
     pub security_context_state: SecurityContextState,
     pub gamma_control_manager_state: GammaControlManagerState,
@@ -423,6 +436,21 @@ pub struct Niri {
 
     /// Most recent XKB settings from org.freedesktop.locale1.
     pub xkb_from_locale1: Option<Xkb>,
+
+    /// Virtual keyboard for which the keymap is currently active on the seat,
+    /// if any.
+    ///
+    /// Note that the keymap may be changed by the client at any time, and it
+    /// only gets activated on the next key/modifier event from the virtual
+    /// keyboard.
+    pub virtual_keyboard_keymap: Option<VirtualKeyboardKeymap>,
+    /// Configured (non-virtual-keyboard) keymap as XKB_KEYMAP_FORMAT_TEXT_V1.
+    ///
+    /// Computed lazily from the seat while no virtual keyboard keymap is
+    /// active, and cleared whenever the configured keymap changes. Used to
+    /// compare against virtual keyboard keymaps, and to switch back to it
+    /// afterwards without going through the config again.
+    pub configured_keymap: Option<Arc<str>>,
 
     pub cursor_manager: CursorManager,
     pub cursor_texture_cache: CursorTextureCache,
@@ -1753,7 +1781,11 @@ impl State {
 
             self.niri.keyboard_focus.clone_from(&focus);
             self.niri.modifier_press = None;
+            #[cfg(feature = "agent")]
+            let agent_focus = focus.surface().cloned();
             keyboard.set_focus(self, focus.into_surface(), SERIAL_COUNTER.next_serial());
+            #[cfg(feature = "agent")]
+            self.agent_on_user_focus(agent_focus.as_ref());
 
             // FIXME: can be more granular.
             self.niri.queue_redraw_all();
@@ -1771,18 +1803,14 @@ impl State {
         let keymap = std::fs::read_to_string(xkb_file).context("failed to read xkb_file")?;
 
         let keyboard = self.niri.seat.get_keyboard().unwrap();
-        let num_lock = keyboard.modifier_state().num_lock;
+        let restore = self.keyboard_state_to_restore();
 
         keyboard
             .set_keymap_from_string(self, keymap)
             .context("failed to set keymap")?;
-
-        // Restore num lock to its previous value.
-        let mut mods_state = keyboard.modifier_state();
-        if mods_state.num_lock != num_lock {
-            mods_state.num_lock = num_lock;
-            keyboard.set_modifier_state(mods_state);
-        }
+        self.niri.virtual_keyboard_keymap = None;
+        self.niri.configured_keymap = None;
+        self.restore_keyboard_state(restore);
 
         Ok(())
     }
@@ -1799,18 +1827,109 @@ impl State {
     pub fn set_xkb_config(&mut self, xkb: XkbConfig) {
         self.niri.modifier_press = None;
         let keyboard = self.niri.seat.get_keyboard().unwrap();
-        let num_lock = keyboard.modifier_state().num_lock;
+        let restore = self.keyboard_state_to_restore();
         if let Err(err) = keyboard.set_xkb_config(self, xkb) {
             warn!("error updating xkb config: {err:?}");
             return;
         }
+        self.niri.virtual_keyboard_keymap = None;
+        self.niri.configured_keymap = None;
+        self.restore_keyboard_state(restore);
+    }
 
-        // Restore num lock to its previous value.
-        let mut mods_state = keyboard.modifier_state();
-        if mods_state.num_lock != num_lock {
-            mods_state.num_lock = num_lock;
-            keyboard.set_modifier_state(mods_state);
+    /// Returns the keyboard state to restore after replacing the seat's keymap (which resets it).
+    ///
+    /// When switching back from a virtual keyboard's keymap, this is the state from before it was
+    /// activated. Otherwise, only Num Lock is carried over.
+    pub fn keyboard_state_to_restore(&self) -> SavedKeyboardState {
+        match &self.niri.virtual_keyboard_keymap {
+            Some(active) => active.saved,
+            None => {
+                let keyboard = self.niri.seat.get_keyboard().unwrap();
+                SavedKeyboardState {
+                    num_lock: Some(keyboard.modifier_state().num_lock),
+                    ..Default::default()
+                }
+            }
         }
+    }
+
+    /// Returns the current keyboard state that gets reset by replacing the seat's keymap.
+    pub fn current_keyboard_state(&mut self) -> SavedKeyboardState {
+        let keyboard = self.niri.seat.get_keyboard().unwrap();
+        let mods = keyboard.modifier_state();
+        let layout = keyboard.with_xkb_state(self, |context| {
+            context.xkb().lock().unwrap().active_layout()
+        });
+        SavedKeyboardState {
+            layout: Some(layout),
+            caps_lock: Some(mods.caps_lock),
+            num_lock: Some(mods.num_lock),
+        }
+    }
+
+    pub fn restore_keyboard_state(&mut self, state: SavedKeyboardState) {
+        let keyboard = self.niri.seat.get_keyboard().unwrap();
+
+        let mut mods = keyboard.modifier_state();
+        let mut mods_changed = false;
+        if let Some(caps_lock) = state.caps_lock {
+            if mods.caps_lock != caps_lock {
+                mods.caps_lock = caps_lock;
+                mods_changed = true;
+            }
+        }
+        if let Some(num_lock) = state.num_lock {
+            if mods.num_lock != num_lock {
+                mods.num_lock = num_lock;
+                mods_changed = true;
+            }
+        }
+        if mods_changed {
+            keyboard.set_modifier_state(mods);
+            // set_modifier_state() doesn't tell the focused client on its own.
+            keyboard.advertise_modifier_state(self);
+        }
+
+        // set_modifier_state() can reset the layout, so restore it afterwards.
+        if let Some(layout) = state.layout {
+            keyboard.with_xkb_state(self, |mut context| {
+                let (exists, current) = {
+                    let xkb = context.xkb().lock().unwrap();
+                    (xkb.layouts().any(|l| l == layout), xkb.active_layout())
+                };
+                if exists && current != layout {
+                    context.set_layout(layout);
+                }
+            });
+        }
+    }
+
+    /// Loads the configured keymap (xkb file, xkb config, or locale1's) onto the seat, replacing a
+    /// virtual keyboard's if there is one.
+    pub fn load_configured_keymap(&mut self) {
+        let mut xkb = self.niri.config.borrow().input.keyboard.xkb.clone();
+        let mut set_xkb_config = true;
+
+        if let Some(xkb_file) = xkb.file.take() {
+            if let Err(err) = self.set_xkb_file(xkb_file) {
+                warn!("error loading xkb_file: {err:?}");
+            } else {
+                set_xkb_config = false;
+            }
+        }
+
+        if set_xkb_config {
+            // If xkb is unset in the niri config, use settings from locale1.
+            if xkb == Xkb::default() {
+                trace!("using xkb from locale1");
+                xkb = self.niri.xkb_from_locale1.clone().unwrap_or_default();
+            }
+
+            self.set_xkb_config(xkb.to_xkb_config());
+        }
+
+        self.ipc_keyboard_layouts_changed();
     }
 
     pub fn reload_config(&mut self, config: Result<Config, ()>) {
@@ -1862,7 +1981,7 @@ impl State {
 
         *CHILD_ENV.write().unwrap() = mem::take(&mut config.environment);
 
-        let mut reload_xkb = None;
+        let mut reload_xkb = false;
         let mut libinput_config_changed = false;
         let mut output_config_changed = false;
         let mut preserved_output_config = None;
@@ -1884,7 +2003,7 @@ impl State {
 
         // We need &mut self to reload the xkb config, so just store it here.
         if config.input.keyboard.xkb != old_config.input.keyboard.xkb {
-            reload_xkb = Some(config.input.keyboard.xkb.clone());
+            reload_xkb = true;
         }
 
         // Reload the repeat info.
@@ -2014,31 +2133,8 @@ impl State {
         drop(old_config);
 
         // Now with a &mut self we can reload the xkb config.
-        if let Some(mut xkb) = reload_xkb {
-            let mut set_xkb_config = true;
-
-            // It's fine to .take() the xkb file, as this is a
-            // clone and the file field is not used in the XkbConfig.
-            if let Some(xkb_file) = xkb.file.take() {
-                if let Err(err) = self.set_xkb_file(xkb_file) {
-                    warn!("error reloading xkb_file: {err:?}");
-                } else {
-                    // We successfully set xkb file so we don't need to fallback to XkbConfig.
-                    set_xkb_config = false;
-                }
-            }
-
-            if set_xkb_config {
-                // If xkb is unset in the niri config, use settings from locale1.
-                if xkb == Xkb::default() {
-                    trace!("using xkb from locale1");
-                    xkb = self.niri.xkb_from_locale1.clone().unwrap_or_default();
-                }
-
-                self.set_xkb_config(xkb.to_xkb_config());
-            }
-
-            self.ipc_keyboard_layouts_changed();
+        if reload_xkb {
+            self.load_configured_keymap();
         }
 
         if libinput_config_changed {
@@ -2803,6 +2899,14 @@ impl Niri {
         #[cfg(test)]
         let single_pixel_buffer_state = SinglePixelBufferState::new::<State>(&display_handle);
 
+        // Apps launched for the agent see only the agent seat.
+        #[cfg(feature = "agent")]
+        let mut seat: Seat<State> = seat_state.new_wl_seat_with_filter(
+            &display_handle,
+            backend.seat_name(),
+            crate::agent::sees_user_seat,
+        );
+        #[cfg(not(feature = "agent"))]
         let mut seat: Seat<State> = seat_state.new_wl_seat(&display_handle, backend.seat_name());
         let keyboard = match seat.add_keyboard(
             config_.input.keyboard.xkb.to_xkb_config(),
@@ -2830,6 +2934,11 @@ impl Niri {
             keyboard.set_modifier_state(modifier_state);
         }
         seat.add_pointer();
+
+        #[cfg(feature = "agent")]
+        let mut agent = (!config_.agent.off).then(|| {
+            crate::agent::AgentState::new(&mut seat_state, &display_handle, &config_, &seat)
+        });
 
         let cursor_shape_manager_state = CursorShapeManagerState::new::<State>(&display_handle);
         let cursor_manager =
@@ -2880,6 +2989,11 @@ impl Niri {
                 .unwrap();
             socket_name
         });
+
+        #[cfg(feature = "agent")]
+        if let (Some(agent), Some(socket_name)) = (&mut agent, &socket_name) {
+            agent.create_socket(&event_loop, socket_name);
+        }
 
         let ipc_server = match IpcServer::start(&event_loop, socket_name.as_deref()) {
             Ok(server) => Some(server),
@@ -2992,6 +3106,8 @@ impl Niri {
             ext_data_control_state,
             popups: PopupManager::default(),
             popup_grab: None,
+            #[cfg(feature = "agent")]
+            agent,
             suppressed_keys: HashSet::new(),
             modifier_press: None,
             suppressed_buttons: HashSet::new(),
@@ -3012,6 +3128,8 @@ impl Niri {
             is_fdo_idle_inhibited: Arc::new(AtomicBool::new(false)),
             keyboard_shortcuts_inhibiting_surfaces: HashMap::new(),
             xkb_from_locale1: None,
+            virtual_keyboard_keymap: None,
+            configured_keymap: None,
             cursor_manager,
             cursor_texture_cache: Default::default(),
             cursor_shape_manager_state,
@@ -3086,6 +3204,19 @@ impl Niri {
     }
 
     pub fn insert_client(&mut self, client: NewClient) {
+        self.insert_client_inner(client, false);
+    }
+
+    /// Inserts a client that connected through the agent socket.
+    #[cfg(feature = "agent")]
+    pub fn insert_agent_client(&mut self, client: NewClient) {
+        self.insert_client_inner(client, true);
+    }
+
+    fn insert_client_inner(&mut self, client: NewClient, agent: bool) {
+        #[cfg(not(feature = "agent"))]
+        let _ = agent;
+
         let NewClient {
             client,
             restricted,
@@ -3099,6 +3230,10 @@ impl Niri {
             primary_selection_disabled: config.clipboard.disable_primary,
             restricted,
             credentials_unknown,
+            #[cfg(feature = "agent")]
+            hide_agent_seat: crate::agent::hides_agent_seat(&client, &config),
+            #[cfg(feature = "agent")]
+            agent_client: agent,
         });
 
         if let Err(err) = self.display_handle.insert_client(client, data) {
@@ -7422,6 +7557,12 @@ pub struct ClientState {
     pub restricted: bool,
     /// We cannot retrieve this client's socket credentials.
     pub credentials_unknown: bool,
+    /// Whether the agent seat global is hidden from this client.
+    #[cfg(feature = "agent")]
+    pub hide_agent_seat: bool,
+    /// Whether this client connected through the agent socket.
+    #[cfg(feature = "agent")]
+    pub agent_client: bool,
 }
 
 impl ClientData for ClientState {

@@ -3,6 +3,7 @@ use smithay::backend::input;
 use smithay::backend::winit::WinitVirtualDevice;
 use smithay::output::Output;
 use smithay::utils::{Logical, Point};
+use smithay::wayland::virtual_keyboard::VirtualKeyboardDevice;
 
 use crate::niri::State;
 use crate::protocols::virtual_pointer::VirtualPointer;
@@ -57,6 +58,12 @@ impl NiriInputDevice for WinitVirtualDevice {
 impl NiriInputDevice for VirtualPointer {
     fn output(&self, _: &State) -> Option<Output> {
         self.output().cloned()
+    }
+}
+
+impl NiriInputDevice for VirtualKeyboardDevice {
+    fn output(&self, _: &State) -> Option<Output> {
+        None
     }
 }
 

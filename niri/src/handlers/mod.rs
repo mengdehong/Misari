@@ -2,6 +2,7 @@ pub mod background_effect;
 mod compositor;
 pub mod image_copy_capture;
 mod layer_shell;
+pub mod virtual_keyboard;
 mod xdg_shell;
 
 use std::fs::File;
@@ -96,7 +97,17 @@ impl SeatHandler for State {
         &mut self.niri.seat_state
     }
 
-    fn cursor_image(&mut self, _seat: &Seat<Self>, mut image: CursorImageStatus) {
+    fn cursor_image(&mut self, seat: &Seat<Self>, mut image: CursorImageStatus) {
+        // Only the user's seat has a visible cursor. While the user operates an agent app, the
+        // app sets it through the agent seat.
+        #[cfg(feature = "agent")]
+        let user_drives = self.agent_user_drives_pointer();
+        #[cfg(not(feature = "agent"))]
+        let user_drives = false;
+        if seat != &self.niri.seat && !user_drives {
+            return;
+        }
+
         // FIXME: this hack should be removable once the screenshot UI is tracked with a
         // PointerFocus properly.
         if self.niri.screenshot_ui.is_open() {
@@ -114,7 +125,10 @@ impl SeatHandler for State {
         set_primary_focus(dh, seat, client);
     }
 
-    fn led_state_changed(&mut self, _seat: &Seat<Self>, led_state: keyboard::LedState) {
+    fn led_state_changed(&mut self, seat: &Seat<Self>, led_state: keyboard::LedState) {
+        if seat != &self.niri.seat {
+            return;
+        }
         let keyboards = self
             .niri
             .devices
@@ -273,6 +287,8 @@ impl InputMethodHandler for State {
     }
 }
 
+impl smithay::wayland::text_input::TextInputActivation for State {}
+
 impl KeyboardShortcutsInhibitHandler for State {
     fn keyboard_shortcuts_inhibit_state(&mut self) -> &mut KeyboardShortcutsInhibitState {
         &mut self.niri.keyboard_shortcuts_inhibit_state
@@ -296,6 +312,16 @@ impl KeyboardShortcutsInhibitHandler for State {
 impl SelectionHandler for State {
     type SelectionUserData = Arc<[u8]>;
 
+    #[cfg(feature = "agent")]
+    fn new_selection(
+        &mut self,
+        ty: SelectionTarget,
+        source: Option<smithay::wayland::selection::SelectionSource>,
+        seat: Seat<Self>,
+    ) {
+        self.agent_new_selection(ty, source, &seat);
+    }
+
     fn send_selection(
         &mut self,
         _ty: SelectionTarget,
@@ -305,6 +331,12 @@ impl SelectionHandler for State {
         user_data: &Self::SelectionUserData,
     ) {
         let _span = tracy_client::span!("send_selection");
+
+        // Selections that sync the user's and the agent's clipboards.
+        #[cfg(feature = "agent")]
+        let Some(fd) = self.agent_send_selection(_ty, _mime_type.clone(), fd, user_data) else {
+            return;
+        };
 
         let buf = user_data.clone();
         thread::spawn(move || {
@@ -334,10 +366,14 @@ impl WaylandDndGrabHandler for State {
         serial: Serial,
         type_: dnd::GrabType,
     ) {
-        self.niri.dnd_icon = icon.map(|surface| DndIcon {
-            surface,
-            offset: Point::new(0, 0),
-        });
+        // Drags from other seats (the agent seat) neither show an icon at the user's cursor nor
+        // affect the user's focus when they end.
+        if seat == self.niri.seat {
+            self.niri.dnd_icon = icon.map(|surface| DndIcon {
+                surface,
+                offset: Point::new(0, 0),
+            });
+        }
 
         match type_ {
             dnd::GrabType::Pointer => {
@@ -365,11 +401,15 @@ impl DndGrabHandler for State {
         &mut self,
         target: Option<DndTarget<'_, Self>>,
         validated: bool,
-        _seat: Seat<Self>,
+        seat: Seat<Self>,
         location: Point<f64, Logical>,
     ) {
         let target: Option<&WlSurface> = target.map(DndTarget::into_inner);
         trace!("dnd dropped, target: {target:?}, validated: {validated}");
+
+        if seat != self.niri.seat {
+            return;
+        }
 
         // End DnD before activating a specific window below so that it takes precedence.
         self.niri.on_maybe_dnd_ended();
@@ -396,8 +436,12 @@ impl DndGrabHandler for State {
         }
     }
 
-    fn cancelled(&mut self, _seat: Seat<Self>, _location: Point<f64, Logical>) {
+    fn cancelled(&mut self, seat: Seat<Self>, _location: Point<f64, Logical>) {
         trace!("dnd cancelled");
+
+        if seat != self.niri.seat {
+            return;
+        }
 
         self.niri.on_maybe_dnd_ended();
     }
@@ -809,6 +853,12 @@ impl XdgActivationHandler for State {
         token_data: XdgActivationTokenData,
         surface: WlSurface,
     ) {
+        // Agent apps never take the user's focus.
+        #[cfg(feature = "agent")]
+        if crate::agent::is_agent_surface(&surface) {
+            return;
+        }
+
         if token_data
             .user_data
             .get::<crate::niri::RecallActivationMarker>()
@@ -821,6 +871,7 @@ impl XdgActivationHandler for State {
             self.niri.activation_state.remove_token(&token);
             return;
         }
+
         if token_data.timestamp.elapsed() < XDG_ACTIVATION_TOKEN_TIMEOUT {
             if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(&surface) {
                 let window = mapped.window.clone();

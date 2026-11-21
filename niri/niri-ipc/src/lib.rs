@@ -58,6 +58,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+pub mod agent;
 pub mod socket;
 pub mod state;
 
@@ -129,6 +130,10 @@ pub enum Request {
     OverviewState,
     /// Request information about screencasts.
     Casts,
+    /// Drive the agent seat, a second input seat for automation.
+    ///
+    /// See the [`agent`] module.
+    Agent(agent::AgentAction),
 }
 
 /// Reply from niri to client.
@@ -192,6 +197,14 @@ pub enum Response {
         /// Saved file path, or `None` when writing to disk was disabled.
         path: Option<String>,
     },
+    /// Window image captured for the agent seat.
+    AgentCapture(agent::AgentCapture),
+    /// What an agent action caused.
+    AgentReceipt(agent::AgentReceipt),
+    /// Window of an app launched for the agent seat.
+    AgentLaunched(agent::AgentWindow),
+    /// Facts about a window for agent tools.
+    AgentInfo(agent::AgentInfo),
 }
 
 /// Overview information.
@@ -1544,6 +1557,9 @@ pub struct Window {
     pub follow_mode: WindowFollowMode,
     /// Whether this window requests your attention.
     pub is_urgent: bool,
+    /// Whether this window belongs to an app launched for the agent seat.
+    #[serde(default)]
+    pub is_agent: bool,
     /// Position- and size-related properties of the window.
     pub layout: WindowLayout,
     /// Timestamp when the window was most recently focused.

@@ -141,6 +141,9 @@ pub struct Match {
     pub is_floating: Option<bool>,
     #[knuffel(property)]
     pub is_window_cast_target: Option<bool>,
+    /// Matches windows of apps launched for the agent seat.
+    #[knuffel(property)]
+    pub is_agent: Option<bool>,
     #[knuffel(property)]
     pub is_urgent: Option<bool>,
     #[knuffel(property)]

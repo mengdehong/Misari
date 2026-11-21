@@ -188,6 +188,37 @@ pub struct XwaylandSatellitePart {
     pub path: Option<String>,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Agent {
+    pub off: bool,
+    /// Executable names of clients that don't see the agent seat, in addition to the built-in
+    /// list of clients known to switch to the last seat they see.
+    pub hide_seat_from: Vec<String>,
+}
+
+#[derive(knuffel::Decode, Debug, Clone, PartialEq, Eq)]
+pub struct AgentPart {
+    #[knuffel(child)]
+    pub off: bool,
+    #[knuffel(child)]
+    pub on: bool,
+    #[knuffel(child, unwrap(arguments))]
+    pub hide_seat_from: Option<Vec<String>>,
+}
+
+impl MergeWith<AgentPart> for Agent {
+    fn merge_with(&mut self, part: &AgentPart) {
+        self.off |= part.off;
+        if part.on {
+            self.off = false;
+        }
+
+        if let Some(names) = &part.hide_seat_from {
+            self.hide_seat_from.extend(names.iter().cloned());
+        }
+    }
+}
+
 impl MergeWith<XwaylandSatellitePart> for XwaylandSatellite {
     fn merge_with(&mut self, part: &XwaylandSatellitePart) {
         self.off |= part.off;

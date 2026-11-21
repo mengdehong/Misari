@@ -16,6 +16,8 @@ depends=(
 )
 makedepends=('git' 'rust>=1.87' 'clang' 'pkgconf')
 optdepends=(
+  'python-gobject: query window controls with niri-agent-ui'
+  'at-spi2-core: accessibility support for niri-agent-ui'
   'xwayland-satellite: X11 application support'
   'xdg-desktop-portal-gnome: screencasting'
   'xdg-desktop-portal-gtk: file chooser and other desktop portals'
@@ -59,6 +61,7 @@ package() {
   local resources="$srcdir/$_srcname/niri/resources"
   install -Dm755 "$srcdir/target-misari/release/niri" "$pkgdir/usr/bin/niri"
   install -Dm755 "$resources/niri-session" "$pkgdir/usr/bin/niri-session"
+  install -Dm755 "$resources/niri-agent-ui" "$pkgdir/usr/bin/niri-agent-ui"
   install -Dm644 "$resources/niri.desktop" "$pkgdir/usr/share/wayland-sessions/niri.desktop"
   install -Dm644 "$resources/niri.service" "$pkgdir/usr/lib/systemd/user/niri.service"
   sed -i 's|^ExecStart=.*|ExecStart=/usr/bin/niri --session|' \

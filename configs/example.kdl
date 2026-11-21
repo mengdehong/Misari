@@ -68,6 +68,14 @@ edge-scroll "left" width=4 {
 // 组合用法：命名工作区作为暂存区，仍参与正常工作区切换。
 workspace "stash"
 
+// Agent 默认开启。按需把 niri msg agent launch 打开的窗口集中到一个工作区。
+workspace "agent"
+
+window-rule {
+    match is-agent=true
+    open-on-workspace "agent"
+}
+
 // 组合用法：浮动 + 置顶 + 跟随，让画中画窗口跨工作区显示。
 window-rule {
     match app-id="^firefox$" title="^Picture-in-Picture$"

@@ -190,6 +190,13 @@ impl<'a> WindowRef<'a> {
             WindowRef::Mapped(mapped) => mapped.is_window_cast_target(),
         }
     }
+
+    pub fn is_agent(self) -> bool {
+        #[cfg(feature = "agent")]
+        return crate::agent::is_agent_surface(self.toplevel().wl_surface());
+        #[cfg(not(feature = "agent"))]
+        false
+    }
 }
 
 impl ResolvedWindowRules {
@@ -469,6 +476,12 @@ fn window_matches(window: WindowRef, role: &XdgToplevelSurfaceRoleAttributes, m:
 
     if let Some(is_window_cast_target) = m.is_window_cast_target {
         if window.is_window_cast_target() != is_window_cast_target {
+            return false;
+        }
+    }
+
+    if let Some(is_agent) = m.is_agent {
+        if window.is_agent() != is_agent {
             return false;
         }
     }

@@ -1283,6 +1283,8 @@ impl<W: LayoutElement> Tile<W> {
                     error!("background effect clipping is unimplemented");
                     elem.into()
                 }
+                // Drawn above the window, not clipped to it.
+                elem @ LayoutElementRenderElement::AgentCursor(_) => elem.into(),
             };
 
             if clip_to_geometry && clip_shader.is_some() {

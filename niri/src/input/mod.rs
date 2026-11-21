@@ -20,7 +20,9 @@ use smithay::backend::input::{
 };
 use smithay::backend::libinput::LibinputInputBackend;
 use smithay::input::dnd::DnDGrab;
-use smithay::input::keyboard::{keysyms, FilterResult, Keysym, Layout, ModifiersState};
+use smithay::input::keyboard::{
+    keysyms, FilterResult, KeyboardSource, Keysym, Layout, ModifiersState,
+};
 use smithay::input::pointer::{
     AxisFrame, ButtonEvent, CursorIcon, CursorImageStatus, Focus, GestureHoldBeginEvent,
     GestureHoldEndEvent, GesturePinchBeginEvent, GesturePinchEndEvent, GesturePinchUpdateEvent,
@@ -39,6 +41,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Transform, SERIAL_COUNTER};
 use smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitor;
 use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraint};
+use smithay::wayland::virtual_keyboard::VirtualKeyboardDevice;
 use touch_overview_grab::TouchOverviewGrab;
 
 use self::move_grab::MoveGrab;
@@ -457,14 +460,25 @@ impl State {
         &mut self,
         event: I::KeyboardKeyEvent,
         consumed_by_a11y: &mut bool,
-    ) {
+    ) where
+        I::Device: 'static,
+    {
+        let device = event.device();
+        let source =
+            if let Some(device) = (&device as &dyn Any).downcast_ref::<VirtualKeyboardDevice>() {
+                device.source()
+            } else {
+                self.restore_configured_keymap();
+                KeyboardSource::MAIN
+            };
+
         let mod_key = self.backend.mod_key(&self.niri.config.borrow());
 
         let serial = SERIAL_COUNTER.next_serial();
         let time = Event::time(&event);
         let pressed = event.state() == KeyState::Pressed;
         let keyboard = self.niri.seat.get_keyboard().unwrap();
-        let device = event.device().id();
+        let device = device.id();
         let key_code = event.key_code();
         let press_time = Duration::from_micros(time.micros());
         let can_use_modifier_bind = !keyboard.is_grabbed()
@@ -544,7 +558,10 @@ impl State {
         let _ = consumed_by_a11y;
 
         let mut release_forwarded = false;
-        let bind = keyboard.input(
+        #[cfg(feature = "agent")]
+        let mut agent_forward = false;
+        let bind = keyboard.input_from_source(
+            source,
             self,
             event.key_code(),
             event.state(),
@@ -701,9 +718,18 @@ impl State {
                 }
 
                 release_forwarded = !pressed && matches!(res, FilterResult::Forward);
+                #[cfg(feature = "agent")]
+                {
+                    agent_forward = matches!(res, FilterResult::Forward);
+                }
                 res
             },
         );
+
+        #[cfg(feature = "agent")]
+        if agent_forward {
+            self.agent_user_key(key_code, event.state(), time);
+        }
 
         // keyboard.input() has now forwarded the release and updated the client's modifiers.
         // Executing here avoids transferring focus while the modifier is still held.
@@ -2825,6 +2851,13 @@ impl State {
 
         pointer.frame(self);
 
+        #[cfg(feature = "agent")]
+        self.agent_user_motion(
+            self.niri.pointer_contents.surface.clone(),
+            new_pos,
+            event.time(),
+        );
+
         // contents_under() will return no surface when the hot corner should trigger, so
         // pointer.motion() will set the current focus to None.
         if under.hot_corner && pointer.current_focus().is_none() {
@@ -2915,6 +2948,13 @@ impl State {
         );
 
         pointer.frame(self);
+
+        #[cfg(feature = "agent")]
+        self.agent_user_motion(
+            self.niri.pointer_contents.surface.clone(),
+            pos,
+            event.time(),
+        );
 
         // contents_under() will return no surface when the hot corner should trigger, so
         // pointer.motion() will set the current focus to None.
@@ -3280,6 +3320,9 @@ impl State {
             },
         );
         pointer.frame(self);
+
+        #[cfg(feature = "agent")]
+        self.agent_user_button(button_code, button_state, event.time());
     }
 
     fn on_pointer_axis<I: InputBackend>(&mut self, event: I::PointerAxisEvent) {
@@ -3765,6 +3808,9 @@ impl State {
 
         pointer.axis(self, frame);
         pointer.frame(self);
+
+        #[cfg(feature = "agent")]
+        self.agent_user_axis(frame);
     }
 
     fn on_tablet_tool_axis<I: InputBackend>(&mut self, event: I::TabletToolAxisEvent)

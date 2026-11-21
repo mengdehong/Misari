@@ -426,6 +426,8 @@ impl Thumbnail {
                 error!("background effect clipping is unimplemented");
                 elem.into()
             }
+            // Drawn above the window, not clipped to it.
+            elem @ LayoutElementRenderElement::AgentCursor(_) => elem.into(),
         };
 
         let downscale = move |elem| {

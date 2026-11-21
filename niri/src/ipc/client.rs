@@ -1,11 +1,13 @@
-use std::io::{BufRead as _, ErrorKind};
+use std::io::{BufRead as _, ErrorKind, Read as _, Write};
 use std::iter::Peekable;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::{env, slice};
 
 use anyhow::{anyhow, bail, Context};
+use base64::Engine as _;
 use niri_config::OutputName;
-use niri_ipc::socket::Socket;
+use niri_ipc::agent::{AgentAction, AgentCapture};
+use niri_ipc::socket::{Socket, SOCKET_PATH_ENV};
 use niri_ipc::{
     Action, Cast, CastKind, CastTarget, Event, KeyboardLayouts, LogicalOutput, Mode, Output,
     OutputConfigChanged, Overview, Request, Response, Transform, Window, WindowLayout,
@@ -16,6 +18,16 @@ use crate::cli::Msg;
 use crate::utils::version;
 
 pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Result<()> {
+    // Shells that niri didn't start, like a coding agent's, don't have NIRI_SOCKET, and long-lived
+    // programs keep the one of a niri that has since restarted.
+    let socket_exists = env::var_os(SOCKET_PATH_ENV)
+        .is_some_and(|path| !path.is_empty() && Path::new(&path).exists());
+    if !socket_exists {
+        if let Some(path) = find_niri_socket() {
+            env::set_var(SOCKET_PATH_ENV, path);
+        }
+    }
+
     if json
         && matches!(
             msg,
@@ -66,6 +78,7 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
         Msg::RequestError => Request::ReturnError,
         Msg::OverviewState => Request::OverviewState,
         Msg::Casts => Request::Casts,
+        Msg::Agent { action, image, .. } => Request::Agent(prepare_agent_action(action, image)?),
         Msg::RawRequest => {
             let mut buf = Vec::new();
             let mut stdin = std::io::stdin().lock();
@@ -378,6 +391,78 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
                 bail!("unexpected response: expected Handled, got {response:?}");
             };
         }
+        Msg::Agent { .. } => match response {
+            Response::Handled => (),
+            Response::AgentReceipt(receipt) => {
+                // Receipts are meant for programs, so they're always JSON.
+                let output =
+                    serde_json::to_string(&receipt).context("error formatting response")?;
+                println!("{output}");
+
+                let unchanged = receipt.changed.is_empty()
+                    && receipt.popups_opened.is_empty()
+                    && receipt.popups_closed.is_empty()
+                    && receipt.windows_opened.is_empty()
+                    && receipt.windows_closed.is_empty()
+                    && receipt.title.is_none();
+                if unchanged
+                    && matches!(
+                        msg,
+                        Msg::Agent {
+                            require_change: true,
+                            ..
+                        }
+                    )
+                {
+                    eprintln!("nothing changed");
+                    std::process::exit(3);
+                }
+            }
+            Response::AgentLaunched(window) => {
+                let output = serde_json::to_string(&window).context("error formatting response")?;
+                println!("{output}");
+            }
+            Response::AgentInfo(info) => {
+                let output = serde_json::to_string(&info).context("error formatting response")?;
+                println!("{output}");
+            }
+            Response::AgentCapture(capture) => {
+                if let Msg::Agent {
+                    action:
+                        AgentAction::Capture {
+                            id,
+                            path: Some(path),
+                            ..
+                        },
+                    ..
+                } = &msg
+                {
+                    return write_agent_capture(*id, path, &capture);
+                }
+
+                if json {
+                    let output =
+                        serde_json::to_string(&capture).context("error formatting response")?;
+                    println!("{output}");
+                    return Ok(());
+                }
+
+                let png = base64::engine::general_purpose::STANDARD
+                    .decode(&capture.png_base64)
+                    .context("error decoding capture response")?;
+                std::io::stdout()
+                    .lock()
+                    .write_all(&png)
+                    .context("error writing capture to stdout")?;
+                eprintln!(
+                    "origin: {} {}, scale: {}",
+                    capture.origin.0, capture.origin.1, capture.scale
+                );
+            }
+            response => {
+                bail!("unexpected response: expected Handled, got {response:?}");
+            }
+        },
         Msg::Output { output, .. } => {
             let Response::OutputConfigChanged(response) = response else {
                 bail!("unexpected response: expected OutputConfigChanged, got {response:?}");
@@ -833,6 +918,9 @@ fn print_window(window: &Window) {
     if let Some(pinned) = window.pinned {
         println!("  Pinned: {}", if pinned { "yes" } else { "no" });
     }
+    if window.is_agent {
+        println!("  Is agent: yes");
+    }
 
     if let Some(pid) = window.pid {
         println!("  PID: {pid}");
@@ -1001,5 +1089,147 @@ mod tests {
         assert_snapshot!(fmt_rounded(2.004), @"2");
         assert_snapshot!(fmt_rounded(2.006), @"2.01");
         assert_snapshot!(fmt_rounded(2.1), @"2.10");
+    }
+}
+
+/// Where a capture written with `agent capture --path` sits in its window, saved next to the PNG.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AgentCaptureInfo {
+    id: u64,
+    path: PathBuf,
+    width: u32,
+    height: u32,
+    /// Window coordinates of the image's top-left corner.
+    origin: (f64, f64),
+    /// Image pixels per logical pixel.
+    scale: f64,
+}
+
+fn agent_capture_info_path(image: &Path) -> PathBuf {
+    let mut path = image.as_os_str().to_owned();
+    path.push(".json");
+    PathBuf::from(path)
+}
+
+fn write_agent_capture(id: u64, path: &Path, capture: &AgentCapture) -> anyhow::Result<()> {
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(&capture.png_base64)
+        .context("error decoding capture response")?;
+    // Width and height are the first fields of the IHDR chunk.
+    let dim = |at: usize| {
+        png.get(at..at + 4)
+            .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
+    };
+    let (Some(width), Some(height)) = (dim(16), dim(20)) else {
+        bail!("capture response is not a PNG");
+    };
+
+    std::fs::write(path, &png).with_context(|| format!("error writing {path:?}"))?;
+
+    let info = AgentCaptureInfo {
+        id,
+        path: std::path::absolute(path).unwrap_or_else(|_| path.to_owned()),
+        width,
+        height,
+        origin: capture.origin,
+        scale: capture.scale,
+    };
+    let json = serde_json::to_string(&info).context("error formatting capture info")?;
+    let info_path = agent_capture_info_path(path);
+    std::fs::write(&info_path, &json).with_context(|| format!("error writing {info_path:?}"))?;
+
+    println!("{json}");
+    Ok(())
+}
+
+/// Resolves the CLI conveniences of an agent action before sending it.
+fn prepare_agent_action(
+    action: &AgentAction,
+    image: &Option<PathBuf>,
+) -> anyhow::Result<AgentAction> {
+    let mut action = action.clone();
+
+    if let AgentAction::Type { text, .. } = &mut action {
+        if text == "-" {
+            text.clear();
+            std::io::stdin()
+                .read_to_string(text)
+                .context("error reading text from stdin")?;
+        }
+    }
+
+    let Some(image) = image else {
+        return Ok(action);
+    };
+
+    let info_path = agent_capture_info_path(image);
+    let info = std::fs::read(&info_path).with_context(|| {
+        format!("error reading {info_path:?}; was the image made with `capture --path`?")
+    })?;
+    let info: AgentCaptureInfo =
+        serde_json::from_slice(&info).with_context(|| format!("error parsing {info_path:?}"))?;
+
+    let (id, x, y) = match &mut action {
+        AgentAction::Move { id, x, y }
+        | AgentAction::Click { id, x, y, .. }
+        | AgentAction::Button { id, x, y, .. }
+        | AgentAction::Scroll { id, x, y, .. } => (id, x, y),
+        _ => bail!("--image only applies to move, click, button and scroll"),
+    };
+    if *id != info.id {
+        bail!(
+            "{image:?} is a capture of window {}, not window {id}",
+            info.id
+        );
+    }
+
+    // Pixel centers, so that pixel (0, 0) maps to the middle of its area.
+    *x = info.origin.0 + (*x + 0.5) / info.scale;
+    *y = info.origin.1 + (*y + 0.5) / info.scale;
+
+    Ok(action)
+}
+
+/// Finds the socket of a running niri for when NIRI_SOCKET isn't set.
+///
+/// Sockets are named `niri.<wayland display>.<pid>.sock`. Prefers the instance for WAYLAND_DISPLAY,
+/// then the only one running, then the only session instance among several (nested ones aside).
+fn find_niri_socket() -> Option<PathBuf> {
+    let dir = env::var_os("XDG_RUNTIME_DIR")?;
+    let wayland_display = env::var("WAYLAND_DISPLAY").ok().filter(|d| !d.is_empty());
+
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(rest) = name
+            .strip_prefix("niri.")
+            .and_then(|r| r.strip_suffix(".sock"))
+        else {
+            continue;
+        };
+        let Some((display, pid)) = rest.rsplit_once('.') else {
+            continue;
+        };
+        // Skip sockets left behind by an instance that's gone.
+        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        let is_session = cmdline.split(|b| *b == 0).any(|arg| arg == b"--session");
+        found.push((display.to_owned(), is_session, entry.path()));
+    }
+
+    if let Some(display) = wayland_display {
+        if let Some((_, _, path)) = found.iter().find(|(d, _, _)| *d == display) {
+            return Some(path.clone());
+        }
+    }
+    if found.len() == 1 {
+        return found.pop().map(|(_, _, path)| path);
+    }
+    let mut sessions = found.into_iter().filter(|(_, is_session, _)| *is_session);
+    match (sessions.next(), sessions.next()) {
+        (Some((_, _, path)), None) => Some(path),
+        _ => None,
     }
 }

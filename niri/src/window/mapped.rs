@@ -100,6 +100,10 @@ pub struct Mapped {
     /// Whether this window is a target of a window cast.
     is_window_cast_target: bool,
 
+    /// The agent's cursor, while the agent acts on this window.
+    #[cfg(feature = "agent")]
+    pub agent_cursor: Option<crate::agent::cursor::AgentCursor>,
+
     /// Whether this window should ignore opacity set through window rules.
     ignore_opacity_window_rule: bool,
 
@@ -290,6 +294,8 @@ impl Mapped {
             is_active_in_column: true,
             is_floating: false,
             is_window_cast_target: false,
+            #[cfg(feature = "agent")]
+            agent_cursor: None,
             ignore_opacity_window_rule: false,
             block_out_buffer: RefCell::new(SolidColorBuffer::new((0., 0.), [0., 0., 0., 1.])),
             blur_config: config.blur,
@@ -684,6 +690,14 @@ impl LayoutElement for Mapped {
     ) {
         if ctx.target.should_block_out(self.rules.block_out_from) {
             return;
+        }
+
+        // On top of everything, popups included.
+        #[cfg(feature = "agent")]
+        if let Some(cursor) = &self.agent_cursor {
+            cursor.render(ctx.renderer, location, scale, alpha, &mut |elem| {
+                push(elem.into())
+            });
         }
 
         let surface = self.toplevel().wl_surface();

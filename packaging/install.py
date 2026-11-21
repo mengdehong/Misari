@@ -154,6 +154,7 @@ def main():
             old_app.rmdir()
 
     resources = ROOT / "niri/resources"
+    atomic_copy(resources / "niri-agent-ui", prefix / "bin/niri-agent-ui", 0o755)
     session = (resources / "niri-session").read_text().replace("exec niri --session", f"exec {shlex.quote(str(prefix / 'bin/niri'))} --session")
     atomic_write(prefix / "bin/niri-session", session.encode(), 0o755)
     session_desktop = (resources / "niri.desktop").read_text().replace("Name=Niri", "Name=Misari")

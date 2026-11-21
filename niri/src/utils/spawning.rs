@@ -75,6 +75,26 @@ pub fn spawn_with_result<T: AsRef<OsStr> + Send + 'static>(
     token: Option<XdgActivationToken>,
     on_spawn: impl FnOnce(bool) + Send + 'static,
 ) -> io::Result<()> {
+    spawn_with_env_and_result(command, token, Vec::new(), on_spawn)
+}
+
+#[cfg(feature = "agent")]
+pub fn spawn_with_env<T: AsRef<OsStr> + Send + 'static>(
+    command: Vec<T>,
+    token: Option<XdgActivationToken>,
+    env: Vec<(String, Option<String>)>,
+) {
+    if let Err(err) = spawn_with_env_and_result(command, token, env, |_| {}) {
+        warn!("error spawning a thread to spawn the command: {err:?}");
+    }
+}
+
+fn spawn_with_env_and_result<T: AsRef<OsStr> + Send + 'static>(
+    command: Vec<T>,
+    token: Option<XdgActivationToken>,
+    env: Vec<(String, Option<String>)>,
+    on_spawn: impl FnOnce(bool) + Send + 'static,
+) -> io::Result<()> {
     let _span = tracy_client::span!();
 
     if command.is_empty() {
@@ -87,7 +107,7 @@ pub fn spawn_with_result<T: AsRef<OsStr> + Send + 'static>(
         .name("Command Spawner".to_owned())
         .spawn(move || {
             let (command, args) = command.split_first().unwrap();
-            spawn_sync(command, args, token, on_spawn);
+            spawn_sync(command, args, token, env, on_spawn);
         })?;
     Ok(())
 }
@@ -106,6 +126,7 @@ fn spawn_sync(
     command: impl AsRef<OsStr>,
     args: impl IntoIterator<Item = impl AsRef<OsStr>>,
     token: Option<XdgActivationToken>,
+    extra_env: Vec<(String, Option<String>)>,
     on_spawn: impl FnOnce(bool),
 ) {
     let _span = tracy_client::span!();
@@ -158,6 +179,14 @@ fn spawn_sync(
         }
     }
     drop(env);
+
+    for (name, value) in extra_env {
+        if let Some(value) = value {
+            process.env(name, value);
+        } else {
+            process.env_remove(name);
+        }
+    }
 
     if let Some(token) = token.as_ref() {
         process.env("XDG_ACTIVATION_TOKEN", token.as_str());
