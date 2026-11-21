@@ -86,6 +86,10 @@ wallpaperd release --output DP-1
 
 ## 找到并使用你的壁纸
 
+安装了带 `ui` 功能的版本时，可以运行 `wallpaperd ui` 打开壁纸库。
+
+![已导入的场景、视频和网页壁纸，以及选中项目的详情](../../docs/screenshots/wallpaper-library.png)
+
 把壁纸放进目录（例如 `~/Pictures/Wallpapers`），在配置里声明（见下节），然后：
 
 ```sh

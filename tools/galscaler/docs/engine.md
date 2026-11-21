@@ -26,14 +26,16 @@ printf '%s\n' '{"op":"status"}' | galscaler request
 直接使用 socket 时，成功响应为 `{"ok":true,"result":...}`，失败响应为 `{"ok":false,"error":"..."}`。`galscaler request` 成功时只输出 `result`。
 
 - `list` 返回应用全局设置后的游戏条目。`library` 返回全局设置和保存的游戏覆盖项。`set_settings` 替换全局设置。
+- `lan` 查询局域网连接状态。`set_lan` 接收 `enabled` 和可选的 `password`，省略密码时沿用已保存的值。
 - `launch` 返回会话。客户端可通过 `status` 查询会话状态，用 `log` 读取最近一次启动日志。`launch` 和 `doctor` 可以传入包含绝对 Wayland socket 路径的 `desktop`。
 - `status` 中的增强会话可以提供实际输入尺寸 `metrics.source`、增强尺寸 `metrics.enhanced` 和显示尺寸 `metrics.display`。
 
 ## 局域网接口
 
-开启监听后，`GET /` 提供浏览器播放器。控制和信令接口使用 `Authorization: Bearer <token>`。
+开启监听后，`GET /` 提供浏览器播放器。下表的接口使用 HTTP Basic 认证，用户名为 `galscaler`，密码为主机设置的连接密码。开启和连接步骤见 [局域网串流](lan-streaming.md)。
 
 | 接口 | 用途 |
 | --- | --- |
-| `POST /api/v1/rpc`、`GET /api/v1/ws` | 发送 JSON 请求。允许 `list`、`status`、`log`、`stop` 和 `launch_stream`。 |
+| `POST /api/v1/rpc`、`GET /api/v1/ws` | 发送 JSON 请求。允许 `list`、`status`、`log`、`set_picture`、`stop` 和 `launch_stream`。 |
+| `GET /api/v1/cover/{id}` | 获取指定游戏的封面。 |
 | `POST /api/v1/stream/{id}` | 为指定游戏会话交换 WebRTC offer 和 answer。 |
