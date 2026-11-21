@@ -1685,7 +1685,11 @@ impl App {
                                 .chain(&mut self.recommendations)
                                 .filter(|a| a["id"] == item["id"])
                             {
+                                let cover_previews = old.get_mut("cover_previews").map(Value::take);
                                 *old = item.clone();
+                                if let Some(previews) = cover_previews {
+                                    old["cover_previews"] = previews;
+                                }
                             }
                         } else {
                             self.notice = Some(Notice::new(

@@ -6,19 +6,21 @@ use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     fs,
     hash::{Hash, Hasher},
-    io::Read,
-    path::PathBuf,
+    io::{Cursor, Read},
+    path::{Path, PathBuf},
     sync::{OnceLock, mpsc},
     thread,
     time::{Duration, Instant},
 };
 use steamworks::{
     AppIDs, AppId, Client, ItemState, PublishedFileId, QueryHandle, UGCQueryType, UGCType,
-    UserList, UserListOrder,
+    UserList, UserListOrder, sys,
 };
 
 const APP: AppId = AppId(431960);
 const WAIT: Duration = Duration::from_secs(20);
+const THUMBNAIL_SIZE: (u32, u32) = (480, 320);
+const COVER_SIZE: (u32, u32) = (960, 640);
 type Reply = Result<Value, String>;
 struct Message {
     action: Value,
@@ -842,7 +844,23 @@ impl Steam {
                 .ugc()
                 .query_items(covers)
                 .map_err(|error| error.to_string())?;
-            fetch(&client, query, 1)
+            let mut result = fetch(&client, query, 1)?;
+            if let Some(items) = result["items"].as_array_mut() {
+                let ids = items
+                    .iter()
+                    .take(3)
+                    .filter_map(|item| item_id(item).ok().map(|id| id.0))
+                    .collect();
+                let mut previews = additional_previews(ids).unwrap_or_default();
+                for item in items.iter_mut().take(3) {
+                    let urls = item_id(item)
+                        .ok()
+                        .and_then(|id| previews.remove(&id.0))
+                        .unwrap_or_default();
+                    item["cover_previews"] = json!(urls);
+                }
+            }
+            Ok(result)
         });
         match result {
             Ok(mut results) => {
@@ -860,7 +878,9 @@ impl Steam {
                             item["recommendation"] = collection.clone();
                         }
                         if let Some(id) = item["id"].as_str() {
-                            self.items.insert(id.to_owned(), item.clone());
+                            let mut detail = item.clone();
+                            detail.as_object_mut().unwrap().remove("cover_previews");
+                            self.items.insert(id.to_owned(), detail);
                         }
                     }
                 }
@@ -942,13 +962,11 @@ fn grouped_search(
     page: u32,
 ) -> Reply {
     use std::{ffi::CString, mem::MaybeUninit};
-    use steamworks::sys;
     // SAFETY: called only on the initialized Steam worker. Strings and their
     // pointer arrays live through each SDK call, and every query is released.
     let (ids, total) = unsafe {
         let ugc = sys::SteamAPI_SteamUGC_v021();
-        let utils = sys::SteamAPI_SteamUtils_v010();
-        if ugc.is_null() || utils.is_null() {
+        if ugc.is_null() {
             return Err("Steam 筛选接口不可用。".into());
         }
         let handle = sys::SteamAPI_ISteamUGC_CreateQueryAllUGCRequestPage(
@@ -993,40 +1011,7 @@ fn grouped_search(
             if sort == UGCQueryType::RankedByTrend {
                 sys::SteamAPI_ISteamUGC_SetRankedByTrendDays(ugc, handle, days);
             }
-            let call = sys::SteamAPI_ISteamUGC_SendQueryUGCRequest(ugc, handle);
-            if call == 0 {
-                return Err("Steam 未接受筛选查询。".into());
-            }
-            let deadline = Instant::now() + WAIT;
-            let completed = loop {
-                let mut failed = false;
-                if sys::SteamAPI_ISteamUtils_IsAPICallCompleted(utils, call, &mut failed) {
-                    if failed {
-                        return Err("Steam 筛选查询失败，请重试。".into());
-                    }
-                    let mut result = MaybeUninit::<sys::SteamUGCQueryCompleted_t>::uninit();
-                    let ok = sys::SteamAPI_ISteamUtils_GetAPICallResult(
-                        utils,
-                        call,
-                        result.as_mut_ptr().cast(),
-                        std::mem::size_of::<sys::SteamUGCQueryCompleted_t>() as i32,
-                        sys::SteamUGCQueryCompleted_t_k_iCallback as i32,
-                        &mut failed,
-                    );
-                    if !ok || failed {
-                        return Err("无法读取 Steam 筛选结果。".into());
-                    }
-                    break result.assume_init();
-                }
-                if Instant::now() >= deadline {
-                    return Err("Steam 筛选查询超时，请重试。".into());
-                }
-                client.run_callbacks();
-                thread::sleep(Duration::from_millis(10));
-            };
-            if completed.m_eResult != sys::EResult::k_EResultOK {
-                return Err(format!("Steam 筛选查询失败：{:?}", completed.m_eResult));
-            }
+            let completed = run_ugc_query(ugc, handle, "筛选", WAIT)?;
             let mut ids = Vec::new();
             for index in 0..completed.m_unNumResultsReturned {
                 let mut details = MaybeUninit::<sys::SteamUGCDetails_t>::uninit();
@@ -1064,6 +1049,128 @@ fn grouped_search(
     response["total"] = json!(total);
     response["total_pages"] = json!(total.div_ceil(50).max(1));
     Ok(response)
+}
+
+/// The caller holds a live query on the initialized Steam worker and releases it.
+unsafe fn run_ugc_query(
+    ugc: *mut sys::ISteamUGC,
+    handle: sys::UGCQueryHandle_t,
+    name: &str,
+    timeout: Duration,
+) -> Result<sys::SteamUGCQueryCompleted_t, String> {
+    unsafe {
+        let utils = sys::SteamAPI_SteamUtils_v010();
+        if utils.is_null() {
+            return Err(format!("Steam {name}接口不可用。"));
+        }
+        let call = sys::SteamAPI_ISteamUGC_SendQueryUGCRequest(ugc, handle);
+        if call == 0 {
+            return Err(format!("Steam 未接受{name}查询。"));
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            let mut failed = false;
+            if sys::SteamAPI_ISteamUtils_IsAPICallCompleted(utils, call, &mut failed) {
+                if failed {
+                    return Err(format!("Steam {name}查询失败，请重试。"));
+                }
+                let mut result = std::mem::MaybeUninit::<sys::SteamUGCQueryCompleted_t>::uninit();
+                let ok = sys::SteamAPI_ISteamUtils_GetAPICallResult(
+                    utils,
+                    call,
+                    result.as_mut_ptr().cast(),
+                    std::mem::size_of::<sys::SteamUGCQueryCompleted_t>() as i32,
+                    sys::SteamUGCQueryCompleted_t_k_iCallback as i32,
+                    &mut failed,
+                );
+                if !ok || failed {
+                    return Err(format!("无法读取 Steam {name}结果。"));
+                }
+                let result = result.assume_init();
+                if result.m_eResult != sys::EResult::k_EResultOK {
+                    return Err(format!("Steam {name}查询失败：{:?}", result.m_eResult));
+                }
+                return Ok(result);
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("Steam {name}查询超时，请重试。"));
+            }
+            // The wrapper's callback dispatch would consume this raw result.
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+fn additional_previews(mut ids: Vec<u64>) -> Option<BTreeMap<u64, Vec<String>>> {
+    use std::{ffi::CStr, mem::MaybeUninit};
+    use sys::EItemPreviewType::k_EItemPreviewType_Image as Image;
+
+    if ids.is_empty() {
+        return None;
+    }
+    // The SDK wrapper can request gallery images but only exposes the main URL.
+    // SAFETY: the initialized Steam worker owns this query until it is released.
+    unsafe {
+        let ugc = sys::SteamAPI_SteamUGC_v021();
+        if ugc.is_null() {
+            return None;
+        }
+        let handle = sys::SteamAPI_ISteamUGC_CreateQueryUGCDetailsRequest(
+            ugc,
+            ids.as_mut_ptr(),
+            ids.len() as u32,
+        );
+        if handle == u64::MAX {
+            return None;
+        }
+        let previews = (|| {
+            sys::SteamAPI_ISteamUGC_SetReturnAdditionalPreviews(ugc, handle, true);
+            let result = run_ugc_query(ugc, handle, "预览", Duration::from_secs(5)).ok()?;
+            let mut items = BTreeMap::new();
+            for index in 0..result.m_unNumResultsReturned {
+                let mut details = MaybeUninit::<sys::SteamUGCDetails_t>::uninit();
+                if !sys::SteamAPI_ISteamUGC_GetQueryUGCResult(
+                    ugc,
+                    handle,
+                    index,
+                    details.as_mut_ptr(),
+                ) {
+                    continue;
+                }
+                let id = details.assume_init().m_nPublishedFileId;
+                let count =
+                    sys::SteamAPI_ISteamUGC_GetQueryUGCNumAdditionalPreviews(ugc, handle, index);
+                let urls = (0..count)
+                    .filter_map(|preview| {
+                        let mut url = [0u8; 4096];
+                        let mut kind = Image;
+                        let ok = sys::SteamAPI_ISteamUGC_GetQueryUGCAdditionalPreview(
+                            ugc,
+                            handle,
+                            index,
+                            preview,
+                            url.as_mut_ptr().cast(),
+                            url.len() as u32,
+                            std::ptr::null_mut(),
+                            0,
+                            &mut kind,
+                        );
+                        if !ok || kind != Image {
+                            return None;
+                        }
+                        let url = CStr::from_bytes_until_nul(&url).ok()?.to_str().ok()?;
+                        preview_request_url(url, COVER_SIZE)?;
+                        Some(url.to_owned())
+                    })
+                    .take(3)
+                    .collect();
+                items.insert(id, urls);
+            }
+            Some(items)
+        })();
+        sys::SteamAPI_ISteamUGC_ReleaseQueryUGCRequest(ugc, handle);
+        previews
+    }
 }
 
 fn user_page(items: &[Value], action: &Value) -> Value {
@@ -1350,8 +1457,32 @@ fn preview_path(id: u64, url: &str) -> PathBuf {
     cache_dir().join(format!("{id}-{:016x}.img", hash.finish()))
 }
 
+pub(crate) fn cover_key(item: &Value) -> Option<String> {
+    let id = item_id(item).ok()?.0;
+    let mut hash = DefaultHasher::new();
+    item["preview_url"].as_str().hash(&mut hash);
+    for url in crate::array(&item["cover_previews"])
+        .iter()
+        .filter_map(Value::as_str)
+    {
+        url.hash(&mut hash);
+    }
+    Some(format!("{id}-{:016x}", hash.finish()))
+}
+
+fn cover_path(item: &Value) -> Option<PathBuf> {
+    Some(
+        cache_dir()
+            .join("covers")
+            .join(format!("{}.png", cover_key(item)?)),
+    )
+}
+
 /// Load disk caches before waiting for a network slot.
 pub fn cached_thumbnail(item: &Value) -> Option<iced::widget::image::Handle> {
+    if item["cover_previews"].is_array() {
+        return crate::engine::thumbnail_handle(&cover_path(item)?, COVER_SIZE);
+    }
     let path = if let (Some(id), Some(url)) = (
         item["id"].as_str().and_then(|id| id.parse::<u64>().ok()),
         item["preview_url"].as_str().filter(|url| !url.is_empty()),
@@ -1361,7 +1492,7 @@ pub fn cached_thumbnail(item: &Value) -> Option<iced::widget::image::Handle> {
     } else {
         crate::engine::thumbnail(item["thumbnail"].as_str()?)?
     };
-    crate::engine::thumbnail_handle(&path)
+    crate::engine::thumbnail_handle(&path, THUMBNAIL_SIZE)
 }
 
 fn preview_client() -> &'static reqwest::Client {
@@ -1382,7 +1513,7 @@ fn preview_client() -> &'static reqwest::Client {
     })
 }
 
-fn preview_request_url(original: &str) -> Option<url::Url> {
+fn preview_request_url(original: &str, size: (u32, u32)) -> Option<url::Url> {
     let mut url = url::Url::parse(original).ok()?;
     let host = url.host_str()?;
     let steam_image = host == "steamusercontent.com"
@@ -1405,8 +1536,8 @@ fn preview_request_url(original: &str) -> Option<url::Url> {
             .collect();
         url.set_query(None);
         url.query_pairs_mut().extend_pairs(pairs).extend_pairs([
-            ("imw", "480"),
-            ("imh", "320"),
+            ("imw", size.0.to_string().as_str()),
+            ("imh", size.1.to_string().as_str()),
             ("ima", "fit"),
             ("impolicy", "Letterbox"),
             ("imcolor", "#000000"),
@@ -1416,7 +1547,7 @@ fn preview_request_url(original: &str) -> Option<url::Url> {
     Some(url)
 }
 
-fn gif_first_frame(bytes: &[u8]) -> Option<Vec<u8>> {
+fn gif_first_frame(bytes: &[u8], size: (u32, u32)) -> Option<Vec<u8>> {
     use image::{AnimationDecoder, ImageDecoder};
     let mut decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes)).ok()?;
     let mut limits = image::Limits::default();
@@ -1425,13 +1556,13 @@ fn gif_first_frame(bytes: &[u8]) -> Option<Vec<u8>> {
     limits.max_alloc = Some(64 * 1024 * 1024);
     decoder.set_limits(limits).ok()?;
     let frame = decoder.into_frames().next()?.ok()?.into_buffer();
-    let image = image::DynamicImage::ImageRgba8(frame).thumbnail(480, 320);
-    let mut output = std::io::Cursor::new(Vec::new());
+    let image = bounded_preview(image::DynamicImage::ImageRgba8(frame), size);
+    let mut output = Cursor::new(Vec::new());
     image.write_to(&mut output, image::ImageFormat::Png).ok()?;
     Some(output.into_inner())
 }
 
-async fn preview_bytes(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
+async fn preview_bytes(client: &reqwest::Client, url: &str, size: (u32, u32)) -> Option<Vec<u8>> {
     const LIMIT: usize = 8 * 1024 * 1024;
     let mut response = client.get(url).send().await.ok()?.error_for_status().ok()?;
     let large = response
@@ -1451,7 +1582,7 @@ async fn preview_bytes(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
         // Probe on arrival so a slow animation tail cannot hide a ready preview.
         if gif {
             let prefix = bytes.clone();
-            if let Some(frame) = crate::blocking(move || gif_first_frame(&prefix)).await {
+            if let Some(frame) = crate::blocking(move || gif_first_frame(&prefix, size)).await {
                 // Dropping the response stops downloading the unused animation frames.
                 return Some(frame);
             }
@@ -1461,25 +1592,105 @@ async fn preview_bytes(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
 }
 
 pub async fn download_thumbnail(item: Value) -> Option<iced::widget::image::Handle> {
+    if item["cover_previews"].is_array() {
+        return download_cover(&item).await;
+    }
     let id = item["id"].as_str()?.parse::<u64>().ok()?;
     let url = item["preview_url"].as_str()?;
-    let requested = preview_request_url(url)?;
+    let requested = preview_request_url(url, THUMBNAIL_SIZE)?;
     let output = preview_path(id, url);
-    let bytes = preview_bytes(preview_client(), requested.as_str()).await?;
+    let bytes = preview_bytes(preview_client(), requested.as_str(), THUMBNAIL_SIZE).await?;
     crate::blocking(move || {
-        fs::create_dir_all(output.parent()?).ok()?;
-        let temporary = output.with_extension(format!(
-            "{}-{:?}.tmp",
-            std::process::id(),
-            thread::current().id()
-        ));
-        fs::write(&temporary, bytes).ok()?;
-        if fs::rename(&temporary, &output).is_err() {
-            let _ = fs::remove_file(&temporary);
-            return None;
-        }
+        write_preview(&output, &bytes)?;
         let path = crate::engine::thumbnail(output.to_str()?)?;
-        crate::engine::thumbnail_handle(&path)
+        crate::engine::thumbnail_handle(&path, THUMBNAIL_SIZE)
+    })
+    .await
+}
+
+pub(crate) fn fills_cover(width: u32, height: u32) -> bool {
+    width >= 640 && height >= 320 && width > height
+}
+
+fn bounded_preview(image: image::DynamicImage, size: (u32, u32)) -> image::DynamicImage {
+    if image.width() > size.0 || image.height() > size.1 {
+        image.resize(size.0, size.1, image::imageops::FilterType::Triangle)
+    } else {
+        image
+    }
+}
+
+fn write_preview(output: &Path, bytes: &[u8]) -> Option<()> {
+    fs::create_dir_all(output.parent()?).ok()?;
+    let temporary = output.with_extension(format!(
+        "{}-{:?}.tmp",
+        std::process::id(),
+        thread::current().id()
+    ));
+    if fs::write(&temporary, bytes)
+        .and_then(|()| fs::rename(&temporary, output))
+        .is_err()
+    {
+        let _ = fs::remove_file(&temporary);
+        return None;
+    }
+    Some(())
+}
+
+async fn fetch_cover(url: &str) -> Option<image::DynamicImage> {
+    let url = preview_request_url(url, COVER_SIZE)?;
+    let bytes = preview_bytes(preview_client(), url.as_str(), COVER_SIZE).await?;
+    crate::blocking(move || {
+        let reader = image::ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .ok()?;
+        let image = crate::engine::decode_preview(reader).ok()?;
+        Some(bounded_preview(image, COVER_SIZE))
+    })
+    .await
+}
+
+async fn download_cover(item: &Value) -> Option<iced::widget::image::Handle> {
+    let output = cover_path(item)?;
+    let previews = crate::array(&item["cover_previews"]);
+    let mut fallback = None;
+    for url in previews.iter().filter_map(Value::as_str) {
+        if let Some(image) = fetch_cover(url).await {
+            if fills_cover(image.width(), image.height()) {
+                return Some(cache_cover(output, image).await);
+            }
+            fallback.get_or_insert(image);
+        }
+    }
+    let Some(url) = item["preview_url"].as_str() else {
+        return fallback.map(crate::engine::image_handle);
+    };
+    if let Some(image) = fetch_cover(url).await {
+        if previews.is_empty() || fills_cover(image.width(), image.height()) {
+            return Some(cache_cover(output, image).await);
+        }
+        return Some(crate::engine::image_handle(image));
+    }
+    let path = preview_path(item_id(item).ok()?.0, url);
+    crate::blocking(move || {
+        let cached = image::ImageReader::open(path)
+            .ok()
+            .and_then(|reader| reader.with_guessed_format().ok())
+            .and_then(|reader| crate::engine::decode_preview(reader).ok());
+        cached
+            .or(fallback)
+            .map(|image| crate::engine::image_handle(bounded_preview(image, COVER_SIZE)))
+    })
+    .await
+}
+
+async fn cache_cover(output: PathBuf, image: image::DynamicImage) -> iced::widget::image::Handle {
+    crate::blocking(move || {
+        let mut png = Cursor::new(Vec::new());
+        if image.write_to(&mut png, image::ImageFormat::Png).is_ok() {
+            let _ = write_preview(&output, png.get_ref());
+        }
+        crate::engine::image_handle(image)
     })
     .await
 }
@@ -1550,15 +1761,33 @@ mod tests {
 
     #[test]
     fn preview_url_requests_a_bounded_cdn_image() {
-        let url = preview_request_url("https://images.steamusercontent.com/ugc/1/2/?imw=4096&v=3")
-            .unwrap();
+        let source = "https://images.steamusercontent.com/ugc/1/2/?imw=4096&v=3";
+        let url = preview_request_url(source, THUMBNAIL_SIZE).unwrap();
         let query: BTreeMap<_, _> = url.query_pairs().collect();
         assert_eq!(query["imw"], "480");
         assert_eq!(query["imh"], "320");
         assert_eq!(query["impolicy"], "Letterbox");
         assert_eq!(query["v"], "3");
-        assert!(preview_request_url("http://images.steamusercontent.com/a").is_none());
-        assert!(preview_request_url("https://steamusercontent.com.evil.invalid/a").is_none());
+        assert!(preview_request_url("http://images.steamusercontent.com/a", COVER_SIZE).is_none());
+        assert!(
+            preview_request_url("https://steamusercontent.com.evil.invalid/a", COVER_SIZE)
+                .is_none()
+        );
+        let cover = preview_request_url(source, COVER_SIZE).unwrap();
+        let query: BTreeMap<_, _> = cover.query_pairs().collect();
+        assert_eq!(query["imw"], "960");
+        assert_eq!(query["imh"], "640");
+    }
+
+    #[test]
+    fn cover_downscaling_preserves_hd_and_keeps_small_images_at_native_size() {
+        let cover = bounded_preview(image::DynamicImage::new_rgb8(1920, 1080), COVER_SIZE);
+        assert_eq!((cover.width(), cover.height()), (960, 540));
+        assert!(fills_cover(cover.width(), cover.height()));
+
+        let small = bounded_preview(image::DynamicImage::new_rgb8(224, 224), COVER_SIZE);
+        assert_eq!((small.width(), small.height()), (224, 224));
+        assert!(!fills_cover(small.width(), small.height()));
     }
 
     #[test]
@@ -1591,7 +1820,8 @@ mod tests {
             .unwrap()
             .block_on(async {
                 let client = reqwest::Client::builder().no_proxy().build().unwrap();
-                let request = tokio::spawn(async move { preview_bytes(&client, &url).await });
+                let request =
+                    tokio::spawn(async move { preview_bytes(&client, &url, THUMBNAIL_SIZE).await });
                 tokio::time::timeout(Duration::from_secs(2), headers)
                     .await
                     .unwrap()
@@ -1650,10 +1880,13 @@ mod tests {
             .unwrap()
             .block_on(async {
                 let client = reqwest::Client::builder().no_proxy().build().unwrap();
-                tokio::time::timeout(Duration::from_secs(1), preview_bytes(&client, &url))
-                    .await
-                    .unwrap()
-                    .unwrap()
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    preview_bytes(&client, &url, THUMBNAIL_SIZE),
+                )
+                .await
+                .unwrap()
+                .unwrap()
             });
         assert!(png.starts_with(b"\x89PNG"));
         let image = image::load_from_memory(&png).unwrap();

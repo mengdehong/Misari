@@ -190,10 +190,12 @@ pub fn kind_label(kind: &str) -> &'static str {
     }
 }
 fn preview<'a>(app: &App, item: &Value, height: f32, fade: bool) -> Element<'a, Message> {
-    let handle = app.previews.get(item).and_then(Clone::clone);
-    let label = if matches!(app.previews.get(item), Some(None)) {
+    let preview = app.previews.get(item);
+    let handle = preview.and_then(Clone::clone);
+    let cover = item["cover_previews"].is_array();
+    let label = if matches!(preview, Some(None)) {
         "预览暂不可用"
-    } else if item["preview_url"].is_string() || item["thumbnail"].is_string() {
+    } else if cover || item["preview_url"].is_string() || item["thumbnail"].is_string() {
         ""
     } else {
         "暂无预览"
@@ -202,11 +204,12 @@ fn preview<'a>(app: &App, item: &Value, height: f32, fade: bool) -> Element<'a, 
         container(muted(label))
             .center_x(Fill)
             .center_y(Fixed(height))
-            .style(box_style(CARD)),
+            .style(box_style(if cover { BG } else { CARD })),
         Element::new(ClippedImage {
             handle,
             height,
-            fade
+            fade,
+            cover
         })
     ]
     .into()
@@ -217,6 +220,7 @@ struct ClippedImage {
     handle: Option<widget::image::Handle>,
     height: f32,
     fade: bool,
+    cover: bool,
 }
 struct PreviewMotion {
     current: Option<widget::image::Handle>,
@@ -340,10 +344,18 @@ impl iced::advanced::Widget<Message, Theme, iced::Renderer> for ClippedImage {
         let state = tree.state.downcast_ref::<PreviewMotion>();
         renderer.with_layer(bounds, |renderer| {
             let mut paint = |handle: &widget::image::Handle, opacity: f32| {
+                let fit = match handle {
+                    widget::image::Handle::Rgba { width, height, .. }
+                        if self.cover && !crate::services::fills_cover(*width, *height) =>
+                    {
+                        iced::ContentFit::ScaleDown
+                    }
+                    _ => iced::ContentFit::Cover,
+                };
                 let image = image(handle.clone())
                     .width(Fill)
                     .height(Fixed(self.height))
-                    .content_fit(iced::ContentFit::Cover)
+                    .content_fit(fit)
                     .border_radius(9)
                     .opacity(opacity);
                 iced::advanced::Widget::<Message, Theme, iced::Renderer>::draw(
@@ -1107,26 +1119,11 @@ fn browser(app: &App) -> Element<'_, Message> {
         body = body.push(chips.wrap());
     }
     if app.page == Page::Discover
-        && app.filters.count() == 0
+        && active_count == 0
         && app.search.trim().is_empty()
         && !app.recommendations.is_empty()
     {
-        let mut recommendations = Row::new().spacing(12);
-        for item in app.recommendations.iter().take(3) {
-            recommendations = recommendations.push(
-                button(column![
-                    preview(app, item, 76.0, true),
-                    container(text(truncate(&app.local_title(item), 24)).size(12)).padding([7, 10])
-                ])
-                .padding(0)
-                .width(Fill)
-                .on_press(Message::Select(strv(item, "id").into()))
-                .card(strv(item, "id"), false)
-                .style(card_style(false)),
-            );
-        }
-        body = body
-            .push(column![muted("本期精选 · Wallpaper Engine 推荐"), recommendations].spacing(8));
+        body = body.push(recommendations(app));
     }
     if app.loading || (remote && app.remote_loading() && app.remote.is_empty()) {
         return container(body.push(loading()))
@@ -1212,6 +1209,91 @@ fn browser(app: &App) -> Element<'_, Message> {
     );
     container(body).padding(28).height(Fill).into()
 }
+fn recommendations(app: &App) -> Element<'_, Message> {
+    const COLUMNS: usize = 3;
+    const GAP: f32 = 12.0;
+    const MIN_WIDTH: f32 = 144.0;
+    widget::responsive(move |size| {
+        let mut heading = row![text("本期精选").size(15)]
+            .spacing(10)
+            .align_y(Alignment::Center);
+        if size.width >= 220.0 {
+            heading = heading.push(muted("Wallpaper Engine 推荐"));
+        }
+        let card_width = ((size.width - GAP * (COLUMNS - 1) as f32) / COLUMNS as f32)
+            .floor()
+            .max(MIN_WIDTH.min(size.width));
+        let min_height = (card_width * 0.6).min(88.0);
+        let max_height = (size.height * 0.5).clamp(min_height, 220.0);
+        let height = ((card_width - 2.0) * 3.0 / 7.0).clamp(min_height, max_height);
+        let cards = Row::with_children(
+            app.recommendations
+                .iter()
+                .take(COLUMNS)
+                .map(|item| recommendation_card(app, item, card_width, height)),
+        )
+        .spacing(GAP);
+        let covers = widget::scrollable(cards)
+            .direction(widget::scrollable::Direction::Horizontal(
+                widget::scrollable::Scrollbar::new()
+                    .width(4)
+                    .scroller_width(4)
+                    .spacing(4),
+            ))
+            .width(Fill);
+        column![heading, covers]
+            .spacing(8)
+            .padding(iced::Padding::ZERO.bottom(8))
+            .into()
+    })
+    .height(Shrink)
+    .into()
+}
+
+fn recommendation_card<'a>(
+    app: &'a App,
+    item: &'a Value,
+    width: f32,
+    height: f32,
+) -> Element<'a, Message> {
+    let id = strv(item, "id");
+    let selected = app.selected.as_deref() == Some(id);
+    let caption = container(
+        row![
+            single_line_title(app.local_title(item), 14),
+            icon(Icon::ChevronRight).size(14)
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+    )
+    .width(Fill)
+    .padding(iced::Padding::from([8, 12]).top(16))
+    .style(|_| container::Style {
+        background: Some(
+            iced::gradient::Linear::new(std::f32::consts::PI)
+                .add_stop(0.0, BG.scale_alpha(0.0))
+                .add_stop(0.6, BG.scale_alpha(0.85))
+                .add_stop(1.0, BG.scale_alpha(0.98))
+                .into(),
+        ),
+        border: Border {
+            radius: iced::border::bottom_left(9).bottom_right(9),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    button(widget::stack![
+        preview(app, item, height, true),
+        container(caption).align_bottom(Fill),
+    ])
+    .padding(1)
+    .width(width)
+    .on_press(Message::Select(id.into()))
+    .card(id, selected)
+    .style(card_style(selected))
+    .into()
+}
+
 pub fn grid_columns(width: f32) -> usize {
     let columns = ((width + 16.0) / (220.0 + 16.0)).floor();
     columns.max(1.0) as usize

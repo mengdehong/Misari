@@ -616,22 +616,33 @@ pub fn thumbnail(path: &str) -> Option<PathBuf> {
 }
 
 /// Iced can lay out decoded handles without opening or decoding files itself.
-pub fn thumbnail_handle(path: &Path) -> Option<iced::widget::image::Handle> {
+pub fn thumbnail_handle(path: &Path, size: (u32, u32)) -> Option<iced::widget::image::Handle> {
     let mut reader = image::ImageReader::open(path)
         .ok()?
         .with_guessed_format()
         .ok()?;
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(480);
-    limits.max_image_height = Some(320);
+    limits.max_image_width = Some(size.0);
+    limits.max_image_height = Some(size.1);
     limits.max_alloc = Some(4 * 1024 * 1024);
     reader.limits(limits);
-    let image = reader.decode().ok()?.into_rgba8();
-    Some(iced::widget::image::Handle::from_rgba(
-        image.width(),
-        image.height(),
-        image.into_raw(),
-    ))
+    Some(image_handle(reader.decode().ok()?))
+}
+
+pub(crate) fn image_handle(image: image::DynamicImage) -> iced::widget::image::Handle {
+    let image = image.into_rgba8();
+    iced::widget::image::Handle::from_rgba(image.width(), image.height(), image.into_raw())
+}
+
+pub(crate) fn decode_preview(
+    mut reader: image::ImageReader<impl BufRead + std::io::Seek>,
+) -> Result<image::DynamicImage, String> {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16384);
+    limits.max_image_height = Some(16384);
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    reader.decode().map_err(|error| error.to_string())
 }
 
 fn prepare_thumbnail(path: &Path) -> Result<PathBuf, String> {
@@ -657,19 +668,11 @@ fn prepare_thumbnail(path: &Path) -> Result<PathBuf, String> {
     if output.is_file() {
         return Ok(output);
     }
-    let mut reader = image::ImageReader::open(&canonical)
+    let reader = image::ImageReader::open(&canonical)
         .map_err(|error| error.to_string())?
         .with_guessed_format()
         .map_err(|error| error.to_string())?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(16384);
-    limits.max_image_height = Some(16384);
-    limits.max_alloc = Some(128 * 1024 * 1024);
-    reader.limits(limits);
-    let image = reader
-        .decode()
-        .map_err(|error| error.to_string())?
-        .thumbnail(480, 320);
+    let image = decode_preview(reader)?.thumbnail(480, 320);
     fs::create_dir_all(&cache).map_err(|error| error.to_string())?;
     // A unique temporary path prevents partially written images reaching Iced.
     let temporary = cache.join(format!(

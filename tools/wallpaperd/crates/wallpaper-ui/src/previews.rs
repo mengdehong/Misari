@@ -6,7 +6,10 @@ use iced::{
     widget::image,
 };
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet, VecDeque},
+};
 
 // All generations share the network limit; cancelling a stream releases its requests.
 static DOWNLOADS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
@@ -23,16 +26,20 @@ pub struct Previews {
     pub pending: usize,
 }
 
-fn source(item: &Value) -> Option<&str> {
+fn source(item: &Value) -> Option<Cow<'_, str>> {
+    if item["cover_previews"].is_array() {
+        return Some(format!("cover:{}", services::cover_key(item)?).into());
+    }
     item["preview_url"]
         .as_str()
         .filter(|url| !url.is_empty())
         .or_else(|| item["thumbnail"].as_str())
+        .map(Cow::Borrowed)
 }
 
 impl Previews {
     pub fn get(&self, item: &Value) -> Option<&Option<image::Handle>> {
-        self.images.get(source(item)?)
+        self.images.get(source(item)?.as_ref())
     }
 
     pub fn cancel_pending(&mut self) {
@@ -66,7 +73,7 @@ impl Previews {
         let mut work: Vec<_> = items
             .into_iter()
             .filter_map(|item| {
-                let source = source(&item)?.to_owned();
+                let source = source(&item)?.into_owned();
                 seen.insert(source.clone()).then_some((source, item))
             })
             .collect();
@@ -154,7 +161,9 @@ where
         // Probe every cache entry before queuing network misses. Even eight slow
         // downloads must not prevent a later cached/local image from appearing.
         while let Some((rank, source, item, handle)) = cached.next().await {
-            if handle.is_some() || !item["preview_url"].is_string() {
+            if handle.is_some()
+                || !(item["preview_url"].is_string() || item["cover_previews"].is_array())
+            {
                 if output
                     .send(Message::ThumbnailLoaded(generation, source, handle))
                     .await
@@ -261,6 +270,24 @@ mod tests {
         assert!(previews.get(&next).is_none());
         let _ = previews.load(vec![next]);
         assert_eq!(previews.pending, 1, "refresh retries failed previews");
+    }
+
+    #[test]
+    fn one_wallpaper_can_have_a_grid_thumbnail_and_a_cover() {
+        let mut previews = Previews::default();
+        let grid = json!({"id":"42","preview_url":"https://images.steamusercontent.com/ugc/1/2/"});
+        let mut cover = grid.clone();
+        cover["cover_previews"] = json!([]);
+        let _ = previews.load(vec![grid.clone(), cover.clone()]);
+        assert_eq!(previews.pending, 2);
+        let small = image::Handle::from_rgba(1, 1, vec![0; 4]);
+        previews.accept(
+            previews.generation,
+            source(&grid).unwrap().into_owned(),
+            Some(small),
+        );
+        assert!(previews.get(&grid).is_some());
+        assert!(previews.get(&cover).is_none());
     }
 
     #[test]
