@@ -1,4 +1,7 @@
-use crate::render::{Pipeline, fit};
+use crate::{
+    model::Resolution,
+    render::{Pipeline, fit},
+};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use galscaler::api::{FRAME_LIMIT, Reply, frame};
 use serde::{Deserialize, Serialize};
@@ -526,8 +529,13 @@ impl Drop for Stream {
     }
 }
 
+pub(super) const MAX_RESOLUTION: Resolution = Resolution {
+    width: 1920,
+    height: 1080,
+};
+
 fn viewport(width: u32, height: u32) -> u32 {
-    (width.clamp(64, 1920) << 16) | height.clamp(64, 1080)
+    (width.clamp(64, MAX_RESOLUTION.width) << 16) | height.clamp(64, MAX_RESOLUTION.height)
 }
 
 fn fitted_size(
@@ -566,18 +574,27 @@ impl Worker {
                 conn = listener.accept() => {
                     let (mut conn, _) = conn?;
                     let offer = async {
-                        let offer: Offer = serde_json::from_slice(&frame(&mut conn).await?)?;
-                        Peer::answer(offer, &self.events).await
+                        // A null offer disconnects the peer while leaving the game running.
+                        let offer: Option<Offer> = serde_json::from_slice(&frame(&mut conn).await?)?;
+                        match offer {
+                            Some(offer) => Peer::answer(offer, &self.events).await.map(Some),
+                            None => Ok(None),
+                        }
                     };
                     let reply = match timeout(Duration::from_secs(5), offer).await {
-                        Ok(Ok((next, sdp))) => {
+                        Ok(Ok(answer)) => {
                             self.input.send(Input::Release)?;
                             self.viewport.store(0, Relaxed);
                             self.events.keyframe.store(true, Relaxed);
-                            peer = Some(next);
+                            peer = None;
                             audio = None;
                             encoder = None;
-                            Ok(serde_json::json!({ "sdp": sdp }))
+                            if let Some((next, sdp)) = answer {
+                                peer = Some(next);
+                                Ok(serde_json::json!({ "sdp": sdp }))
+                            } else {
+                                Ok(serde_json::Value::Null)
+                            }
                         }
                         Ok(Err(error)) => Err(error),
                         Err(_) => Err(anyhow!("WebRTC 协商超时")),
@@ -1067,6 +1084,16 @@ pub async fn signal(path: &Path, offer: Offer) -> Result<serde_json::Value> {
     })
     .await
     .context("串流未就绪，请检查游戏日志")?
+}
+
+pub async fn disconnect(path: PathBuf) {
+    let _ = timeout(Duration::from_secs(7), async {
+        let mut socket = UnixStream::connect(path).await?;
+        socket.write_all(b"null\n").await?;
+        frame(socket).await?;
+        anyhow::Ok(())
+    })
+    .await;
 }
 
 #[cfg(test)]

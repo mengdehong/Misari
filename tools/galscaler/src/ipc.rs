@@ -14,7 +14,7 @@ use std::{
 };
 use tokio::{
     io::AsyncWriteExt,
-    net::{TcpListener, UnixListener, UnixStream},
+    net::{UnixListener, UnixStream},
     signal::unix::{SignalKind, signal},
     sync::{mpsc, oneshot, watch},
     task::JoinSet,
@@ -33,6 +33,7 @@ pub async fn dispatch(queue: &Queue, bytes: &[u8], local: Option<&Paths>) -> Rep
                     Request::List
                         | Request::Status
                         | Request::Log { .. }
+                        | Request::SetPicture { .. }
                         | Request::Stop { .. }
                         | Request::LaunchStream { .. }
                 ),
@@ -87,7 +88,7 @@ async fn serve_socket(
     Ok(())
 }
 
-pub async fn serve(paths: Paths, network: Option<(SocketAddr, String)>) -> Result<()> {
+pub async fn serve(paths: Paths, listen: Option<SocketAddr>) -> Result<()> {
     paths.prepare()?;
     let lock = OpenOptions::new()
         .read(true)
@@ -105,19 +106,10 @@ pub async fn serve(paths: Paths, network: Option<(SocketAddr, String)>) -> Resul
         .mode(0o600)
         .open(paths.socket.with_added_extension("lock"))?;
     socket_lock.try_lock().context("该引擎 socket 已被占用")?;
-    let mut engine = Engine::open(paths.clone(), network.is_some())?;
+    let mut engine = Engine::open(paths.clone(), false)?;
     engine.refresh().await?;
     let mut terminate = signal(SignalKind::terminate())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
-    let web = match network {
-        Some((address, token)) => {
-            let listener = TcpListener::bind(address)
-                .await
-                .context("无法监听局域网地址")?;
-            Some((listener, token))
-        }
-        None => None,
-    };
     match UnixStream::connect(&paths.socket).await {
         Ok(_) => return Err(anyhow!("该引擎 socket 已被占用")),
         Err(error) if error.kind() == ErrorKind::ConnectionRefused => {
@@ -130,14 +122,12 @@ pub async fn serve(paths: Paths, network: Option<(SocketAddr, String)>) -> Resul
         Err(error) if error.kind() == ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("无法检查引擎 socket"),
     }
-    let listener = UnixListener::bind(&paths.socket).context("无法创建引擎 socket")?;
-    fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
-
     let (tx, mut rx) = mpsc::channel::<(Request, oneshot::Sender<Reply>)>(32);
     let (stopping, stop) = watch::channel(());
-    let web = web.map(|(listener, token)| {
-        tokio::spawn(web::serve(listener, token, tx.clone(), stop.clone()))
-    });
+    let mut lan = web::Lan::open(paths.data.join("lan.json"), listen, &tx).await?;
+    engine.streaming = lan.enabled();
+    let listener = UnixListener::bind(&paths.socket).context("无法创建引擎 socket")?;
+    fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
     let mut clients = JoinSet::new();
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     let result = loop {
@@ -158,7 +148,20 @@ pub async fn serve(paths: Paths, network: Option<(SocketAddr, String)>) -> Resul
             }
             Some((request, reply)) = rx.recv() => {
                 let shutdown = matches!(request, Request::Shutdown);
-                let response = engine.handle(request).await;
+                let response = match request {
+                    Request::Lan => Ok(lan.status()),
+                    Request::SetLan { enabled, password } => match lan.set(enabled, password, &tx).await {
+                        Ok(revoke) => {
+                            engine.streaming = lan.enabled();
+                            if revoke {
+                                engine.disconnect_streams().await;
+                            }
+                            Ok(lan.status())
+                        }
+                        Err(error) => Err(error),
+                    },
+                    request => engine.handle(request).await,
+                };
                 let stopped = shutdown && response.is_ok();
                 let _ = reply.send(Reply::from_result(response));
                 if stopped { break Ok(()); }
@@ -173,11 +176,9 @@ pub async fn serve(paths: Paths, network: Option<(SocketAddr, String)>) -> Resul
     drop(listener);
     drop(rx);
     stopping.send_replace(());
+    lan.stop().await;
     let _ = timeout(Duration::from_secs(3), async {
         while clients.join_next().await.is_some() {}
-        if let Some(task) = web {
-            let _ = task.await;
-        }
     })
     .await;
     fs::remove_file(paths.socket)?;

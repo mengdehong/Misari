@@ -1,4 +1,4 @@
-use crate::model::{Changes, Settings};
+use crate::model::{Changes, Filter, Resolution, Settings};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -12,9 +12,17 @@ use tokio::{
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     List,
+    CoverPath {
+        id: u64,
+    },
     Library,
     SetSettings {
         settings: Settings,
+    },
+    Lan,
+    SetLan {
+        enabled: bool,
+        password: Option<String>,
     },
     Inspect {
         directory: PathBuf,
@@ -34,6 +42,13 @@ pub enum Request {
         id: u64,
         changes: Box<Changes>,
     },
+    SetPicture {
+        id: u64,
+        enabled: Option<bool>,
+        filter: Option<Filter>,
+        output: Option<Resolution>,
+        fps: Option<u16>,
+    },
     Remove {
         id: u64,
     },
@@ -49,6 +64,8 @@ pub enum Request {
     },
     LaunchStream {
         id: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        auto_output: Option<bool>,
     },
     Stream {
         id: u64,

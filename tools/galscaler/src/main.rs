@@ -32,7 +32,7 @@ struct Cli {
 enum Action {
     /// 从标准输入读取一个 JSON 请求。
     Request,
-    /// 在前台运行 galscalerd。默认只监听本地 Unix socket。
+    /// 在前台运行 galscalerd。
     Serve {
         #[arg(long)]
         listen: Option<SocketAddr>,

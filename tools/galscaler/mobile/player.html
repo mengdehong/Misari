@@ -2,155 +2,497 @@
 <html lang="zh-CN">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="dark">
+<meta name="color-scheme" content="light dark">
 <title>GalScaler</title>
 <style>
-  :root {
-    font: 16px/1.5 system-ui, "Noto Sans CJK SC", sans-serif;
-    color: #e5e9f0;
-    background: #23272e;
-    --muted: #a6adba;
-    --panel: #2d323b;
-    --line: #3e4451;
-    --accent: #79bdf2;
-    --live: #98c379;
-    --error: #f0939b;
+  @font-face {
+    font-family: "GalScaler Serif";
+    src: local("Noto Serif Regular"), local("NotoSerif"), local("NotoSerif-Regular");
   }
+
+  :root {
+    font: 100%/1.5 Roboto, system-ui, "Noto Sans CJK SC", sans-serif;
+    color-scheme: light dark;
+    color: var(--ink);
+    background: var(--canvas);
+    --canvas: #f8fbfe;
+    --panel: #fff;
+    --sheet: #fdfefe;
+    --raised: #eff5fa;
+    --line: #e4edf5;
+    --ink: #23374a;
+    --muted: #576d80;
+    --accent: #366b98;
+    --focus: #477fab;
+    --sky: #e6f3fd;
+    --atmosphere: linear-gradient(135deg, var(--raised), var(--sky));
+    --action: linear-gradient(115deg, #3b75a5, #3b6c9e);
+    --on-accent: #fff;
+    --live: #356b58;
+    --error: #a44554;
+    --end-game: #8f4f55;
+    --scrim: #172c4159;
+    --player: #111823;
+    --radius-control: .625rem;
+    --radius-panel: 1rem;
+    --radius-sheet: 1.125rem;
+    --spring: cubic-bezier(.22, 1.48, .42, 1);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --canvas: #171f2b;
+      --panel: #1d2836;
+      --sheet: #222e3d;
+      --raised: #253448;
+      --line: #344457;
+      --ink: #eef5fb;
+      --muted: #afc0d1;
+      --accent: #a9cfee;
+      --focus: #9cccf3;
+      --sky: #294357;
+      --action: linear-gradient(115deg, #316996, #3a5d91);
+      --live: #9ecdb8;
+      --error: #ffadb7;
+      --end-game: #dda4aa;
+      --scrim: #0a111b9c;
+    }
+  }
+
   * { box-sizing: border-box; }
   [hidden] { display: none !important; }
-  body { margin: 0; }
-  header, main { max-width: 48rem; margin-inline: auto; padding-inline: 1.25rem; }
-  header {
-    min-height: 4.25rem;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    border-bottom: 1px solid var(--line);
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background: radial-gradient(ellipse min(72vw, 42rem) 30rem at 100% 3rem, var(--sky), transparent);
   }
-  header strong { font-size: 1.2rem; letter-spacing: -.035em; }
-  header strong span { color: var(--accent); }
-  #connection { color: var(--muted); font-size: .875rem; }
-  #connection::before {
-    display: inline-block;
-    width: .45rem;
-    height: .45rem;
-    margin-right: .4rem;
-    border-radius: 50%;
-    background: currentColor;
-    vertical-align: .1em;
-    content: "";
+  body:has(dialog[open], #player:not([hidden])) { overflow: hidden; }
+  h1, h2, p, ul { margin: 0; }
+  h1 { font-size: 1.875rem; line-height: 1.2; font-weight: 700; }
+  h2 { font-size: 1.25rem; line-height: 1.35; }
+  h1, h2 { overflow-wrap: anywhere; }
+  .sr-only {
+    position: absolute;
+    width: 1px; height: 1px;
+    padding: 0; margin: -1px; overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
   }
-  #connection[data-online="true"] { color: var(--live); }
-  main { padding-block: 2.5rem; }
-  h1, h2, p { margin: 0; }
-  h1 { font-size: clamp(1.75rem, 6vw, 2.25rem); letter-spacing: -.035em; }
-  h2 { font-size: 1rem; overflow-wrap: anywhere; }
-  label { display: block; margin: 1.5rem 0 .5rem; font-size: .875rem; color: var(--muted); }
-  input, button { font: inherit; border-radius: .625rem; min-height: 2.75rem; }
-  input {
-    display: block;
-    width: 100%;
-    padding: .6rem .75rem;
-    background: var(--panel);
-    border: 1px solid var(--line);
-    color: inherit;
-  }
+  .muted { color: var(--muted); font-size: .875rem; }
+  .error { color: var(--error); overflow-wrap: anywhere; }
+  [role="alert"]:not(:empty) { margin-block: .75rem; }
+  a, button, input { -webkit-tap-highlight-color: transparent; }
+  button, input { font: inherit; color: inherit; }
   button {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    padding: .5rem .75rem;
-    background: var(--panel);
-    border: 1px solid var(--line);
-    color: inherit;
-    white-space: nowrap;
+    gap: .5rem;
+    min-height: 3rem;
+    padding: .5rem 1rem;
+    border: 0;
+    border-radius: var(--radius-control);
+    background: var(--raised);
+    font-weight: 600;
     cursor: pointer;
+    touch-action: manipulation;
   }
-  button:disabled { cursor: default; opacity: .55; }
-  button.primary { background: var(--accent); border-color: var(--accent); color: #17212c; }
+  button:disabled { opacity: .55; cursor: default; }
+  button:active:not(:disabled) { box-shadow: inset 0 0 0 80px #172c411c; }
+  button.primary { background: var(--action); color: var(--on-accent); }
   button.secondary { background: transparent; }
-  .icon-button { min-width: 2.75rem; padding: .5rem; }
+  #show-password[aria-pressed="true"] { color: var(--accent); background: var(--sky); }
+  .icon-button { flex: none; width: 3rem; padding: 0; }
+  :is(button, input, select):focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+  :is(.primary, .stream, #favorite, #manual), .game-info > :is(img, .icon) { transition: scale 260ms var(--spring), translate 220ms var(--spring); }
+  :is(.primary, .stream, #favorite, #manual):active:not(:disabled) { scale: .95; transition-duration: 80ms; }
+  .game-info:active > :is(img, .icon) { scale: .98; transition-duration: 80ms; }
   .icon {
-    width: 1.125rem;
-    height: 1.125rem;
+    width: 1.25rem;
+    height: 1.25rem;
     flex: none;
     fill: none;
     stroke: currentColor;
     stroke-width: 2;
     stroke-linecap: round;
     stroke-linejoin: round;
-    vertical-align: -.2em;
+    vertical-align: -.25em;
     pointer-events: none;
   }
-  :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
-  form { max-width: 24rem; }
-  .connect-fields { display: flex; gap: .5rem; }
-  .connect-fields input { min-width: 0; }
-  .title { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
-  .muted { color: var(--muted); font-size: .875rem; }
-  .error { color: var(--error); overflow-wrap: anywhere; }
-  [role="alert"]:not(:empty) { margin-block: .75rem; }
-  ul { list-style: none; padding: 0; margin: 1rem 0; display: grid; gap: .625rem; }
-  li {
-    min-height: 5rem;
-    padding: .875rem;
+  .tile {
+    width: 2.625rem;
+    height: 2.625rem;
+    flex: none;
+    display: grid;
+    place-items: center;
+    border-radius: var(--radius-control);
+    background: var(--atmosphere);
+    color: var(--accent);
+  }
+  .app-bar {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+  }
+  .toolbar, main { max-width: 52rem; margin-inline: auto; padding-inline: 1rem; }
+  .toolbar {
+    min-height: 3.4375rem;
+    display: flex;
+    align-items: center;
+    gap: .5rem;
+  }
+  .toolbar .tile { position: relative; width: 1.5625rem; height: 1.75rem; background: transparent; color: var(--ink); }
+  .toolbar .tile::after, .star-burst span {
+    width: .5rem; height: .5rem;
+    clip-path: polygon(50% 0, 63% 37%, 100% 50%, 63% 63%, 50% 100%, 37% 63%, 0 50%, 37% 37%);
+    background: var(--focus);
+  }
+  .toolbar .tile::after {
+    content: "";
+    position: absolute;
+    top: .1875rem;
+    right: 0;
+    width: .375rem;
+    height: .375rem;
+    animation: drift 6s ease-in-out infinite;
+  }
+  @keyframes drift { 50% { translate: 0 -3px; } }
+  .star-burst {
+    position: fixed;
+    z-index: 4;
+    pointer-events: none;
+    animation: star-fade 420ms ease-out both;
+  }
+  dialog .star-burst { position: absolute; }
+  .star-burst span {
+    position: absolute;
+    animation: star-travel 420ms ease-out both;
+  }
+  .star-burst span:nth-child(1) { --dx: 2px; --dy: -28px; width: .6875rem; height: .6875rem; }
+  .star-burst span:nth-child(2) { --dx: -19px; --dy: -14px; background: var(--accent); }
+  .star-burst span:nth-child(3) { --dx: 19px; --dy: -9px; width: .375rem; height: .375rem; }
+  @keyframes star-fade { 15% { opacity: 1; } to { opacity: 0; } }
+  @keyframes star-travel { from { scale: .5; } to { translate: var(--dx) var(--dy); scale: .8; } }
+  .brand { flex: 1; font-size: 1rem; letter-spacing: -.025em; }
+  #back-to-computers { margin-inline-start: -.75rem; }
+  #back-to-computers:not([hidden]) + .tile { display: none; }
+  #connection { position: relative; }
+  #connection::after {
+    content: "";
+    position: absolute;
+    width: .4375rem; height: .4375rem;
+    inset: .625rem .625rem auto auto;
+    border: 2px solid var(--panel);
+    border-radius: 50%;
+    background: var(--error);
+  }
+  :root[data-online="true"] #connection::after { background: var(--live); }
+  #search-toggle[aria-expanded="true"] { background: var(--sky); color: var(--accent); }
+  main { padding-block: 1.25rem 2rem; }
+  .subtitle { margin-top: .5rem; }
+  .field { display: grid; gap: .375rem; margin-top: 1.25rem; }
+  .field label { font-size: .875rem; color: var(--muted); }
+  .field input, #search {
+    min-height: 3.25rem;
+    min-width: 0;
+    width: 100%;
+    padding: .75rem 1rem;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-control);
+    background: var(--panel);
+  }
+  .input-with-button { position: relative; }
+  .input-with-button input { padding-inline-end: 3.25rem; }
+  .input-with-button button { position: absolute; inset-inline-end: .125rem; top: 50%; transform: translateY(-50%); }
+  .remember {
+    display: flex;
+    align-items: center;
+    gap: .75rem;
+    min-height: 3rem;
+    width: fit-content;
+    margin-block: .375rem .75rem;
+    color: var(--muted);
+  }
+  .remember input { width: 1.125rem; height: 1.125rem; margin: 0; accent-color: var(--accent); }
+  #connect, #computers { max-width: 30rem; margin-inline: auto; }
+  #connect button[type="submit"] { width: 100%; }
+  #clear-default { width: 100%; margin-top: .5rem; color: var(--accent); }
+  #discovery:not(:empty) { margin-block: 1.25rem; }
+  #manual { margin-top: .75rem; color: var(--accent); }
+  .search-field { margin-block: 0 1rem; color: var(--muted); }
+  .search-field .input-with-button > .icon { position: absolute; inset-inline-start: 1rem; top: 1rem; }
+  #search {
+    appearance: none;
+    border: 0;
+    border-radius: var(--radius-control);
+    padding-inline: 2.875rem;
+    background: var(--raised);
+    color: var(--ink);
+  }
+  #search::placeholder { color: var(--muted); opacity: 1; }
+  #search::-webkit-search-cancel-button { appearance: none; }
+
+  .rows {
+    list-style: none;
+    padding: 0;
+    overflow: hidden;
+    border-radius: var(--radius-panel);
+    background: var(--panel);
+  }
+  .rows > * + * { border-top: 1px solid var(--line); }
+  .rows button:focus-visible { outline-offset: -3px; }
+  .computer, .sheet-action {
+    justify-content: flex-start;
+    gap: .75rem;
+    border-radius: 0;
+    background: transparent;
+    white-space: normal;
+    text-align: start;
+  }
+  .computer { width: 100%; padding: .75rem; }
+  .row-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .computer > .icon, .sheet-action .icon { color: var(--muted); }
+  #library-title { margin-bottom: 1rem; font-size: 1.4375rem; letter-spacing: -.035em; }
+  #library-title:focus { outline: 0; }
+  #games {
+    list-style: none;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: .9375rem .875rem;
+  }
+  @media (min-width: 36rem) {
+    #games { grid-template-columns: repeat(auto-fill, minmax(10rem, 1fr)); }
+  }
+  .poster {
+    position: relative;
+    aspect-ratio: 2 / 3;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-control);
+    background: var(--canvas);
+  }
+  .game-info {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    padding: 0;
+    overflow: hidden;
+    border-radius: calc(var(--radius-control) - 1px);
+    background: var(--atmosphere);
+    color: var(--accent);
+  }
+  .game-info:has(img:not([hidden])) { background: var(--canvas); }
+  @media (hover: hover) { .game-info:hover:not(:active) > :is(img, .icon) { translate: 0 -2px; } }
+  .game-info > .icon { width: 2.5rem; height: 2.5rem; opacity: .65; }
+  .game-info img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+  .game-info:has(img:not([hidden])) > .icon { visibility: hidden; }
+  .game-caption { display: flex; align-items: flex-start; min-height: 3.5625rem; margin-top: .125rem; }
+  .game-label { flex: 1; min-width: 0; padding-top: .3125rem; }
+  .game-name {
+    font-size: .8125rem;
+    font-weight: 600;
+    line-height: 1.35;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    overflow: hidden;
+  }
+  .game-state {
+    display: block;
+    margin-top: .125rem;
+    color: var(--muted);
+    font-size: .75rem;
+  }
+  .game-state[data-state="running"] { color: var(--live); }
+  .game-state[data-state="failed"], .game-state[data-state="interrupted"] { color: var(--error); }
+  .stream {
+    width: 2.75rem;
+    min-height: 2.75rem;
+    margin-top: -.1875rem;
+    margin-inline-end: -.25rem;
+    background: transparent;
+    color: var(--muted);
+  }
+  .stream .icon { width: 1rem; height: 1rem; fill: currentColor; stroke: none; }
+  .stream:focus-visible { outline-offset: -4px; }
+  .stream:active:not(:disabled) { background: var(--raised); box-shadow: none; }
+  #empty { padding: 2.25rem .75rem; text-align: center; }
+
+  dialog {
+    width: min(34rem, 100%);
+    max-width: 100%;
+    max-height: 86vh;
+    margin: auto auto 0;
+    padding: 1.25rem 1.25rem 1.5rem;
+    border: 0;
+    border-radius: var(--radius-sheet) var(--radius-sheet) 0 0;
+    color: var(--ink);
+    background: var(--sheet);
+    overscroll-behavior: contain;
+  }
+  dialog[open] { animation: sheet-in 220ms var(--spring) both; }
+  @keyframes sheet-in { from { translate: 0 10px; opacity: .5; } }
+  dialog::backdrop { background: var(--scrim); }
+  .sheet-heading { display: flex; align-items: center; gap: .625rem; margin-bottom: .375rem; }
+  .sheet-heading h2 { flex: 1; }
+  .sheet-heading button { margin-inline-end: -.5rem; }
+  #favorite { width: 2.75rem; min-height: 2.75rem; color: var(--muted); }
+  #favorite .icon { width: 1.125rem; height: 1.125rem; }
+  #favorite[aria-pressed="true"] { color: var(--focus); }
+  #favorite[aria-pressed="true"] .icon { fill: currentColor; }
+  #game-details .sheet-heading { align-items: flex-start; }
+  #game-title {
+    min-width: 0;
+    font: 400 1.625rem/1.16 "GalScaler Serif", "Noto Serif CJK JP", "Noto Serif", times, serif;
+    letter-spacing: -.025em;
+  }
+  #game-title .work-name { display: block; text-wrap: balance; }
+  #game-title .work-subtitle { display: block; margin-top: .3rem; font-size: .94rem; letter-spacing: 0; color: var(--muted); }
+  .sheet-actions { display: grid; margin-top: .75rem; }
+  .sheet-action { padding-inline: .625rem; border-radius: var(--radius-control); }
+  #default-connect { justify-content: space-between; }
+  .switch-track {
+    width: 2.625rem;
+    height: 1.5rem;
+    padding: .1875rem;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: var(--raised);
+  }
+  .switch-track::before {
+    content: "";
+    display: block;
+    width: 1rem;
+    height: 1rem;
+    border-radius: 50%;
+    background: var(--muted);
+  }
+  #default-connect[aria-checked="true"] .switch-track { border-color: transparent; background: var(--action); }
+  #default-connect[aria-checked="true"] .switch-track::before { margin-inline-start: auto; background: var(--on-accent); }
+  #default-error:empty { display: none; }
+  .danger, .sheet-action.danger .icon { color: var(--error); }
+  #device-address { overflow-wrap: anywhere; }
+  #picture-fields {
+    min-width: 0;
+    margin: 1.125rem 0 0;
+    padding: 0;
+    border: 0;
+  }
+  .picture-row {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    flex-wrap: wrap;
-    gap: .625rem 1rem;
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: .875rem;
+    min-height: 3.5rem;
+    gap: .5rem;
+    font-size: .875rem;
+    border-top: 1px solid var(--line);
   }
-  .game-info { min-width: 0; flex: 1 1 10rem; }
-  .actions { display: flex; gap: .5rem; margin-left: auto; }
-  .state { color: var(--accent); }
-  .state[data-state="running"] { color: var(--live); }
-  .state[data-state="failed"], .state[data-state="interrupted"] { color: var(--error); }
-  dialog {
-    width: min(42rem, calc(100% - 2rem));
-    max-height: 82vh;
-    padding: 1rem;
-    color: inherit;
-    background: var(--panel);
+  .picture-row select {
+    width: min(11rem, 57%);
+    min-height: 2.75rem;
+    padding: .375rem .625rem;
     border: 1px solid var(--line);
-    border-radius: .875rem;
+    border-radius: var(--radius-control);
+    background: var(--panel);
+    color: var(--ink);
+    font: inherit;
   }
-  dialog::backdrop { background: #171a20cc; }
-  pre { white-space: pre-wrap; overflow-wrap: anywhere; }
-  #discovery { display: flex; flex-wrap: wrap; gap: .375rem; margin-top: .5rem; }
-  #discovery button { min-height: 2.25rem; font-size: .875rem; }
+  .picture-actions { display: flex; align-items: center; justify-content: space-between; gap: .5rem; margin-top: 1rem; }
+  #game-stop {
+    border: 1px solid var(--line);
+    background: transparent;
+    color: var(--end-game);
+  }
+  #save-picture { margin-inline-start: auto; min-width: 5rem; }
+  @media (min-width: 42rem) and (min-height: 30rem) {
+    dialog { width: min(34rem, calc(100% - 2rem)); margin: auto; border-radius: var(--radius-sheet); }
+  }
+
   #player {
-    position: fixed; inset: 0; z-index: 1;
-    background: #090b0f; overflow: hidden; overscroll-behavior: none;
+    position: fixed; inset: 0; z-index: 2;
+    color: #edf5fc; background: var(--player);
+    overflow: hidden; overscroll-behavior: none;
     -webkit-user-select: none; user-select: none;
   }
   #picture, #touch { position: absolute; inset: 0; width: 100%; height: 100%; }
   #picture { object-fit: contain; }
-  #touch { touch-action: none; user-select: none; }
+  #touch { touch-action: none; }
   #loading {
     position: absolute; inset: 50% 1rem auto; transform: translateY(-50%);
+    display: grid; justify-items: center; gap: .75rem;
     text-align: center; pointer-events: none;
   }
+  .spinner {
+    width: 1.25rem; height: 1.25rem;
+    border: 2px solid currentColor; border-inline-end-color: transparent; border-radius: 50%;
+    animation: spin 900ms linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(1turn); } }
   #controls {
-    position: absolute; top: max(.65rem, env(safe-area-inset-top));
-    left: max(.65rem, env(safe-area-inset-left)); right: max(.65rem, env(safe-area-inset-right));
-    display: flex; align-items: flex-start; justify-content: space-between;
-    gap: .5rem; pointer-events: none;
+    position: absolute;
+    top: max(.75rem, env(safe-area-inset-top));
+    right: max(.75rem, env(safe-area-inset-right));
+    left: max(.75rem, env(safe-area-inset-left));
+    display: flex;
+    align-items: flex-start;
+    justify-content: flex-end;
+    gap: .5rem;
+    pointer-events: none;
   }
-  .bar {
-    display: flex; flex-wrap: wrap; justify-content: flex-end;
-    border: 1px solid #ffffff2b; border-radius: .8rem; padding: .1875rem;
-    background: #181d29ce; backdrop-filter: blur(12px); pointer-events: auto;
+  .glass {
+    border: 1px solid #cce3fb36;
+    background: linear-gradient(115deg, #b4d7f61c, #83b5e61f), #1c2939;
+    color: #edf5fc;
+    box-shadow: inset 0 1px 0 #fff2, 0 5px 18px #06080959;
   }
-  .bar button {
-    border: 0; background: transparent; padding: .5rem;
-    touch-action: manipulation;
+  @media (prefers-reduced-transparency: no-preference) {
+    @supports (backdrop-filter: blur(1px)) {
+      .glass {
+        background: linear-gradient(115deg, #b4d7f61c, #83b5e61f), #162232be;
+        backdrop-filter: blur(20px) saturate(115%);
+      }
+    }
   }
-  .bar button:active, .bar button[aria-pressed="true"] { background: #ffffff29; }
+  #more {
+    order: 1;
+    pointer-events: auto;
+  }
+  #actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    min-width: 0;
+    padding: .125rem;
+    border-radius: var(--radius-panel);
+    opacity: 1;
+    transition: opacity 150ms ease, transform 150ms ease, visibility 150ms;
+  }
+  #actions[data-open="false"] {
+    opacity: 0;
+    visibility: hidden;
+    transform: translateX(.375rem) scale(.98);
+  }
+  #actions[data-open="true"] { pointer-events: auto; }
+  #actions button { background: transparent; }
+  #actions button[aria-pressed="true"], #actions button:active, #more[aria-expanded="true"] {
+    background: linear-gradient(115deg, #316996, #3a5d91);
+    color: var(--on-accent);
+  }
   #skip { touch-action: none; }
-  #gesture-help { font-size: .95rem; }
+  #gesture-help {
+    width: min(30rem, calc(100% - 2rem));
+    margin: auto;
+    border-radius: var(--radius-sheet);
+  }
+  #gesture-help::backdrop { background: #0a111b7a; }
+  .gestures { display: grid; grid-template-columns: max-content 1fr; gap: .5rem 1rem; }
+  .gestures dd { margin: 0; color: #d7e4f0; }
+  [data-reduced-motion] .toolbar .tile::after,
+  [data-reduced-motion] :is(dialog[open], .spinner) { animation: none; }
+  [data-reduced-motion] :is(.primary, .stream, #favorite, #manual, #actions, .game-info > img, .game-info > .icon) { transition: none; }
+  [data-reduced-motion] :is(.primary, .stream, #favorite, #manual):active,
+  [data-reduced-motion] .game-info:is(:active, :hover) > :is(img, .icon) { scale: 1; translate: none; }
 </style>
 <!--
   Lucide Icons, ISC License.
@@ -170,6 +512,16 @@
   OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 -->
 <svg hidden aria-hidden="true">
+  <symbol id="icon-gamepad" viewBox="0 0 24 24">
+    <path d="M6 12h4m-2-2v4m7-1h.01m3-2h.01" />
+    <path d="M6.2 7h11.6a4 4 0 0 1 3.9 3.2l1.1 5.8a2.5 2.5 0 0 1-4.2 2.3L16 16H8l-2.6 2.3A2.5 2.5 0 0 1 1.2 16l1.1-5.8A4 4 0 0 1 6.2 7Z" />
+  </symbol>
+  <symbol id="icon-search" viewBox="0 0 24 24">
+    <circle cx="11" cy="11" r="7" /><path d="m20 20-4-4" />
+  </symbol>
+  <symbol id="icon-eye" viewBox="0 0 24 24">
+    <path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z" /><circle cx="12" cy="12" r="2.5" />
+  </symbol>
   <symbol id="icon-plug" viewBox="0 0 24 24">
     <path d="M12 22v-5" /><path d="M9 8V2" /><path d="M15 8V2" />
     <path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z" />
@@ -180,19 +532,14 @@
     <path d="M7.5 13.5 10 11" /><path d="M10.5 16.5 13 14" />
     <path d="m12 6 6 6 2.3-2.3a2.4 2.4 0 0 0 0-3.4l-2.6-2.6a2.4 2.4 0 0 0-3.4 0Z" />
   </symbol>
-  <symbol id="icon-file-text" viewBox="0 0 24 24">
-    <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
-    <path d="M14 2v4a2 2 0 0 0 2 2h4" /><path d="M10 9H8" /><path d="M16 13H8" /><path d="M16 17H8" />
-  </symbol>
-  <symbol id="icon-square" viewBox="0 0 24 24">
-    <rect width="18" height="18" x="3" y="3" rx="2" />
-  </symbol>
-  <symbol id="icon-cast" viewBox="0 0 24 24">
-    <path d="M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6" />
-    <path d="M2 12a9 9 0 0 1 8 8" /><path d="M2 16a5 5 0 0 1 4 4" /><line x1="2" x2="2.01" y1="20" y2="20" />
+  <symbol id="icon-play" viewBox="0 0 24 24">
+    <path d="M8 5.3a1.15 1.15 0 0 1 1.75-.98l11 6.7a1.15 1.15 0 0 1 0 1.96l-11 6.7A1.15 1.15 0 0 1 8 18.7Z" transform="translate(-1.5 0)" />
   </symbol>
   <symbol id="icon-x" viewBox="0 0 24 24">
     <path d="M18 6 6 18" /><path d="m6 6 12 12" />
+  </symbol>
+  <symbol id="icon-star" viewBox="0 0 24 24">
+    <path d="m12 3 2.8 5.7 6.3.9-4.55 4.45 1.07 6.28L12 17.37l-5.62 2.96 1.07-6.28L2.9 9.6l6.3-.9Z" />
   </symbol>
   <symbol id="icon-arrow-left" viewBox="0 0 24 24">
     <path d="m12 19-7-7 7-7" /><path d="M19 12H5" />
@@ -219,131 +566,462 @@
   <symbol id="icon-menu" viewBox="0 0 24 24">
     <line x1="4" x2="20" y1="12" y2="12" /><line x1="4" x2="20" y1="6" y2="6" /><line x1="4" x2="20" y1="18" y2="18" />
   </symbol>
+  <symbol id="icon-monitor" viewBox="0 0 24 24">
+    <rect width="20" height="14" x="2" y="3" rx="2" />
+    <path d="M12 17v4m-4 0h8" />
+  </symbol>
+  <symbol id="icon-chevron-right" viewBox="0 0 24 24">
+    <path d="m9 18 6-6-6-6" />
+  </symbol>
+  <symbol id="icon-pin" viewBox="0 0 24 24">
+    <path d="M16 9V4h1V2H7v2h1v5c0 2-2 3-3 4v2h14v-2c-1-1-3-2-3-4Zm-4 6v7" />
+  </symbol>
   <symbol id="icon-circle-help" viewBox="0 0 24 24">
     <circle cx="12" cy="12" r="10" /><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" /><path d="M12 17h.01" />
   </symbol>
 </svg>
-<header>
-  <strong>Gal<span>Scaler</span></strong>
-  <span id="connection" role="status">未连接</span>
+<header class="app-bar">
+  <div class="toolbar">
+    <button id="back-to-computers" type="button" class="secondary icon-button" aria-label="返回附近的电脑" hidden>
+      <svg class="icon" aria-hidden="true"><use href="#icon-arrow-left" /></svg>
+    </button>
+    <span class="tile" aria-hidden="true"><svg class="icon"><use href="#icon-gamepad" /></svg></span>
+    <strong class="brand">GalScaler</strong>
+    <button id="search-toggle" type="button" class="secondary icon-button" aria-expanded="false" aria-controls="search-field" aria-label="搜索作品" hidden>
+      <svg class="icon" aria-hidden="true"><use href="#icon-search" /></svg>
+    </button>
+    <button id="connection" type="button" class="secondary icon-button" aria-label="连接详情" hidden>
+      <svg class="icon" aria-hidden="true"><use href="#icon-monitor" /></svg>
+      <span id="connection-status" class="sr-only" role="status"></span>
+    </button>
+  </div>
 </header>
 <main>
+  <section id="computers" hidden aria-labelledby="computers-title">
+    <h1 id="computers-title" tabindex="-1">附近的电脑</h1>
+    <p id="discovery-status" class="muted subtitle" role="status">正在查找附近的电脑…</p>
+    <div id="discovery" class="rows"></div>
+    <button id="manual" type="button">
+      <svg class="icon" aria-hidden="true"><use href="#icon-plug" /></svg>
+      手动连接
+    </button>
+  </section>
   <form id="connect">
-    <h1>连接 GalScaler</h1>
-    <div id="host-fields" hidden>
+    <h1 id="connect-title" tabindex="-1">连接 GalScaler</h1>
+    <p id="connect-address" class="muted subtitle" hidden></p>
+    <div id="host-fields" class="field" hidden>
       <label for="host">电脑地址</label>
-      <input id="host" placeholder="192.168.1.20:9771" inputmode="url" autocapitalize="none" spellcheck="false">
-      <div id="discovery"></div>
+      <input id="host" placeholder="192.168.1.20:9771" inputmode="url" enterkeyhint="next" autocapitalize="none" spellcheck="false">
     </div>
-    <label for="key">访问令牌</label>
-    <div class="connect-fields">
-      <input id="key" name="key" type="password" required minlength="32" autocapitalize="none" spellcheck="false">
-      <button type="submit" class="primary icon-button" aria-label="连接" title="连接">
-        <svg class="icon" aria-hidden="true"><use href="#icon-plug" /></svg>
-      </button>
+    <div class="field">
+      <label for="password">连接密码</label>
+      <div class="input-with-button">
+        <input id="password" name="password" type="password" required maxlength="256" autocomplete="current-password" enterkeyhint="go" autocapitalize="none" spellcheck="false">
+        <button id="show-password" type="button" class="secondary icon-button" aria-label="显示密码" aria-pressed="false">
+          <svg class="icon" aria-hidden="true"><use href="#icon-eye" /></svg>
+        </button>
+      </div>
     </div>
+    <label class="remember"><input id="remember" type="checkbox">记住密码</label>
+    <button type="submit" class="primary">连接</button>
     <p id="connect-error" class="error" role="alert"></p>
+    <button id="clear-default" type="button" class="secondary" hidden>取消默认连接</button>
   </form>
-  <section id="library" hidden>
-    <div class="title">
-      <div><h1>游戏库</h1><p id="count" class="muted"></p></div>
-      <button id="disconnect" class="secondary icon-button" aria-label="断开" title="断开">
-        <svg class="icon" aria-hidden="true"><use href="#icon-unplug" /></svg>
-      </button>
+  <section id="library" aria-labelledby="library-title" hidden>
+    <h1 id="library-title" tabindex="-1">游戏库</h1>
+    <div id="search-field" class="search-field" role="search" hidden>
+      <div class="input-with-button">
+        <input id="search" type="search" aria-label="搜索作品" placeholder="搜索作品" autocomplete="off" enterkeyhint="search">
+        <svg class="icon" aria-hidden="true"><use href="#icon-search" /></svg>
+        <button id="clear-search" type="button" class="secondary icon-button" aria-label="清除搜索" hidden>
+          <svg class="icon" aria-hidden="true"><use href="#icon-x" /></svg>
+        </button>
+      </div>
     </div>
-    <label for="search">搜索游戏</label>
-    <input id="search" type="search">
     <p id="error" class="error" role="alert"></p>
     <ul id="games"></ul>
-    <p id="empty" class="muted" hidden></p>
+    <p id="empty" class="muted" role="status" hidden></p>
   </section>
 </main>
+<template id="computer">
+  <button type="button" class="computer">
+    <span class="tile"><svg class="icon" aria-hidden="true"><use href="#icon-monitor" /></svg></span>
+    <span class="row-text computer-name"></span>
+    <svg class="icon" aria-hidden="true"><use href="#icon-chevron-right" /></svg>
+  </button>
+</template>
 <template id="game">
   <li>
-    <div class="game-info">
-      <h2></h2>
-      <p class="muted"><span class="state"></span><span class="quality"></span></p>
-      <p class="error" hidden></p>
+    <div class="poster">
+      <button type="button" class="game-info" aria-haspopup="dialog">
+        <svg class="icon" aria-hidden="true"><use href="#icon-gamepad" /></svg>
+        <img alt="" decoding="async" hidden>
+      </button>
     </div>
-    <div class="actions">
-      <button data-op="log" class="secondary icon-button" aria-label="查看游戏日志" title="查看游戏日志">
-        <svg class="icon" aria-hidden="true"><use href="#icon-file-text" /></svg>
-      </button>
-      <button data-op="stop" class="secondary icon-button" aria-label="结束游戏" title="结束游戏" hidden>
-        <svg class="icon" aria-hidden="true"><use href="#icon-square" /></svg>
-      </button>
-      <button data-op="play" class="primary icon-button" aria-label="开始串流" title="开始串流">
-        <svg class="icon" aria-hidden="true"><use href="#icon-cast" /></svg>
+    <div class="game-caption">
+      <div class="game-label">
+        <h2 class="game-name"></h2>
+        <span class="game-state" hidden></span>
+      </div>
+      <button type="button" class="stream icon-button">
+        <svg class="icon" aria-hidden="true"><use href="#icon-play" /></svg>
       </button>
     </div>
   </li>
 </template>
-<dialog id="log" aria-labelledby="log-title">
-  <div class="title">
-    <h2 id="log-title">游戏日志</h2>
-    <button class="secondary icon-button" aria-label="关闭日志" title="关闭日志">
+<dialog id="device" aria-labelledby="device-name">
+  <div class="sheet-heading">
+    <span class="tile"><svg class="icon" aria-hidden="true"><use href="#icon-monitor" /></svg></span>
+    <h2 id="device-name">电脑连接</h2>
+    <button class="secondary icon-button" data-close aria-label="关闭连接详情">
       <svg class="icon" aria-hidden="true"><use href="#icon-x" /></svg>
     </button>
   </div>
-  <pre></pre>
+  <p id="device-address" class="muted subtitle"></p>
+  <p id="device-offline" class="error subtitle" hidden>连接中断</p>
+  <div class="sheet-actions">
+    <button id="default-connect" type="button" class="sheet-action" role="switch" aria-checked="false" hidden>
+      启动时自动连接
+      <span class="switch-track" aria-hidden="true"></span>
+    </button>
+    <p id="default-error" class="error" role="alert"></p>
+    <button id="disconnect" type="button" class="sheet-action danger">
+      <svg class="icon" aria-hidden="true"><use href="#icon-unplug" /></svg>断开连接
+    </button>
+  </div>
+</dialog>
+<dialog id="game-details" aria-labelledby="game-title">
+  <div class="sheet-heading">
+    <h2 id="game-title"><span class="work-name"></span><span class="work-subtitle" hidden></span></h2>
+    <button id="favorite" type="button" class="secondary icon-button" aria-label="收藏并置顶" aria-pressed="false">
+      <svg class="icon" aria-hidden="true"><use href="#icon-star" /></svg>
+    </button>
+  </div>
+  <p class="game-error error" hidden></p>
+  <form id="picture-settings">
+    <fieldset id="picture-fields" aria-label="画质设置">
+      <label class="picture-row">
+        画质增强
+        <select id="picture-mode">
+          <option value="off">原始画质</option>
+          <option value="anime4k">Anime4K</option>
+          <option value="cunny">CuNNy</option>
+        </select>
+      </label>
+      <label class="picture-row">
+        帧率
+        <select id="picture-fps">
+          <option value="30">30 FPS</option>
+          <option value="60">60 FPS</option>
+          <option value="120">120 FPS</option>
+        </select>
+      </label>
+    </fieldset>
+    <p id="details-error" class="error" role="alert"></p>
+    <div class="picture-actions">
+      <button id="game-stop" type="button" class="danger" hidden>结束游戏</button>
+      <button id="save-picture" type="submit" class="primary" disabled>保存</button>
+    </div>
+  </form>
 </dialog>
 <section id="player" aria-label="游戏画面" hidden>
   <video id="picture" autoplay playsinline></video>
   <div id="touch" aria-label="游戏触控"></div>
-  <p id="loading" role="status">正在连接游戏…</p>
+  <div id="loading" role="status"><span class="spinner" aria-hidden="true"></span><span class="sr-only">正在连接游戏</span></div>
   <div id="controls">
-    <div class="bar">
-      <button id="back" class="icon-button" aria-label="返回游戏库" title="返回游戏库">
+    <button id="more" class="glass icon-button" aria-label="操作面板" aria-expanded="false" aria-controls="actions" title="操作面板">
+      <svg class="icon" aria-hidden="true"><use href="#icon-ellipsis" /></svg>
+    </button>
+    <div id="actions" class="glass" role="group" aria-label="游戏操作" data-open="false" inert>
+      <button id="back" class="icon-button" aria-label="返回作品库" title="返回作品库">
         <svg class="icon" aria-hidden="true"><use href="#icon-arrow-left" /></svg>
       </button>
-    </div>
-    <div class="bar">
-      <button id="more" class="icon-button" aria-label="播放器控制" aria-expanded="true" aria-controls="actions" title="播放器控制">
-        <svg class="icon" aria-hidden="true"><use href="#icon-ellipsis" /></svg>
+      <button id="mute" class="icon-button" aria-label="静音" aria-pressed="false" title="静音">
+        <svg class="icon" aria-hidden="true"><use href="#icon-volume-2" /></svg>
       </button>
-      <div id="actions" class="bar" style="display:contents">
-        <button id="mute" class="icon-button" aria-label="静音" aria-pressed="false" title="静音">
-          <svg class="icon" aria-hidden="true"><use href="#icon-volume-2" /></svg>
-        </button>
-        <button id="history" class="icon-button" aria-label="回看剧情" title="回看剧情">
-          <svg class="icon" aria-hidden="true"><use href="#icon-history" /></svg>
-        </button>
-        <button id="skip" class="icon-button" aria-label="按住快进" title="按住快进">
-          <svg class="icon" aria-hidden="true"><use href="#icon-fast-forward" /></svg>
-        </button>
-        <button id="menu" class="icon-button" aria-label="游戏菜单" title="游戏菜单">
-          <svg class="icon" aria-hidden="true"><use href="#icon-menu" /></svg>
-        </button>
-        <button id="help" class="icon-button" aria-label="手势说明" title="手势说明">
-          <svg class="icon" aria-hidden="true"><use href="#icon-circle-help" /></svg>
-        </button>
-      </div>
+      <button id="history" class="icon-button" aria-label="回看剧情" title="回看剧情">
+        <svg class="icon" aria-hidden="true"><use href="#icon-history" /></svg>
+      </button>
+      <button id="skip" class="icon-button" aria-label="按住快进" aria-pressed="false" title="按住快进">
+        <svg class="icon" aria-hidden="true"><use href="#icon-fast-forward" /></svg>
+      </button>
+      <button id="menu" class="icon-button" aria-label="游戏菜单" title="游戏菜单">
+        <svg class="icon" aria-hidden="true"><use href="#icon-menu" /></svg>
+      </button>
+      <button id="help" class="icon-button" aria-label="手势说明" title="手势说明">
+        <svg class="icon" aria-hidden="true"><use href="#icon-circle-help" /></svg>
+      </button>
+      <button id="pin" class="icon-button" aria-label="固定操作面板" aria-pressed="false" title="固定操作面板">
+        <svg class="icon" aria-hidden="true"><use href="#icon-pin" /></svg>
+      </button>
     </div>
   </div>
 </section>
-<dialog id="gesture-help" aria-labelledby="gesture-title">
-  <div class="title">
+<dialog id="gesture-help" class="glass" aria-labelledby="gesture-title">
+  <div class="sheet-heading">
     <h2 id="gesture-title">触控手势</h2>
-    <button class="secondary icon-button" aria-label="关闭手势说明" title="关闭手势说明">
+    <button class="secondary icon-button" data-close aria-label="关闭手势说明">
       <svg class="icon" aria-hidden="true"><use href="#icon-x" /></svg>
     </button>
   </div>
-  <p>轻点选择或推进剧情。长按打开右键菜单。上下滑动滚动回看，横向拖动模拟鼠标拖拽。按住
-    <svg class="icon" aria-label="快进" role="img"><use href="#icon-fast-forward" /></svg>可连续快进。</p>
+  <dl class="gestures">
+    <dt>轻点</dt><dd>选择或推进剧情</dd>
+    <dt>长按</dt><dd>打开右键菜单</dd>
+    <dt>上下滑动</dt><dd>滚动回看</dd>
+    <dt>横向滑动</dt><dd>模拟鼠标拖拽</dd>
+    <dt>按住快进键</dt><dd>连续快进</dd>
+  </dl>
 </dialog>
 <script>
   const $ = (id) => document.getElementById(id);
-  const form = $('connect'), library = $('library'), list = $('games'), log = $('log');
-  const search = $('search'), error = $('error'), connectError = $('connect-error');
+  const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
+  let starBurst;
+  function syncMotion() {
+    const reduce = reducedMotion.matches || window.mygo?.preferences?.reduceMotion;
+    document.documentElement.toggleAttribute('data-reduced-motion', Boolean(reduce));
+    if (reduce) starBurst?.remove();
+  }
+  syncMotion();
+  reducedMotion.addEventListener('change', syncMotion);
+  window.mygo?.on('mygo:preferences', syncMotion);
+  document.addEventListener('click', (event) => {
+    if (!(event.target instanceof Element)) return;
+    const button = event.target.closest('button:is(.primary, .stream, #favorite, #manual)');
+    if (!button || button.disabled || document.documentElement.hasAttribute('data-reduced-motion')) return;
+    const rect = button.getBoundingClientRect();
+    const panel = button.closest('dialog');
+    const x = event.detail ? event.clientX : rect.left + rect.width / 2;
+    const y = event.detail ? event.clientY : rect.top + rect.height / 2;
+    const burst = document.createElement('span');
+    burst.className = 'star-burst';
+    burst.setAttribute('aria-hidden', 'true');
+    const bounds = panel?.getBoundingClientRect();
+    burst.style.left = (panel ? x - bounds.left - panel.clientLeft + panel.scrollLeft : x) + 'px';
+    burst.style.top = (panel ? y - bounds.top - panel.clientTop + panel.scrollTop : y) + 'px';
+    for (let i = 0; i < 3; i++) burst.append(document.createElement('span'));
+    starBurst?.remove();
+    starBurst = burst;
+    burst.addEventListener('animationend', () => burst.remove(), { once: true });
+    (panel || document.body).append(burst);
+  }, true);
+
+  const form = $('connect'), library = $('library'), list = $('games');
+  const search = $('search'), searchToggle = $('search-toggle'), error = $('error'), connectError = $('connect-error');
+  const host = $('host'), passwordInput = $('password'), remember = $('remember');
+  const connectButton = form.querySelector('button[type="submit"]');
+  const showPassword = $('show-password'), connection = $('connection');
+  const defaultConnect = $('default-connect'), clearDefault = $('clear-default'), defaultError = $('default-error');
+  const computers = $('computers'), backToComputers = $('back-to-computers');
+  const details = $('game-details'), detailsError = $('details-error'), gameStop = $('game-stop'), favorite = $('favorite');
+  const pictureSettings = $('picture-settings'), pictureFields = $('picture-fields'), savePicture = $('save-picture');
+  const pictureMode = $('picture-mode'), pictureFPS = $('picture-fps');
   const cards = new Map(), pending = new Set();
+  let favorites = new Set();
   const states = {
     starting: '正在启动', running: '正在运行', stopping: '正在停止',
     exited: '已结束', failed: '启动失败', interrupted: '会话中断',
   };
   const active = (state) => ['starting', 'running', 'stopping'].includes(state);
-  let token = '', games = [], sessions = new Map(), revision = 0, refreshing = false;
+  let password = '', connectedAddress = '', games = [], sessions = new Map(), revision = 0, refreshing = false;
+  let restoreRevision = 0, computerName = '', selectedGame = null, originalPicture = null, disconnectMessage = '';
 
   const mobile = window.mygo?.call;
+  const defaultComputerKey = 'galscaler-default-computer';
+  let defaultComputer = mobile ? loadDefaultComputer() : null;
+  let screen = mobile ? 'computers' : 'connect';
+  const rootURL = location.pathname + location.search;
+  history.replaceState({ screen, depth: 0 }, '', rootURL);
+
+  function navigate(next, replace = false) {
+    const depth = history.state.depth + (replace ? 0 : 1);
+    screen = next;
+    history[replace ? 'replaceState' : 'pushState']({ screen, depth }, '', '#' + screen);
+  }
+
+  function openPanel(panel) {
+    const previous = document.querySelector('dialog[open]');
+    if (previous === panel) return;
+    history.pushState({ screen, panel: panel.id, depth: history.state.depth + 1 }, '', '#' + panel.id);
+    previous?.close();
+    panel.showModal();
+  }
+  for (const panel of document.querySelectorAll('dialog')) {
+    if (panel === details) continue;
+    panel.querySelector('[data-close]')?.addEventListener('click', () => panel.close());
+    panel.addEventListener('close', () => {
+      if (!panel.open && history.state?.panel === panel.id) history.back();
+    });
+  }
+
+  let closingDetails = false, pressedBackdrop = false;
+  function dismissDetails() {
+    if (!details.open || closingDetails || history.state?.panel !== details.id) return;
+    closingDetails = true;
+    history.back();
+  }
+
+  const onBackdrop = ({ target, clientX, clientY }) => {
+    if (target !== details) return false;
+    const { left, right, top, bottom } = details.getBoundingClientRect();
+    return clientX < left || clientX >= right || clientY < top || clientY >= bottom;
+  };
+  details.addEventListener('pointerdown', event => {
+    pressedBackdrop = event.isPrimary && event.button === 0 && onBackdrop(event);
+  });
+  details.addEventListener('click', event => {
+    if (pressedBackdrop && onBackdrop(event)) dismissDetails();
+    pressedBackdrop = false;
+  });
+  details.addEventListener('cancel', event => {
+    event.preventDefault();
+    dismissDetails();
+  });
+
+  const passwordKey = (address) => 'galscaler-password:' + address;
+  const favoritesKey = (address) => 'galscaler-favorites:' + address;
+  const authorization = (key) => 'Basic ' + btoa(String.fromCharCode(...new TextEncoder().encode('galscaler:' + key)));
+
+  async function fetchCover(id, key) {
+    if (mobile) return await mobile('Mobile.Cover', id, key);
+    const response = await fetch('/api/v1/cover/' + id, {
+      headers: { Authorization: authorization(key) },
+      signal: AbortSignal.timeout(14000),
+    });
+    if (response.ok && response.headers.get('Content-Type')?.startsWith('image/')) {
+      return URL.createObjectURL(await response.blob());
+    }
+  }
+
+  const coverObserver = new IntersectionObserver((entries) => {
+    for (const { target, isIntersecting } of entries) {
+      if (!isIntersecting) continue;
+      coverObserver.unobserve(target);
+      const { cover, id } = target.dataset;
+      fetchCover(id, password).then((source) => {
+        if (!source) return;
+        if (target.isConnected && target.dataset.cover === cover) target.querySelector('img').src = source;
+        else if (source.startsWith('blob:')) URL.revokeObjectURL(source);
+      }).catch(() => {});
+    }
+  }, { rootMargin: '180px' });
+
+  function clearCover(target) {
+    const image = target.querySelector('img');
+    if (image.src.startsWith('blob:')) URL.revokeObjectURL(image.src);
+    image.removeAttribute('src');
+    image.hidden = true;
+  }
+
+  function forgetCard(card) {
+    const target = card.querySelector('.game-info');
+    coverObserver.unobserve(target);
+    clearCover(target);
+    card.remove();
+  }
+
+  function toggleSearch(open) {
+    $('search-field').hidden = !open;
+    searchToggle.setAttribute('aria-expanded', String(open));
+    searchToggle.setAttribute('aria-label', open ? '关闭搜索' : '搜索作品');
+    searchToggle.querySelector('use').setAttribute('href', open ? '#icon-x' : '#icon-search');
+    if (open) search.focus();
+    else search.value = '';
+  }
+
+  function revealPassword(reveal) {
+    passwordInput.type = reveal ? 'text' : 'password';
+    showPassword.setAttribute('aria-pressed', String(reveal));
+  }
+  showPassword.addEventListener('click', () => revealPassword(passwordInput.type === 'password'));
+
+  function readSaved(key) {
+    try { return localStorage.getItem(key) ?? ''; } catch { return ''; }
+  }
+
+  function writeSaved(key, value) {
+    try {
+      if (value) localStorage.setItem(key, value);
+      else localStorage.removeItem(key);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function loadDefaultComputer() {
+    try {
+      const computer = JSON.parse(readSaved(defaultComputerKey) || 'null');
+      if (typeof computer?.name === 'string' && computer.address && addressKey(computer.address) === computer.address) {
+        return computer;
+      }
+    } catch {}
+    return null;
+  }
+
+  function saveDefaultComputer(computer) {
+    if (!writeSaved(defaultComputerKey, computer ? JSON.stringify(computer) : '')) return false;
+    defaultComputer = computer;
+    return true;
+  }
+
+  function renderDefaultConnect() {
+    defaultConnect.setAttribute('aria-checked', String(defaultComputer?.address === connectedAddress));
+  }
+
+  function loadFavorites(address) {
+    try {
+      const ids = JSON.parse(readSaved(favoritesKey(address)) || '[]');
+      return new Set(Array.isArray(ids) ? ids : []);
+    } catch {
+      return new Set();
+    }
+  }
+
+  function addressKey(value) {
+    try { return new URL(value.includes('://') ? value : 'http://' + value).origin; }
+    catch { return ''; }
+  }
+
+  async function savedPassword(address) {
+    if (!mobile) return readSaved(passwordKey(address));
+    try { return await mobile('Mobile.SavedPassword', address); } catch { return ''; }
+  }
+
+  async function savePassword(address, value) {
+    if (mobile) await mobile('Mobile.RememberPassword', address, value);
+    else writeSaved(passwordKey(address), value);
+  }
+
+  async function restorePassword() {
+    const current = ++restoreRevision;
+    const address = mobile ? addressKey(host.value.trim()) : location.origin;
+    passwordInput.value = '';
+    remember.checked = false;
+    if (!address) return;
+    const saved = await savedPassword(address);
+    if (current !== restoreRevision || connectButton.disabled || passwordInput.value) return;
+    passwordInput.value = saved;
+    remember.checked = saved !== '' || defaultComputer?.address === address;
+  }
+
+  async function forgetPassword(address, rejected) {
+    if (await savedPassword(address) === rejected) {
+      try { await savePassword(address, ''); } catch {}
+    }
+  }
+
+  remember.addEventListener('change', async () => {
+    const address = mobile ? addressKey(host.value.trim()) : location.origin;
+    if (!remember.checked && address) {
+      try { await savePassword(address, ''); }
+      catch { connectError.textContent = '无法清除记住的密码'; }
+      if (defaultComputer?.address === address) {
+        if (saveDefaultComputer(null)) clearDefault.hidden = true;
+        else connectError.textContent = '无法取消默认连接';
+      }
+    }
+  });
+
   async function request(key, path, fields) {
     let status, reply;
     if (mobile) {
@@ -351,7 +1029,10 @@
     } else {
       const response = await fetch(path, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: authorization(key),
+        },
         body: JSON.stringify(fields),
         signal: AbortSignal.timeout(14000),
       });
@@ -368,97 +1049,246 @@
 
   const rpc = (key, op, fields) => request(key, '/api/v1/rpc', { op, ...fields });
 
-  if (mobile) {
-    const host = $('host'), discovery = $('discovery');
-    $('host-fields').hidden = false;
-    host.required = true;
-    host.value = localStorage.getItem('galscaler-host') || '';
-    let discovering = false;
-    async function discover() {
-      if (form.hidden || discovering || document.hidden) return;
-      discovering = true;
-      try {
-        const servers = await mobile('Mobile.Discover');
-        discovery.replaceChildren(...(servers || []).map(({ name, address }) => {
-          const button = document.createElement('button');
-          button.type = 'button';
-          button.className = 'secondary';
-          button.textContent = name;
-          button.addEventListener('click', () => { host.value = address; $('key').focus(); });
+  let discovering = false, scanned = false, discoveryResult = '';
+  async function discover() {
+    if (computers.hidden || discovering || document.hidden) return;
+    discovering = true;
+    const status = $('discovery-status');
+    try {
+      const servers = await mobile('Mobile.Discover') || [];
+      const result = JSON.stringify(servers);
+      if (result !== discoveryResult) {
+        discoveryResult = result;
+        $('discovery').replaceChildren(...servers.map(({ name, address }) => {
+          const button = $('computer').content.firstElementChild.cloneNode(true);
+          button.querySelector('.computer-name').textContent = name;
+          button.addEventListener('click', () => selectComputer(name, address));
           return button;
         }));
-      } catch {} finally { discovering = false; }
+      }
+      status.hidden = servers.length > 0;
+      if (!servers.length && scanned) {
+        status.textContent = '未发现附近的电脑';
+      }
+      scanned = true;
+    } catch {
+      status.hidden = false;
+      status.textContent = '自动发现暂不可用';
+    } finally {
+      discovering = false;
     }
+  }
+
+  async function selectComputer(name, address, message = '', automatic = false) {
+    navigate('connect');
+    computerName = name;
+    computers.hidden = true;
+    form.hidden = false;
+    backToComputers.hidden = false;
+    clearDefault.hidden = !automatic;
+    $('connect-title').textContent = name ? '连接 ' + name : automatic ? '连接默认电脑' : '手动连接';
+    $('connect-address').hidden = !name;
+    $('connect-address').textContent = address;
+    $('host-fields').hidden = Boolean(name);
+    host.required = !name;
+    host.value = address;
+    connectError.textContent = message;
+    revealPassword(false);
+    $('connect-title').focus();
+    const restored = restorePassword();
+    const current = restoreRevision;
+    await restored;
+    if (message || form.hidden || restoreRevision !== current || connectButton.disabled) return;
+    if ((name || automatic) && passwordInput.value && remember.checked) form.requestSubmit();
+    else if (automatic) connectError.textContent = '请输入默认电脑的连接密码';
+  }
+
+  function showComputers() {
+    ++restoreRevision;
+    form.hidden = true;
+    computers.hidden = false;
+    backToComputers.hidden = true;
+    $('computers-title').focus();
     discover();
-    setInterval(discover, 4500);
+  }
+
+  if (mobile) {
+    defaultConnect.hidden = false;
+    form.hidden = true;
+    computers.hidden = false;
+    $('manual').addEventListener('click', () => selectComputer('', readSaved('galscaler-host')));
+    backToComputers.addEventListener('click', () => history.back());
+    host.addEventListener('input', restorePassword);
+    document.addEventListener('visibilitychange', discover);
+    if (!defaultComputer) discover();
+    setInterval(discover, 2500);
+  } else {
+    restorePassword();
   }
 
   function setConnected(online) {
-    $('connection').dataset.online = online;
-    $('connection').textContent = online ? '已连接' : '未连接';
+    document.documentElement.dataset.online = online;
+    $('connection-status').textContent = online ? '' : '连接中断';
+    $('device-offline').hidden = online;
+    connection.setAttribute('aria-label', online ? '连接详情' : '连接中断，查看连接详情');
   }
 
   function disconnect(message = '') {
-    leavePlayer();
-    token = '';
+    disconnectMessage = message;
+    history.go(-history.state.depth);
+  }
+
+  function resetConnection(message) {
+    password = '';
+    connectedAddress = '';
+    favorites.clear();
+    selectedGame = null;
+    originalPicture = null;
     ++revision;
     pending.clear();
+    for (const card of cards.values()) forgetCard(card);
     cards.clear();
-    list.replaceChildren();
-    form.hidden = false;
     library.hidden = true;
-    if (log.open) log.close();
-    setConnected(false);
+    connection.hidden = true;
+    searchToggle.hidden = true;
+    toggleSearch(false);
+    if (mobile && !message) {
+      showComputers();
+      return;
+    }
+    if (mobile) {
+      selectComputer(computerName, host.value, message);
+      return;
+    }
+    form.hidden = false;
     connectError.textContent = message;
-    $('key').focus();
+    revealPassword(false);
+    restorePassword();
+    $('connect-title').focus();
+  }
+
+  async function rejectPassword(message) {
+    const current = revision;
+    await forgetPassword(connectedAddress, password);
+    if (revision === current) disconnect(message);
+  }
+
+  function chooseOption(select, value, label) {
+    select.querySelector('[data-current]')?.remove();
+    select.value = value;
+    if (select.value === '') {
+      const option = new Option(label, value, false, true);
+      option.dataset.current = '';
+      select.add(option);
+    }
+  }
+
+  const enhancementMode = ({ enabled, filter }) => enabled && filter !== 'linear' ? filter : 'off';
+
+  function openDetails(id) {
+    selectedGame = id;
+    originalPicture = games.find((game) => game.id === id).enhancement;
+    const { fps } = originalPicture;
+    pictureMode.value = enhancementMode(originalPicture);
+    chooseOption(pictureFPS, String(fps), fps + ' FPS');
+    detailsError.textContent = '';
+    render();
+    openPanel(details);
+  }
+
+  function pictureChanges() {
+    const changed = {};
+    if (pictureMode.value !== enhancementMode(originalPicture)) {
+      const enabled = pictureMode.value !== 'off';
+      if (enabled !== originalPicture.enabled) changed.enabled = enabled;
+      if (enabled && pictureMode.value !== originalPicture.filter) changed.filter = pictureMode.value;
+    }
+    const fps = Number(pictureFPS.value);
+    if (fps !== originalPicture.fps) changed.fps = fps;
+    return changed;
+  }
+
+  function updatePictureFields() {
+    const busy = pending.has(selectedGame);
+    pictureFields.disabled = busy;
+    savePicture.disabled = busy || !Object.keys(pictureChanges()).length;
+  }
+
+  function renderDetails(game, session) {
+    const state = session?.state ?? '', busy = pending.has(game.id);
+    const title = $('game-title');
+    if (title.getAttribute('aria-label') !== game.name) {
+      title.setAttribute('aria-label', game.name);
+      const split = game.name.indexOf(' - ');
+      const subtitle = title.querySelector('.work-subtitle');
+      title.querySelector('.work-name').textContent = split < 0 ? game.name : game.name.slice(0, split);
+      subtitle.textContent = split < 0 ? '' : game.name.slice(split + 3);
+      subtitle.hidden = !subtitle.textContent;
+    }
+    const starred = favorites.has(game.id);
+    favorite.setAttribute('aria-pressed', String(starred));
+    favorite.title = starred ? '取消收藏' : '收藏并置顶';
+    const failure = details.querySelector('.game-error');
+    failure.textContent = session?.error ?? '';
+    failure.hidden = !session?.error;
+    gameStop.hidden = !active(state);
+    gameStop.disabled = busy || state === 'stopping';
+    updatePictureFields();
   }
 
   function render() {
     const query = search.value.trim().toLowerCase();
-    const visible = games.filter(({ name }) => name.toLowerCase().includes(query));
-    const running = games.filter(({ id }) => active(sessions.get(id)?.state)).length;
-    $('count').textContent = `${games.length} 款游戏 · ${running} 个活动会话`;
-    $('empty').hidden = visible.length > 0;
-    $('empty').textContent = query ? '没有符合搜索条件的游戏。' : '可在桌面端添加游戏。';
-    const visibleIds = new Set(visible.map(({ id }) => id));
+    const visible = new Set(games.filter(({ name }) => name.toLowerCase().includes(query)).map(({ id }) => id));
+    $('clear-search').hidden = !search.value;
+    $('empty').hidden = visible.size > 0;
+    $('empty').textContent = query ? '未找到作品' : '在电脑上添加作品';
+    const ids = new Set(games.map(({ id }) => id));
     for (const [id, card] of cards) {
-      if (!visibleIds.has(id)) {
-        card.remove();
+      if (!ids.has(id)) {
+        forgetCard(card);
         cards.delete(id);
       }
     }
-    visible.forEach((game, index) => {
+    const ordered = [...games].sort((a, b) => Number(favorites.has(b.id)) - Number(favorites.has(a.id)));
+    ordered.forEach((game, index) => {
       let card = cards.get(game.id);
       if (!card) {
         card = $('game').content.firstElementChild.cloneNode(true);
-        for (const button of card.querySelectorAll('button')) {
-          button.addEventListener('click', () => command(game.id, button.dataset.op));
-        }
+        const info = card.querySelector('.game-info');
+        info.dataset.id = game.id;
+        info.addEventListener('click', () => openDetails(game.id));
+        const image = info.querySelector('img');
+        image.addEventListener('load', () => { image.hidden = false; });
+        image.addEventListener('error', () => clearCover(info));
+        card.querySelector('.stream').addEventListener('click', () => command(game.id, 'play'));
         cards.set(game.id, card);
       }
       const session = sessions.get(game.id);
       const state = session?.state ?? '';
       const busy = pending.has(game.id);
-      const status = card.querySelector('.state');
-      const details = card.querySelector('.error');
-      const [logs, stop, play] = card.querySelectorAll('button');
-      card.querySelector('h2').textContent = game.name;
-      status.dataset.state = state;
-      status.textContent = states[state] ?? '未运行';
-      const quality = game.enhancement;
-      card.querySelector('.quality').textContent = quality.enabled
-        ? ` · ${quality.filter} · ${quality.output.height}p` : ' · 原始画质';
-      details.textContent = session?.error ?? '';
-      details.hidden = !session?.error;
-      logs.hidden = !session;
-      logs.disabled = busy;
-      stop.hidden = !active(state);
-      stop.disabled = busy || state === 'stopping';
-      play.title = active(state) ? '进入串流' : '开始串流';
-      play.setAttribute('aria-label', play.title);
-      play.disabled = busy || state === 'stopping' || (active(state) && !session?.streaming);
+      const info = card.querySelector('.game-info');
+      const play = card.querySelector('.stream');
+      const art = game.cover ?? '';
+      if (info.dataset.cover !== art) {
+        clearCover(info);
+        coverObserver.unobserve(info);
+        info.dataset.cover = art;
+        if (art) coverObserver.observe(info);
+      }
+      card.hidden = !visible.has(game.id);
+      card.querySelector('.game-name').textContent = game.name;
+      const label = card.querySelector('.game-state');
+      label.textContent = busy ? '处理中' : states[state] ?? '';
+      label.dataset.state = state;
+      label.hidden = !busy && (!states[state] || state === 'exited');
+      info.setAttribute('aria-label', label.hidden ? game.name : game.name + ' · ' + label.textContent);
+      play.title = active(state) ? '进入游戏' : '启动游戏';
+      play.setAttribute('aria-label', play.title + ' · ' + game.name);
+      play.disabled = pending.size > 0 || state === 'stopping' || (active(state) && !session?.streaming);
       if (list.children[index] !== card) list.insertBefore(card, list.children[index] ?? null);
     });
+    const selected = games.find(({ id }) => id === selectedGame);
+    if (selected) renderDetails(selected, sessions.get(selectedGame));
   }
 
   async function snapshot(key) {
@@ -467,9 +1297,9 @@
   }
 
   async function refresh() {
-    if (!token || refreshing || pending.size || document.hidden || player) return;
+    if (!password || refreshing || pending.size || document.hidden || player) return;
     refreshing = true;
-    const key = token, current = revision;
+    const key = password, current = revision;
     try {
       const data = await snapshot(key);
       if (current !== revision) return;
@@ -477,81 +1307,134 @@
       setConnected(true);
       render();
     } catch (failure) {
-      if (key !== token) return;
-      if (failure.status === 401) disconnect(failure.message);
+      if (current !== revision) return;
+      if (failure.status === 401) await rejectPassword(failure.message);
       else setConnected(false);
     } finally {
       refreshing = false;
     }
   }
 
-  async function command(id, op) {
-    const key = token;
+  async function command(id, op, fields = {}) {
+    const key = password;
     ++revision;
     pending.add(id);
-    error.textContent = '';
+    const feedback = op === 'play' ? error : detailsError;
+    feedback.textContent = '';
     render();
     try {
       if (op === 'play') {
         if (!active(sessions.get(id)?.state)) {
-          sessions.set(id, await rpc(key, 'launch_stream', { id }));
+          sessions.set(id, await rpc(key, 'launch_stream', { id, auto_output: true }));
         }
-        if (key === token) await playGame(id, key);
+        if (key === password) await playGame(id, key);
         return;
       }
-      const result = await rpc(key, op, { id });
-      if (key !== token) return;
-      if (op === 'log') {
-        log.querySelector('pre').textContent = result.text || '日志为空。';
-        log.showModal();
+      const result = await rpc(key, op, { id, ...fields });
+      if (key !== password) return;
+      if (op === 'set_picture') {
+        games = games.map(game => game.id === id ? result : game);
+        if (selectedGame === id) dismissDetails();
       } else {
         sessions.set(id, result);
       }
     } catch (failure) {
-      if (key !== token) return;
-      if (failure.status === 401) disconnect(failure.message);
-      else error.textContent = failure.message;
+      if (key !== password) return;
+      if (failure.status === 401) await rejectPassword(failure.message);
+      else (details.open && selectedGame === id ? feedback : error).textContent = failure.message;
     } finally {
       pending.delete(id);
-      if (key === token) render();
+      if (key === password) render();
     }
   }
 
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
-    const input = $('key'), button = form.querySelector('button[type="submit"]');
-    button.disabled = true;
+    if (connectButton.disabled) return;
+    const key = passwordInput.value;
+    const controls = [connectButton, host, passwordInput, remember, showPassword, clearDefault];
+    const attempt = restoreRevision;
+    const save = remember.checked;
+    for (const control of controls) control.disabled = true;
     connectError.textContent = '';
+    connectButton.textContent = '正在连接…';
+    let address = location.origin;
     try {
-      const key = input.value.trim();
-      if (mobile) {
-        const address = await mobile('Mobile.Connect', $('host').value);
-        localStorage.setItem('galscaler-host', address);
-      }
-      [games, sessions] = await snapshot(key);
-      token = key;
-      input.value = '';
+      const server = mobile ? await mobile('Mobile.Connect', host.value) : '';
+      if (mobile) address = addressKey(server);
+      const data = await snapshot(key);
+      if (attempt !== restoreRevision) return;
+      if (mobile) writeSaved('galscaler-host', server);
       error.textContent = '';
+      try { await savePassword(address, save ? key : ''); }
+      catch { error.textContent = save ? '无法记住密码' : '无法清除记住的密码'; }
+      if (attempt !== restoreRevision) return;
+      [games, sessions] = data;
+      connectedAddress = address;
+      favorites = loadFavorites(address);
+      password = key;
+      passwordInput.value = '';
       search.value = '';
       form.hidden = true;
+      backToComputers.hidden = true;
       library.hidden = false;
+      connection.hidden = false;
+      searchToggle.hidden = false;
+      navigate('library', Boolean(mobile));
       setConnected(true);
       render();
-      $('disconnect').focus();
+      $('library-title').focus();
     } catch (failure) {
+      if (attempt !== restoreRevision) return;
+      if (failure.status === 401) {
+        await forgetPassword(address, key);
+        if (attempt !== restoreRevision) return;
+        passwordInput.value = '';
+      }
       connectError.textContent = failure.message;
     } finally {
-      button.disabled = false;
+      for (const control of controls) control.disabled = false;
+      connectButton.textContent = '连接';
+      if (!form.hidden && attempt !== restoreRevision) restorePassword();
     }
   });
   const playerView = $('player'), picture = $('picture'), touch = $('touch'), loading = $('loading');
   const mute = $('mute'), muteIcon = mute.querySelector('use');
-  let player = null, gesture = null, lastPoint = { x: .5, y: .5 };
+  const playerControls = $('controls'), actions = $('actions'), more = $('more');
+  const pin = $('pin'), skip = $('skip'), help = $('gesture-help');
+  const shell = document.querySelectorAll('.app-bar, main');
+  let player = null, playerError = '', gesture = null, lastPoint = { x: .5, y: .5 };
+  let controlsTimer, hoveringControls = false, skipInput = null;
+
+  const controlsOpen = () => actions.dataset.open === 'true';
+  const controlsPinned = () => pin.getAttribute('aria-pressed') === 'true';
+  function scheduleControls() {
+    clearTimeout(controlsTimer);
+    if (!player || !controlsOpen() || !loading.hidden || controlsPinned() ||
+        hoveringControls || skipInput !== null || help.open || actions.querySelector(':focus-visible')) return;
+    controlsTimer = setTimeout(() => showControls(false), 3200);
+  }
+
+  function showControls(open) {
+    if (!open && actions.contains(document.activeElement)) more.focus({ preventScroll: true });
+    actions.dataset.open = String(open);
+    actions.inert = !open;
+    more.setAttribute('aria-expanded', String(open));
+    scheduleControls();
+  }
+
+  function setPinned(pinned) {
+    pin.setAttribute('aria-pressed', String(pinned));
+    pin.title = pinned ? '取消固定' : '固定操作面板';
+    pin.setAttribute('aria-label', pin.title);
+    scheduleControls();
+  }
 
   function setMuted(muted) {
     picture.muted = muted;
     mute.setAttribute('aria-pressed', String(muted));
     mute.title = muted ? '取消静音' : '静音';
+    mute.setAttribute('aria-label', mute.title);
     muteIcon.setAttribute('href', muted ? '#icon-volume-x' : '#icon-volume-2');
   }
 
@@ -571,36 +1454,51 @@
   }
 
   function leavePlayer(message = '') {
+    if (!player || player.leaving) return;
+    player.leaving = true;
+    playerError = message;
+    history.go(1 - history.state.depth);
+  }
+
+  function closePlayer() {
     if (!player) return;
     const current = player;
     cancelGesture();
+    releaseSkip();
     send({ type: 'release' });
     player = null;
+    showControls(false);
+    hoveringControls = false;
     current.abort.abort();
     current.pc.close();
     picture.srcObject = null;
     playerView.hidden = true;
+    for (const node of shell) node.inert = false;
     clearInterval(current.heartbeat);
     clearTimeout(current.deadline);
-    if ($('gesture-help').open) $('gesture-help').close();
     if (mobile) mobile('Mobile.Playing', false).catch(() => {});
-    error.textContent = message;
+    error.textContent = playerError;
+    playerError = '';
+    render();
     refresh();
   }
 
   async function playGame(id, key) {
-    leavePlayer();
+    if (player || screen !== 'library' || history.state.panel) return;
     if (!window.RTCPeerConnection) throw new Error('当前 WebView 无法播放 WebRTC');
     const pc = new RTCPeerConnection({ iceServers: [] });
     const dc = pc.createDataChannel('controls', { negotiated: true, id: 0 });
     const current = { pc, dc, abort: new AbortController() };
     player = current;
+    navigate('player');
     const media = new MediaStream();
     picture.srcObject = media;
     loading.hidden = false;
-    loading.textContent = '正在连接游戏…';
     setMuted(false);
     playerView.hidden = false;
+    for (const node of shell) node.inert = true;
+    setPinned(false);
+    showControls(true);
     lastPoint = { x: .5, y: .5 };
     if (mobile) mobile('Mobile.Playing', true).catch(() => {});
     try {
@@ -634,7 +1532,7 @@
         if (player === current) leavePlayer('游戏串流已结束');
       };
       current.deadline = setTimeout(() => {
-        if (player === current && !picture.videoWidth) leavePlayer('等待游戏画面超时，请查看会话日志');
+        if (player === current && !picture.videoWidth) leavePlayer('等待游戏画面超时');
       }, 25000);
       pc.addTransceiver('video', { direction: 'recvonly' });
       pc.addTransceiver('audio', { direction: 'recvonly' });
@@ -660,7 +1558,10 @@
       const answer = await request(key, '/api/v1/stream/' + id, { sdp: pc.localDescription.sdp, ...viewport() });
       if (player === current) await pc.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
     } catch (failure) {
-      if (player === current) leavePlayer(failure.message);
+      if (player === current) {
+        if (failure.status === 401) await rejectPassword(failure.message);
+        else leavePlayer(failure.message);
+      }
     }
   }
 
@@ -670,12 +1571,16 @@
       send(viewport());
     }
   }).observe(playerView);
-  picture.addEventListener('playing', () => { loading.hidden = true; });
+  picture.addEventListener('playing', () => {
+    loading.hidden = true;
+    scheduleControls();
+  });
   $('back').addEventListener('click', () => leavePlayer());
-  window.addEventListener('pagehide', () => leavePlayer());
+  window.addEventListener('pagehide', closePlayer);
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
       cancelGesture();
+      releaseSkip();
       send({ type: 'release' });
     }
   });
@@ -706,10 +1611,12 @@
   touch.addEventListener('pointerdown', event => {
     if (!event.isPrimary || gesture) return;
     const at = point(event);
-    if (!at) return;
+    if (!at && (!picture.videoWidth || event.button !== 0)) return;
     touch.setPointerCapture(event.pointerId);
-    const g = { id: event.pointerId, at, x: event.clientX, y: event.clientY, wheel: 0, mode: 'tap' };
+    const g = { id: event.pointerId, at, x: event.clientX, y: event.clientY, wheel: 0, mode: at ? 'tap' : 'edge' };
     gesture = g;
+    if (!at) return;
+    if (controlsOpen() && !controlsPinned() && skipInput === null) showControls(false);
     g.timer = setTimeout(() => {
       if (gesture === g) {
         g.mode = 'menu';
@@ -721,6 +1628,7 @@
     const g = gesture;
     if (!g || g.id !== event.pointerId) return;
     const dx = event.clientX - g.x, dy = event.clientY - g.y;
+    if (g.mode === 'edge' && Math.hypot(dx, dy) > 12) g.mode = 'ignored';
     if (g.mode === 'tap' && Math.hypot(dx, dy) > 12) {
       clearTimeout(g.timer);
       g.mode = Math.abs(dx) > Math.abs(dy) ? 'drag' : 'wheel';
@@ -738,14 +1646,29 @@
     const g = gesture;
     if (!g || g.id !== event.pointerId) return;
     if (g.mode === 'tap') click(point(event) || g.at, event.button === 2 ? 'right' : 'left');
+    if (g.mode === 'edge') showControls(!controlsOpen());
     cancelGesture();
   });
   touch.addEventListener('lostpointercapture', cancelGesture);
   playerView.addEventListener('contextmenu', event => event.preventDefault());
-  $('more').addEventListener('click', () => {
-    const actions = $('actions');
-    actions.hidden = !actions.hidden;
-    $('more').setAttribute('aria-expanded', String(!actions.hidden));
+  more.addEventListener('click', () => showControls(!controlsOpen()));
+  pin.addEventListener('click', () => setPinned(!controlsPinned()));
+  playerControls.addEventListener('click', scheduleControls);
+  playerControls.addEventListener('focusin', scheduleControls);
+  playerControls.addEventListener('focusout', () => queueMicrotask(scheduleControls));
+  playerControls.addEventListener('pointerenter', (event) => {
+    if (event.pointerType === 'mouse') hoveringControls = true;
+    scheduleControls();
+  });
+  playerControls.addEventListener('pointerleave', (event) => {
+    if (event.pointerType === 'mouse') hoveringControls = false;
+    scheduleControls();
+  });
+  playerControls.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && controlsOpen() && skipInput === null) {
+      event.preventDefault();
+      showControls(false);
+    }
   });
   mute.addEventListener('click', () => {
     setMuted(!picture.muted);
@@ -753,18 +1676,120 @@
   });
   $('history').addEventListener('click', () => { pointer(lastPoint); send({ type: 'scroll', steps: -3 }); });
   $('menu').addEventListener('click', () => click(lastPoint, 'right'));
-  $('skip').addEventListener('pointerdown', event => {
-    $('skip').setPointerCapture(event.pointerId);
+  function holdSkip(input) {
+    if (skipInput !== null) return;
+    skipInput = input;
+    skip.setAttribute('aria-pressed', 'true');
     send({ type: 'key', key: 'control', pressed: true });
+    scheduleControls();
+  }
+  function releaseSkip() {
+    if (skipInput === null) return;
+    skipInput = null;
+    skip.setAttribute('aria-pressed', 'false');
+    send({ type: 'key', key: 'control', pressed: false });
+    scheduleControls();
+  }
+  skip.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0 || skipInput !== null) return;
+    skip.setPointerCapture(event.pointerId);
+    holdSkip(event.pointerId);
   });
-  $('skip').addEventListener('lostpointercapture', () => send({ type: 'key', key: 'control', pressed: false }));
-  $('help').addEventListener('click', () => $('gesture-help').showModal());
-  $('gesture-help').querySelector('button').addEventListener('click', () => $('gesture-help').close());
+  skip.addEventListener('lostpointercapture', (event) => {
+    if (skipInput === event.pointerId) releaseSkip();
+  });
+  skip.addEventListener('keydown', (event) => {
+    if (event.key !== ' ' && event.key !== 'Enter') return;
+    event.preventDefault();
+    if (!event.repeat) holdSkip('keyboard');
+  });
+  skip.addEventListener('keyup', (event) => {
+    if ((event.key === ' ' || event.key === 'Enter') && skipInput === 'keyboard') releaseSkip();
+  });
+  skip.addEventListener('blur', () => {
+    if (skipInput === 'keyboard') releaseSkip();
+  });
+  $('help').addEventListener('click', () => openPanel(help));
 
   search.addEventListener('input', render);
+  search.addEventListener('search', () => search.blur());
+  searchToggle.addEventListener('click', () => {
+    toggleSearch($('search-field').hidden);
+    render();
+  });
+  $('clear-search').addEventListener('click', () => {
+    search.value = '';
+    search.focus();
+    render();
+  });
+  connection.addEventListener('click', () => {
+    $('device-name').textContent = computerName || '电脑连接';
+    $('device-address').textContent = connectedAddress;
+    defaultError.textContent = '';
+    renderDefaultConnect();
+    openPanel($('device'));
+  });
+  defaultConnect.addEventListener('click', async () => {
+    const address = connectedAddress;
+    const computer = defaultComputer?.address === address ? null : { name: computerName, address };
+    defaultConnect.disabled = true;
+    defaultError.textContent = '';
+    try {
+      if (computer) await savePassword(address, password);
+      if (!saveDefaultComputer(computer)) throw new Error();
+    } catch {
+      if (connectedAddress === address) defaultError.textContent = '无法更新默认连接';
+    } finally {
+      defaultConnect.disabled = false;
+      renderDefaultConnect();
+    }
+  });
+  clearDefault.addEventListener('click', () => {
+    if (saveDefaultComputer(null)) history.back();
+    else connectError.textContent = '无法取消默认连接';
+  });
   $('disconnect').addEventListener('click', () => disconnect());
-  log.querySelector('button').addEventListener('click', () => log.close());
+  favorite.addEventListener('click', () => {
+    if (!favorites.delete(selectedGame)) favorites.add(selectedGame);
+    writeSaved(favoritesKey(connectedAddress), JSON.stringify([...favorites]));
+    render();
+  });
+  gameStop.addEventListener('click', () => command(selectedGame, 'stop'));
+  pictureSettings.addEventListener('change', () => {
+    detailsError.textContent = '';
+    updatePictureFields();
+  });
+  pictureSettings.addEventListener('submit', (event) => {
+    event.preventDefault();
+    if (!savePicture.disabled) command(selectedGame, 'set_picture', pictureChanges());
+  });
+  window.addEventListener('popstate', ({ state }) => {
+    closingDetails = false;
+    const open = document.querySelector('dialog[open]');
+    const panel = state?.screen === screen && state.panel ? $(state.panel) : null;
+    if (open !== panel) {
+      open?.close();
+      panel?.showModal();
+    }
+    if (screen === 'player') scheduleControls();
+    if (screen === 'player' && state?.screen !== 'player') {
+      screen = 'library';
+      closePlayer();
+      $('library-title').focus({ preventScroll: true });
+    }
+    const root = mobile ? 'computers' : 'connect';
+    if (state?.screen === root) {
+      screen = root;
+      const message = disconnectMessage;
+      disconnectMessage = '';
+      if (password) resetConnection(message);
+      else if (mobile) showComputers();
+    } else if (state && state.screen !== screen) {
+      history.back();
+    }
+  });
   document.addEventListener('visibilitychange', refresh);
   setInterval(refresh, 2500);
+  if (defaultComputer) selectComputer(defaultComputer.name, defaultComputer.address, '', true);
 </script>
 </html>

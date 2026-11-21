@@ -8,7 +8,7 @@ mod scan;
 mod stream;
 mod web;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use galscaler::{api, model};
 use std::{
@@ -28,7 +28,7 @@ struct Cli {
     data_dir: Option<PathBuf>,
     #[arg(long, env = "GALSCALER_SOCKET")]
     socket: Option<PathBuf>,
-    /// 启用局域网 HTTP/WebSocket，需设置 GALSCALER_TOKEN。
+    /// 指定局域网监听地址，使用已保存的密码或 GALSCALER_PASSWORD。
     #[arg(long)]
     listen: Option<SocketAddr>,
     /// 在后台启动，等待 Unix socket 可用后返回。
@@ -88,19 +88,7 @@ async fn run() -> Result<()> {
     if cli.background {
         return start(&paths).await;
     }
-    let network = match cli.listen {
-        Some(address) => {
-            let token =
-                std::env::var("GALSCALER_TOKEN").context("请为局域网接口设置 GALSCALER_TOKEN")?;
-            ensure!(
-                token.len() >= 32 && token.bytes().all(|byte| byte.is_ascii_graphic()),
-                "GALSCALER_TOKEN 至少需要 32 个可见 ASCII 字符"
-            );
-            Some((address, token))
-        }
-        None => None,
-    };
-    ipc::serve(paths, network).await
+    ipc::serve(paths, cli.listen).await
 }
 
 async fn start(paths: &api::Paths) -> Result<()> {
@@ -119,7 +107,7 @@ async fn start(paths: &api::Paths) -> Result<()> {
         .arg(&paths.data)
         .arg("--socket")
         .arg(&paths.socket)
-        .env_remove("GALSCALER_TOKEN")
+        .env_remove("GALSCALER_PASSWORD")
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log)

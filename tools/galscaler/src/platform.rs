@@ -204,7 +204,7 @@ pub fn launch(
     };
     command
         .envs(&game.settings.environment)
-        .env_remove("GALSCALER_TOKEN")
+        .env_remove("GALSCALER_PASSWORD")
         .env("WINEPREFIX", prefix)
         .env("PROTONPATH", proton)
         .env("GAMEID", "umu-default")

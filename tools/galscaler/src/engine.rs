@@ -1,8 +1,8 @@
 use crate::{
     api::{Desktop, Paths, Request},
     cover,
-    model::{Filter, Library, Prefix},
-    platform,
+    model::{Changes, Enhancement, Filter, Library, Prefix},
+    platform, stream,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -67,7 +67,7 @@ pub struct Engine {
     runs: BTreeMap<u64, Run>,
     pub cover_jobs: JoinSet<(u64, Result<Option<PathBuf>>)>,
     pending_covers: BTreeMap<u64, AbortHandle>,
-    streaming: bool,
+    pub streaming: bool,
 }
 
 fn now() -> u64 {
@@ -75,6 +75,17 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn stream_picture(picture: &mut Enhancement, auto_output: bool) {
+    if !picture.enabled {
+        picture.enabled = true;
+        picture.filter = Filter::Linear;
+        picture.output = picture.source;
+    }
+    if auto_output {
+        picture.output = stream::MAX_RESOLUTION;
+    }
 }
 
 impl Engine {
@@ -140,8 +151,39 @@ impl Engine {
         self.runs.get(&id).is_some_and(|r| r.session.state.active())
     }
 
+    fn edit(&mut self, id: u64, changes: Changes) -> Result<Value> {
+        let original = self.library.get(id)?;
+        let mut game = original.clone();
+        let cover_changed = changes.cover.is_some() || changes.clear_cover;
+        let proton = changes.proton.clone();
+        game.apply(changes)?;
+        if let Some(value) = proton {
+            game.settings.proton = Some(platform::resolve_proton(&value)?);
+        } else if let Some(path) = &game.settings.proton
+            && game.settings.proton != original.settings.proton
+        {
+            game.settings.proton = Some(platform::resolve_proton(
+                path.to_str().context("无效的 Proton 路径")?,
+            )?);
+        }
+        let effective = game.effective(&self.library);
+        effective.settings.validate()?;
+        let cancel_cover =
+            cover_changed || game.name != original.name || game.executable != original.executable;
+        self.library.unique(&game.executable, Some(id))?;
+        let mut library = self.library.clone();
+        *library.games.iter_mut().find(|g| g.id == id).unwrap() = game.clone();
+        library.save(&self.paths.library())?;
+        self.library = library;
+        if cancel_cover {
+            self.cancel_cover(id);
+        }
+        Ok(serde_json::to_value(effective)?)
+    }
+
     pub async fn handle(&mut self, request: Request) -> Result<Value> {
         match request {
+            Request::Lan | Request::SetLan { .. } => unreachable!("handled by IPC"),
             Request::List => Ok(serde_json::to_value(
                 self.library
                     .games
@@ -149,6 +191,7 @@ impl Engine {
                     .map(|g| g.effective(&self.library))
                     .collect::<Vec<_>>(),
             )?),
+            Request::CoverPath { id } => Ok(json!(self.library.get(id)?.cover)),
             Request::Library => Ok(serde_json::to_value(&self.library)?),
             Request::SetSettings { mut settings } => {
                 settings.validate()?;
@@ -198,36 +241,23 @@ impl Engine {
             Request::FindCovers { .. } | Request::DownloadCover { .. } => {
                 bail!("封面查找仅支持本地连接")
             }
-            Request::Edit { id, changes } => {
-                let original = self.library.get(id)?;
-                let mut game = original.clone();
-                let cover_changed = changes.cover.is_some() || changes.clear_cover;
-                let proton = changes.proton.clone();
-                game.apply(*changes)?;
-                if let Some(value) = proton {
-                    game.settings.proton = Some(platform::resolve_proton(&value)?);
-                } else if let Some(path) = &game.settings.proton
-                    && game.settings.proton != original.settings.proton
-                {
-                    game.settings.proton = Some(platform::resolve_proton(
-                        path.to_str().context("无效的 Proton 路径")?,
-                    )?);
-                }
-                let effective = game.effective(&self.library);
-                effective.settings.validate()?;
-                let cancel_cover = cover_changed
-                    || game.name != original.name
-                    || game.executable != original.executable;
-                self.library.unique(&game.executable, Some(id))?;
-                let mut library = self.library.clone();
-                *library.games.iter_mut().find(|g| g.id == id).unwrap() = game.clone();
-                library.save(&self.paths.library())?;
-                self.library = library;
-                if cancel_cover {
-                    self.cancel_cover(id);
-                }
-                Ok(serde_json::to_value(effective)?)
-            }
+            Request::Edit { id, changes } => self.edit(id, *changes),
+            Request::SetPicture {
+                id,
+                enabled,
+                filter,
+                output,
+                fps,
+            } => self.edit(
+                id,
+                Changes {
+                    enabled,
+                    filter,
+                    output,
+                    fps,
+                    ..Default::default()
+                },
+            ),
             Request::Remove { id } => {
                 self.library.get(id)?;
                 ensure!(!self.active(id), "请先结束游戏会话，再移出游戏库");
@@ -244,11 +274,13 @@ impl Engine {
                 Ok(platform::doctor(&self.paths, &desktop.unwrap_or_else(Desktop::current)).await)
             }
             request @ (Request::Launch { .. } | Request::LaunchStream { .. }) => {
-                let (id, desktop) = match request {
+                let (id, desktop, auto_output) = match request {
                     Request::Launch { id, desktop } => {
-                        (id, Some(desktop.unwrap_or_else(Desktop::current)))
+                        (id, Some(desktop.unwrap_or_else(Desktop::current)), false)
                     }
-                    Request::LaunchStream { id } => (id, None),
+                    Request::LaunchStream { id, auto_output } => {
+                        (id, None, auto_output.unwrap_or_default())
+                    }
                     _ => unreachable!(),
                 };
                 ensure!(!self.active(id), "游戏 {id} 已有运行中的会话");
@@ -271,11 +303,7 @@ impl Engine {
                 }
                 if desktop.is_none() {
                     ensure!(self.streaming, "请先开启局域网服务");
-                    if !game.settings.enhancement.enabled {
-                        game.settings.enhancement.enabled = true;
-                        game.settings.enhancement.filter = Filter::Linear;
-                        game.settings.enhancement.output = game.settings.enhancement.source;
-                    }
+                    stream_picture(&mut game.settings.enhancement, auto_output);
                 }
                 let streaming = self.streaming && game.settings.enhancement.enabled;
                 let proton = platform::selected_proton(game.settings.proton.as_deref())?;
@@ -343,6 +371,7 @@ impl Engine {
                 Ok(serde_json::to_value(session)?)
             }
             Request::Stream { id } => {
+                ensure!(self.streaming, "请先开启局域网服务");
                 let run = self
                     .runs
                     .get(&id)
@@ -383,6 +412,18 @@ impl Engine {
                 Ok(json!({ "stopped": true }))
             }
         }
+    }
+
+    pub async fn disconnect_streams(&self) {
+        let mut streams = JoinSet::new();
+        for run in self.runs.values() {
+            if run.session.streaming && run.session.state.active() {
+                streams.spawn(crate::stream::disconnect(
+                    run.session.log.with_extension("stream"),
+                ));
+            }
+        }
+        while streams.join_next().await.is_some() {}
     }
 
     pub async fn refresh(&mut self) -> Result<()> {
@@ -471,7 +512,34 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Changes;
+
+    #[test]
+    fn auto_output_keeps_the_game_mode_and_uses_the_stream_ceiling() {
+        let original = Enhancement {
+            enabled: false,
+            filter: Filter::Anime4k,
+            ..Enhancement::default()
+        };
+
+        let mut auto = original.clone();
+        stream_picture(&mut auto, true);
+        assert!(auto.enabled);
+        assert_eq!(auto.filter, Filter::Linear);
+        assert_eq!(auto.source, original.source);
+        assert_eq!(auto.output, stream::MAX_RESOLUTION);
+
+        let mut enhanced = Enhancement {
+            enabled: true,
+            ..original.clone()
+        };
+        stream_picture(&mut enhanced, true);
+        assert_eq!(enhanced.filter, Filter::Anime4k);
+        assert_eq!(enhanced.output, stream::MAX_RESOLUTION);
+
+        let mut legacy = original;
+        stream_picture(&mut legacy, false);
+        assert_eq!(legacy.output, legacy.source);
+    }
 
     #[tokio::test]
     async fn edits_are_transactional_and_removing_a_game_retains_its_files() -> Result<()> {
@@ -512,10 +580,38 @@ mod tests {
                 .await
                 .is_err()
         );
+        engine
+            .handle(Request::SetPicture {
+                id: 1,
+                enabled: None,
+                filter: Some(Filter::Anime4k),
+                output: Some("1920x1080".parse()?),
+                fps: None,
+            })
+            .await?;
+        assert!(
+            engine
+                .handle(Request::SetPicture {
+                    id: 1,
+                    enabled: Some(false),
+                    filter: None,
+                    output: None,
+                    fps: Some(0),
+                })
+                .await
+                .is_err()
+        );
         drop(engine);
         let mut engine = Engine::open(paths.clone(), false)?;
         let games = engine.handle(Request::List).await?;
         assert_eq!(games[0]["name"], "新版名称");
+        assert_eq!(games[0]["enhancement"]["filter"], "anime4k");
+        assert_eq!(
+            games[0]["enhancement"]["output"],
+            json!({ "width": 1920, "height": 1080 })
+        );
+        assert_eq!(games[0]["enhancement"]["enabled"], true);
+        assert_eq!(engine.library.get(1)?.settings.enhancement.fps, None);
         let prefix = paths.prefix(1);
         fs::create_dir_all(&prefix)?;
         fs::write(prefix.join("save.dat"), b"save")?;

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	_ "embed"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -23,9 +24,11 @@ import (
 var player string
 
 type Mobile struct {
-	mu     sync.RWMutex
-	server url.URL
-	client *http.Client
+	mu      sync.RWMutex
+	server  url.URL
+	client  *http.Client
+	window  *mygo.Window
+	playing bool
 }
 
 type Server struct {
@@ -66,13 +69,35 @@ func (*Mobile) Discover() ([]Server, error) {
 	return servers, nil
 }
 
-func (*Mobile) Playing(active bool) {
-	if active {
-		mygo.SetOrientations(mygo.OrientationLandscape)
-	} else {
-		mygo.SetOrientations(mygo.OrientationPortrait)
+func (*Mobile) SavedPassword(address string) (string, error) {
+	password, err := mygo.Secrets.Get("lan:" + address)
+	if errors.Is(err, mygo.ErrSecretNotFound) {
+		return "", nil
 	}
-	mygo.SystemBars.SetHidden(active)
+	return string(password), err
+}
+
+func (*Mobile) RememberPassword(address, password string) error {
+	key := "lan:" + address
+	if password == "" {
+		return mygo.Secrets.Delete(key)
+	}
+	return mygo.Secrets.Set(key, []byte(password))
+}
+
+func (m *Mobile) Playing(active bool) {
+	mygo.App.WhenReady(func() {
+		m.playing = active
+		m.updateBackground()
+		if active {
+			mygo.SetOrientations(mygo.OrientationLandscape)
+			mygo.SystemBars.SetStyle(mygo.BarStyleLight)
+		} else {
+			mygo.SetOrientations(mygo.OrientationPortrait)
+			mygo.SystemBars.SetStyle(mygo.BarStyleAuto)
+		}
+		mygo.SystemBars.SetHidden(active)
+	})
 }
 
 type Response struct {
@@ -80,26 +105,16 @@ type Response struct {
 	Reply  json.RawMessage `json:"reply"`
 }
 
-func (m *Mobile) Request(ctx context.Context, path, token string, body json.RawMessage) (Response, error) {
+func (m *Mobile) Request(ctx context.Context, path, password string, body json.RawMessage) (Response, error) {
 	if path != "/api/v1/rpc" {
 		id, valid := strings.CutPrefix(path, "/api/v1/stream/")
 		if _, err := strconv.ParseUint(id, 10, 64); !valid || err != nil {
 			return Response{}, errors.New("无效的 GalScaler 请求")
 		}
 	}
-	m.mu.RLock()
-	server := m.server
-	m.mu.RUnlock()
-	server.Path = path
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, server.String(), bytes.NewReader(body))
+	resp, err := m.send(ctx, http.MethodPost, path, password, bytes.NewReader(body))
 	if err != nil {
-		return Response{}, errors.New("电脑地址无效")
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := m.client.Do(req)
-	if err != nil {
-		return Response{}, errors.New("无法连接 GalScaler，请检查电脑地址和局域网")
+		return Response{}, err
 	}
 	defer resp.Body.Close()
 	result := Response{Status: resp.StatusCode}
@@ -109,6 +124,47 @@ func (m *Mobile) Request(ctx context.Context, path, token string, body json.RawM
 	return result, nil
 }
 
+func (m *Mobile) Cover(ctx context.Context, id, password string) (string, error) {
+	const limit = 6 << 20
+	if _, err := strconv.ParseUint(id, 10, 64); err != nil {
+		return "", err
+	}
+	resp, err := m.send(ctx, http.MethodGet, "/api/v1/cover/"+id, password, nil)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	mediaType := resp.Header.Get("Content-Type")
+	if resp.StatusCode != http.StatusOK || !strings.HasPrefix(mediaType, "image/") || resp.ContentLength > limit {
+		return "", nil
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil || len(data) > limit {
+		return "", err
+	}
+	return "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(data), nil
+}
+
+func (m *Mobile) send(ctx context.Context, method, path, password string, body io.Reader) (*http.Response, error) {
+	m.mu.RLock()
+	server := m.server
+	m.mu.RUnlock()
+	server.Path = path
+	req, err := http.NewRequestWithContext(ctx, method, server.String(), body)
+	if err != nil {
+		return nil, errors.New("电脑地址无效")
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.SetBasicAuth("galscaler", password)
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return nil, errors.New("无法连接 GalScaler，请检查电脑地址和局域网")
+	}
+	return resp, nil
+}
+
 func servePlayer(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet || r.URL.Path != "/" {
 		http.NotFound(w, r)
@@ -116,8 +172,24 @@ func servePlayer(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; media-src blob:; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src data:; media-src blob:; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
 	io.WriteString(w, player)
+}
+
+func (m *Mobile) backgroundColor() string {
+	if m.playing {
+		return "#111823"
+	}
+	if mygo.Theme.IsDark() {
+		return "#171f2b"
+	}
+	return "#f8fbfe"
+}
+
+func (m *Mobile) updateBackground() {
+	if err := m.window.SetBackgroundColor(m.backgroundColor()); err != nil {
+		log.Print(err)
+	}
 }
 
 func main() {
@@ -133,13 +205,14 @@ func main() {
 	}
 	mygo.Bind(mobile)
 	mygo.App.WhenReady(func() {
-		mobile.Playing(false)
-		win := mygo.NewWindow(mygo.WindowOptions{
+		mobile.window = mygo.NewWindow(mygo.WindowOptions{
 			Title:           "GalScaler",
-			BackgroundColor: "#090b0f",
+			BackgroundColor: mobile.backgroundColor(),
 			Page:            mygo.PageOptions{Autoplay: mygo.AutoplayAllow, DevTools: mygo.DevToolsEnabled},
 		})
-		if err := win.Page().LoadURL("galscaler://localhost/"); err != nil {
+		mygo.Theme.OnUpdated(mobile.updateBackground)
+		mobile.Playing(false)
+		if err := mobile.window.Page().LoadURL("galscaler://localhost/"); err != nil {
 			log.Print(err)
 		}
 	})

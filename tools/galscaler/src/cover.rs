@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 use tokio::{process::Command, task::JoinSet};
@@ -261,6 +261,27 @@ pub async fn candidates(data: &Path, title: &str) -> Result<Vec<Candidate>> {
         .into_iter()
         .map(|(_, candidate)| candidate)
         .collect())
+}
+
+pub fn read(path: &Path) -> Result<(&'static str, Vec<u8>)> {
+    const LIMIT: u64 = 6 * 1024 * 1024;
+    let info = path.metadata()?;
+    ensure!(info.is_file() && info.len() <= LIMIT, "无效的封面文件");
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(bytes.len() as u64 <= LIMIT, "封面文件过大");
+    let media_type = match bytes.as_slice() {
+        [0xff, 0xd8, 0xff, ..] => "image/jpeg",
+        [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, ..] => "image/png",
+        [b'R', b'I', b'F', b'F', ..] if bytes.get(8..12) == Some(b"WEBP") => "image/webp",
+        [b'G', b'I', b'F', b'8', b'7' | b'9', b'a', ..] => "image/gif",
+        [0, 0, 1, 0, ..] => "image/x-icon",
+        [b'B', b'M', ..] => "image/bmp",
+        _ => anyhow::bail!("不支持的封面格式"),
+    };
+    Ok((media_type, bytes))
 }
 
 pub async fn download(data: &Path, url: &str) -> Result<PathBuf> {
