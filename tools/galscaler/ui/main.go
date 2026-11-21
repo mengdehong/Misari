@@ -70,6 +70,13 @@ type diagnostics struct {
 	SystemdUser bool     `json:"systemd_user"`
 	Runtimes    []proton `json:"runtimes"`
 }
+type lanStatus struct {
+	Name        string `json:"name"`
+	Enabled     bool   `json:"enabled"`
+	Address     string `json:"address"`
+	HasPassword bool   `json:"has_password"`
+	Error       string `json:"error"`
+}
 type inspection struct {
 	Directory  string   `json:"directory"`
 	Candidates []string `json:"candidates"`
@@ -124,6 +131,10 @@ type app struct {
 	settingsDraft                  launchDraft
 	settingsCustomOutput           bool
 	settingsSaved                  time.Time
+	lan                            *lanStatus
+	lanError, lanPassword          string
+	lanPasswordOpen, lanEnable     bool
+	lanCopied                      time.Time
 	outputDisplay                  resolution
 	checkingDisplay                bool
 	appearance                     appearance
@@ -136,8 +147,6 @@ type app struct {
 	listView, focusShelf           bool
 	libraryScroll                  ui.ScrollState
 	revealSelection                bool
-	theme                          *ui.Theme
-	reduceMotion                   bool
 	copiedAt                       time.Time
 	focusSearch                    bool
 }
@@ -271,9 +280,19 @@ func (a *app) refresh() {
 		return
 	}
 	a.polling = true
+	readLan := a.settingsOpen && a.settingsTab == 2
 	go func() {
 		data, gerr := call(object{"op": "library"})
 		status, serr := call(object{"op": "status"})
+		var lan lanStatus
+		var lanErr error
+		if readLan {
+			var value json.RawMessage
+			value, lanErr = call(object{"op": "lan"})
+			if lanErr == nil {
+				lanErr = json.Unmarshal(value, &lan)
+			}
+		}
 		a.win.Update(func() {
 			a.polling = false
 			if a.refreshAgain {
@@ -285,6 +304,13 @@ func (a *app) refresh() {
 				a.connected = false
 				a.connectionError = gerr.Error()
 				return
+			}
+			if readLan {
+				if lanErr != nil {
+					a.lanError = lanErr.Error()
+				} else {
+					a.lan, a.lanError = &lan, ""
+				}
 			}
 			var library struct {
 				Games        []game         `json:"games"`
@@ -441,6 +467,15 @@ func (a *app) send(request object) {
 				a.settingsDraft = form(settings)
 				a.settingsCustomOutput = false
 				a.settingsSaved = time.Now()
+			case "set_lan":
+				var lan lanStatus
+				if err := json.Unmarshal(value, &lan); err != nil {
+					a.err = err.Error()
+					return
+				}
+				a.lan, a.lanError = &lan, ""
+				a.lanPasswordOpen = false
+				a.lanPassword = ""
 			}
 			if a.polling {
 				a.refreshAgain = true
@@ -883,13 +918,11 @@ func main() {
 		log.Fatal(err)
 	}
 	a := &app{
-		appearance:   loadAppearance(),
-		images:       make(map[string]ui.ImageSource),
-		sakura:       sakura,
-		foliage:      foliage,
-		focusShelf:   true,
-		theme:        theme(),
-		reduceMotion: os.Getenv("GALSCALER_REDUCE_MOTION") == "1",
+		appearance: loadAppearance(),
+		images:     make(map[string]ui.ImageSource),
+		sakura:     sakura,
+		foliage:    foliage,
+		focusShelf: true,
 	}
 	mygo.App.WhenReady(func() {
 		a.win = mygo.NewWindow(mygo.WindowOptions{

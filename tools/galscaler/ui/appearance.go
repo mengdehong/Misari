@@ -6,10 +6,134 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 )
+
+type palette struct {
+	theme                                  *ui.Theme
+	canvas, panel, raised, line            ui.Color
+	heading, ink, muted, accent, selection ui.Color
+	sky, actionFrom, actionTo              ui.Color
+	shadow, live, gold, failure            ui.Color
+}
+
+const (
+	controlRadius = 9
+	panelRadius   = 16
+	dialogRadius  = 20
+)
+
+var day = newPalette(false, palette{
+	canvas: ui.Hex("#f8fbfe"), panel: ui.Hex("#ffffff"), raised: ui.Hex("#eff5fa"), line: ui.Hex("#e4edf5"),
+	heading: ui.Hex("#23374a"), ink: ui.Hex("#23374a"), muted: ui.Hex("#576d80"),
+	accent: ui.Hex("#366b98"), selection: ui.Hex("#477fab"),
+	sky: ui.Hex("#e6f3fd"), actionFrom: ui.Hex("#3b75a5"), actionTo: ui.Hex("#3b6c9e"),
+	shadow: ui.Hex("#172c41"), live: ui.Hex("#356b58"), gold: ui.Hex("#8b591b"), failure: ui.Hex("#a44554"),
+})
+
+var night = newPalette(true, palette{
+	canvas: ui.Hex("#171f2b"), panel: ui.Hex("#1d2836"), raised: ui.Hex("#253448"), line: ui.Hex("#344457"),
+	heading: ui.Hex("#eef5fb"), ink: ui.Hex("#eef5fb"), muted: ui.Hex("#afc0d1"),
+	accent: ui.Hex("#a9cfee"), selection: ui.Hex("#9cccf3"),
+	sky: ui.Hex("#294357"), actionFrom: ui.Hex("#316996"), actionTo: ui.Hex("#3a5d91"),
+	shadow: ui.Hex("#0a111b"), live: ui.Hex("#9ecdb8"), gold: ui.Hex("#efbf83"), failure: ui.Hex("#ffadb7"),
+})
+
+func newPalette(dark bool, p palette) *palette {
+	t := ui.LightTheme()
+	if dark {
+		t = ui.DarkTheme()
+	}
+	t = t.WithAccent(p.accent)
+	t.Background = p.canvas
+	t.Surface = p.raised
+	t.SurfaceHover = p.raised.Mix(p.selection, .12)
+	t.SurfacePressed = p.raised.Mix(p.selection, .23)
+	t.Border = p.line
+	t.Text = p.ink
+	t.TextMuted = p.muted
+	t.InactiveAccent = p.accent
+	t.Selection = p.selection.Alpha(.30)
+	t.Focus = p.selection
+	t.Inverse = p.heading
+	t.InverseText = p.panel
+	t.Success = p.live
+	t.Warning = p.gold
+	t.Danger = p.failure
+	t.Scrollbar = p.muted.Alpha(.36)
+	t.ScrollbarWidth = 5
+	t.Font = "Noto Sans CJK SC"
+	t.FontSize = 14
+	t.Radius = controlRadius
+	p.theme = t
+	return &p
+}
+
+func skin(c *ui.Context) *palette {
+	if c.Theme().Dark {
+		return night
+	}
+	return day
+}
+
+var forceReducedMotion = os.Getenv("GALSCALER_REDUCE_MOTION") == "1"
+
+func reducedMotion(c *ui.Context) bool {
+	return forceReducedMotion || c.Preferences().ReduceMotion
+}
+
+var quickSpring = ui.Animation{Spring: ui.SpringOptions{Duration: 280 * time.Millisecond, Bounce: .24}}
+var starFade = ui.Animation{Duration: 420 * time.Millisecond, Ease: ui.CubicBezier(0, 0, 1, 1)}
+
+func paintStar(p *ui.Painter, x, y, radius float32, color ui.Color) {
+	cut := radius * .25
+	path := new(ui.Path).MoveTo(x, y-radius).LineTo(x+cut, y-cut).LineTo(x+radius, y).
+		LineTo(x+cut, y+cut).LineTo(x, y+radius).LineTo(x-cut, y+cut).
+		LineTo(x-radius, y).LineTo(x-cut, y-cut).Close()
+	p.FillPath(path, color)
+}
+
+func brandTile(c *ui.Context) {
+	p := skin(c)
+	tile := ui.Box(c).Size(25, 28).Center()
+	var lift float32
+	if !reducedMotion(c) {
+		if tile.Hovered() {
+			lift = -3
+		}
+		lift = tile.AnimateTo("drift", lift, quickSpring)
+	}
+	tile.DrawOver(func(draw *ui.Painter, r ui.Rect) {
+		paintStar(draw, r.X+r.W-2, r.Y+4+lift, 3, p.selection)
+	}).Children(func() {
+		glyph(c, iGame).FontSize(21).TextColor(p.heading)
+	})
+}
+
+func sparkleClick(c *ui.Context, b ui.Element) bool {
+	clicked := b.Clicked()
+	if reducedMotion(c) {
+		return clicked
+	}
+	if clicked {
+		b.Jump("stars", 1)
+	}
+	left := b.AnimateTo("stars", 0, starFade)
+	if left > 0 {
+		p := skin(c)
+		travel := 1 - left*left
+		b.DrawOver(func(draw *ui.Painter, r ui.Rect) {
+			x, y := r.X+r.W-12, r.Y+7
+			paintStar(draw, x+9*travel, y-21*travel, 5, p.selection.Alpha(left))
+			paintStar(draw, x-13*travel, y-14*travel, 3, p.accent.Alpha(left))
+			paintStar(draw, x+19*travel, y+5*travel, 2.5, p.selection.Alpha(left*.8))
+		})
+	}
+	return clicked
+}
 
 const (
 	minBlur, maxBlur   = 0, 80
@@ -142,7 +266,7 @@ func (a *appearance) backdrop(c *ui.Context) {
 		ui.Box(c).Absolute().Left(-margin).Right(-margin).Top(-margin).Bottom(-margin).Clip().Blur(blur).Draw(func(p *ui.Painter, r ui.Rect) {
 			paintBackground(p, r, image, margin, zoom)
 		})
-		ui.Box(c).Absolute().Fill().Background(canvas.Alpha(float32(a.Shade / 100)))
+		ui.Box(c).Absolute().Fill().Background(skin(c).canvas.Alpha(float32(a.Shade / 100)))
 	})
 }
 
@@ -165,6 +289,7 @@ func paintBackground(p *ui.Painter, r ui.Rect, image *ui.Bitmap, margin, zoom fl
 }
 
 func (a *appearance) view(c *ui.Context, win *mygo.Window) {
+	p := skin(c)
 	before := a.backgroundSettings
 	pressed := false
 	settingsGroup(c).MaxWidth(720).Children(func() {
@@ -223,11 +348,11 @@ func (a *appearance) view(c *ui.Context, win *mygo.Window) {
 				}
 			}
 			if a.imageErr != "" {
-				small(c, a.imageErr).TextColor(failure).FillWidth()
+				small(c, a.imageErr).TextColor(p.failure).FillWidth()
 			}
 		}
 		if a.configErr != "" {
-			small(c, a.configErr).TextColor(failure).FillWidth()
+			small(c, a.configErr).TextColor(p.failure).FillWidth()
 		}
 	})
 	a.dirty = a.dirty || before != a.backgroundSettings

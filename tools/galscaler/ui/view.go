@@ -9,69 +9,30 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 )
 
-var bg = ui.Hex("#e9edf9")
-var canvas = ui.Hex("#f7f7fe")
-var panel = ui.Hex("#fafaff")
-var raised = ui.Hex("#eff2fb")
-var line = ui.Hex("#dbe2f3")
-var ink = ui.Hex("#2e4262")
-var heading = ui.Hex("#152b4b")
-var muted = ui.Hex("#536988")
-var accent = ui.Hex("#2875c7")
-var selection = ui.Hex("#62a5ed")
-var gold = ui.Hex("#8b591b")
-var live = ui.Hex("#30745b")
-var failure = ui.Hex("#a44554")
-
 var filters = []string{"cunny", "anime4k", "linear"}
 var filterNames = []string{"CuNNy", "Anime4K", "无滤镜"}
 
-func theme() *ui.Theme {
-	t := ui.LightTheme()
-	t.Background = bg
-	t.Surface = raised
-	t.SurfaceHover = ui.Hex("#e4edf6")
-	t.SurfacePressed = line
-	t.Border = line
-	t.Text = ink
-	t.TextMuted = muted
-	t.Accent = accent
-	t.AccentText = panel
-	t.AccentHover = ui.Hex("#2168b3")
-	t.AccentPressed = ui.Hex("#195995")
-	t.InactiveAccent = accent
-	t.Selection = accent.Alpha(.3)
-	t.Inverse = heading
-	t.InverseText = panel
-	t.Success = live
-	t.Warning = gold
-	t.Scrollbar = muted.Alpha(.3)
-	t.ScrollbarWidth = 5
-	t.Focus = accent
-	t.Font = "Noto Sans CJK SC"
-	t.FontSize = 14
-	t.Radius = 10
-	t.Danger = failure
-	return t
+func small(c *ui.Context, s string) ui.Element {
+	return ui.Text(c, s).FontSize(12).TextColor(skin(c).muted)
 }
-
-func small(c *ui.Context, s string) ui.Element { return ui.Text(c, s).FontSize(12).TextColor(muted) }
-func rule(c *ui.Context)                       { ui.Box(c).FillWidth().Height(1).Background(line) }
-func stateColor(state string) ui.Color {
+func rule(c *ui.Context) { ui.Box(c).FillWidth().Height(1).Background(skin(c).line) }
+func stateColor(c *ui.Context, state string) ui.Color {
+	p := skin(c)
 	switch state {
 	case "running":
-		return live
+		return p.live
 	case "starting":
-		return accent
+		return p.accent
 	case "failed", "interrupted":
-		return failure
+		return p.failure
 	}
-	return muted
+	return p.muted
 }
 func badge(c *ui.Context, label string, color ui.Color) {
 	ui.Row(c).Padding(5, 9).Gap(6).Radius(9).Background(color.Alpha(.11)).AlignItems(ui.Center).Children(func() {
@@ -80,11 +41,12 @@ func badge(c *ui.Context, label string, color ui.Color) {
 	})
 }
 func (a *app) view(c *ui.Context) {
-	c.SetTheme(a.theme)
-	if a.reduceMotion {
+	p := skin(c)
+	c.SetTheme(p.theme)
+	if forceReducedMotion {
 		c.DisableAnimations()
 	}
-	if !a.editOpen && !a.confirmOpen && !a.logOpen {
+	if !a.editOpen && !a.confirmOpen && !a.logOpen && !a.lanPasswordOpen {
 		if c.Shortcut(ui.Ctrl, ui.KeyN) && a.connected {
 			a.openEditor(addGame)
 		}
@@ -114,7 +76,7 @@ func (a *app) view(c *ui.Context) {
 		}
 	}
 	w, h := c.Size()
-	ui.Column(c).Fill().Background(canvas).Children(func() {
+	ui.Column(c).Fill().Background(p.canvas).Children(func() {
 		if a.appearance.active() {
 			a.appearance.backdrop(c)
 		}
@@ -126,25 +88,26 @@ func (a *app) view(c *ui.Context) {
 		a.appearance.save()
 	}
 	a.editorView(c, h)
+	a.lanPasswordView(c.Key("lan-password"))
 	dialog(c, &a.confirmOpen, func() {
-		ui.Text(c, "移出游戏库？").FontSize(21).FontWeight(600).TextColor(heading)
+		ui.Text(c, "移出游戏库？").FontSize(21).FontWeight(600).TextColor(p.heading)
 		ui.Text(c, "游戏文件和存档会保留，你可以随时重新添加。")
 		if a.err != "" {
-			small(c, a.err).TextColor(failure)
+			small(c, a.err).TextColor(p.failure)
 		}
 		ui.Row(c).Gap(10).Children(func() {
 			ui.Spacer(c)
 			if iconButton(c, iClose, "取消").Disabled(a.busy).Clicked() {
 				a.confirmOpen = false
 			}
-			if iconButton(c, iTrash, "确认移出游戏库").TextColor(failure).Disabled(a.busy).Clicked() {
+			if iconButton(c, iTrash, "确认移出游戏库").TextColor(p.failure).Disabled(a.busy).Clicked() {
 				a.send(object{"op": "remove", "id": a.draft.ID})
 			}
 		})
 	}).Key("remove").Width(440)
 	dialog(c, &a.logOpen, func() {
 		ui.Row(c).FillWidth().Gap(6).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, "启动日志").FontSize(21).FontWeight(600).TextColor(heading).Grow(1)
+			ui.Text(c, "启动日志").FontSize(21).FontWeight(600).TextColor(p.heading).Grow(1)
 			code, label := iCopy, "复制日志"
 			if time.Since(a.copiedAt) < 3*time.Second {
 				code, label = iCheck, "已复制"
@@ -179,12 +142,13 @@ func (a *app) art(g *game) ui.ImageSource {
 	return src
 }
 func dialog(c *ui.Context, open *bool, content func()) ui.Element {
+	p := skin(c)
 	return ui.DialogBase(c, open, func(backdrop, body ui.Element) {
-		backdrop.Background(heading.Alpha(.25))
-		body.Padding(22).Gap(12).Background(panel).Border(1, line).Radius(16).
-			Shadow(0, 8, 28, 0, heading.Alpha(.17)).Transition(ui.ElementTransition{
+		backdrop.Background(p.shadow.Alpha(.48))
+		body.Padding(22).Gap(12).Background(p.panel).Border(1, p.line).Radius(dialogRadius).
+			Shadow(0, 8, 28, 0, p.shadow.Alpha(.17)).Transition(ui.ElementTransition{
 			Duration: 180 * time.Millisecond, ExitDuration: 120 * time.Millisecond,
-			Enter: &ui.Motion{Y: 6}, Exit: &ui.Motion{Y: 4},
+			Enter: &ui.Motion{Y: 8, Scale: .98}, Exit: &ui.Motion{Y: 4},
 		})
 		content()
 	})
@@ -194,28 +158,30 @@ func colorMotion() ui.ElementTransition {
 	return ui.ElementTransition{Colors: true, Duration: 140 * time.Millisecond}
 }
 
-func menuPanel(box ui.Element) {
-	box.Background(panel).Border(1, line).NoShadow().Shadow(0, 6, 20, 0, heading.Alpha(.18)).
-		Transition(ui.ElementTransition{
-			Colors: true, Duration: 150 * time.Millisecond, Enter: &ui.Motion{Y: -4, Flip: true},
-		})
+func menuPanel(c *ui.Context) func(ui.Element) {
+	p := skin(c)
+	return func(box ui.Element) {
+		box.Background(p.panel).Border(1, p.line).Radius(controlRadius).NoShadow().Shadow(0, 6, 20, 0, p.shadow.Alpha(.18)).
+			Transition(ui.ElementTransition{
+				Colors: true, Duration: 150 * time.Millisecond, Enter: &ui.Motion{Y: -4, Flip: true},
+			})
+	}
 }
 
 const toolbarHeight = 56
 
 func (a *app) toolbar(c *ui.Context, width float32) {
+	p := skin(c)
 	bar := ui.Row(c).FillWidth().Height(toolbarHeight).Padding(0, 18).Gap(8).AlignItems(ui.Center)
 	if a.appearance.active() {
-		bar.Background(panel.Alpha(.82))
+		bar.Background(p.panel.Alpha(.82))
 	} else {
-		bar.Gradient(panel, bg, 180)
+		bar.Background(p.panel)
 	}
 	bar.Children(func() {
 		ui.Row(c).FillHeight().Gap(10).AlignItems(ui.Center).DragWindow().Children(func() {
-			ui.Box(c).Size(32, 32).Center().Radius(9).Background(accent.Alpha(.15)).Children(func() {
-				glyph(c, iGame).FontSize(22).TextColor(accent)
-			})
-			ui.Text(c, "GalScaler").FontSize(18).FontWeight(700).TextColor(heading).NoWrap()
+			brandTile(c)
+			ui.Text(c, "GalScaler").FontSize(18).FontWeight(700).TextColor(p.heading).NoWrap()
 		})
 		ui.Box(c).Grow(1).FillHeight().DragWindow()
 		if a.settingsOpen {
@@ -224,8 +190,9 @@ func (a *app) toolbar(c *ui.Context, width float32) {
 			}
 		} else {
 			a.searchBox(c, min(244, width*.22))
-			if actionButton(c.Key("add"), iAdd, "添加游戏", false).Height(34).Background(panel).
-				Border(1, line).Tooltip("Ctrl N").Disabled(!a.connected || a.busy).Clicked() {
+			add := quietButton(c, actionButton(c.Key("add"), iAdd, "添加游戏", false)).
+				Height(34).Padding(0, 8).Tooltip("Ctrl N").Disabled(!a.connected || a.busy)
+			if sparkleClick(c, add) {
 				a.openEditor(addGame)
 			}
 			if iconButton(c.Key("global-settings"), iGear, "全局设置").Size(34, 34).Clicked() {
@@ -233,7 +200,7 @@ func (a *app) toolbar(c *ui.Context, width float32) {
 				a.reload()
 			}
 		}
-		ui.Box(c).Size(1, 18).Background(line)
+		ui.Box(c).Size(1, 18).Background(p.line)
 		if iconButton(c.Key("minimize"), iMinus, "最小化").Size(32, 32).Clicked() {
 			a.win.Minimize()
 		}
@@ -279,41 +246,56 @@ func (a *app) coverDensity() int {
 }
 
 func (a *app) library(c *ui.Context, width, height float32) {
+	p := skin(c)
 	padding := min(36, width*.032)
 	density := a.coverDensity()
 	controls := len(a.games) > 20 || a.density != densityAuto || a.listView
 	custom := a.appearance.active()
 	gallery := density == densityGallery && !a.listView && !a.settingsOpen && !custom
+	top, gap := min(48, width*.039), float32(18)
+	if a.settingsOpen {
+		top, gap = 14, 12
+	}
 	library := ui.Box(c).FillWidth().Grow(1).MinHeight(0)
-	if gallery {
-		library.LinearGradient(ui.LinearGradient{Angle: 140, Oklab: true, Stops: []ui.GradientStop{
-			{Color: ui.Hex("#fff1f5"), At: 0}, {Color: ui.Hex("#fbf7fb"), At: .43}, {Color: ui.Hex("#e8eafb"), At: 1},
-		}})
-	} else if !custom {
-		library.Gradient(canvas, ui.Hex("#e8e9f8"), 155)
+	if !custom {
+		library.Draw(func(draw *ui.Painter, r ui.Rect) {
+			draw.FillRadialGradient(r, ui.RadialGradient{
+				Center: ui.Point{X: .99, Y: .01}, Radius: min(width*.66, height*.78),
+				Stops: []ui.GradientStop{{Color: p.sky, At: 0}, {Color: p.sky.Alpha(0), At: 1}},
+			}, 0)
+			if !a.settingsOpen {
+				paintStar(draw, r.X+r.W*.06, r.Y+r.H*.58, 4, p.selection.Alpha(.24))
+				paintStar(draw, r.X+r.W*.94, r.Y+r.H*.26, 5, p.accent.Alpha(.22))
+				paintStar(draw, r.X+r.W*.96, r.Y+r.H*.31, 3, p.selection.Alpha(.28))
+			}
+		})
 	}
 	if !a.settingsOpen {
 		library.TabStop(false)
 	}
 	library.Children(func() {
 		if gallery {
-			artSize := min(440, width*.34, height*.60)
-			ui.Image(c, a.sakura).Absolute().Top(0).Left(0).Size(artSize, artSize).ZIndex(-1).
-				Fit(ui.Contain).Opacity(.76).AccessHidden(true).PassThrough()
+			artSize := min(400, width*.31, height*.58)
+			opacity := float32(.34)
+			if p.theme.Dark {
+				opacity = .26
+			}
+			ui.Image(c, a.sakura).Absolute().Top(0).Left(-artSize*.08).Size(artSize, artSize).ZIndex(-1).
+				Fit(ui.Contain).Opacity(opacity).AccessHidden(true).PassThrough()
 			foliageSize := artSize * .83
 			ui.Image(c, a.foliage).Absolute().Top(min(92, height*.11)).Right(0).Size(foliageSize, foliageSize).ZIndex(-1).
-				Fit(ui.Contain).Opacity(.52).AccessHidden(true).PassThrough()
+				Fit(ui.Contain).Opacity(opacity * .7).AccessHidden(true).PassThrough()
 		}
 		ui.Column(c).Fill().MaxWidth(1640).AlignSelf(ui.Center).
-			Padding(14, padding, 16, padding).Gap(12).Children(func() {
-			available := height - 30
+			Padding(top, padding, 16, padding).Gap(gap).Children(func() {
+			available := height - top - 16
 			if a.connectionError != "" && (len(a.games) > 0 || a.settingsOpen) {
 				a.notice(c.Key("connection"), "暂时连不上 GalScaler。", a.connectionError, iRefresh, "重试", a.polling, a.reload)
-				available -= 56
+				available -= 44 + gap
 			}
-			if a.err != "" && !a.editOpen {
+			if a.err != "" && !a.editOpen && !a.lanPasswordOpen {
 				a.notice(c.Key("error"), a.err, a.err, iClose, "关闭提示", false, func() { a.err = "" })
-				available -= 56
+				available -= 44 + gap
 			}
 			if a.settingsOpen {
 				a.settingsView(c, width-2*padding)
@@ -321,32 +303,38 @@ func (a *app) library(c *ui.Context, width, height float32) {
 			}
 			shown := a.shown()
 			width = min(width, 1640) - 2*padding
+			a.shelfHeader(c, len(shown), width, controls)
 			if len(shown) == 0 {
-				a.shelfHeader(c, 0, width, controls)
 				a.emptyLibrary(c)
 				return
 			}
 
-			detailHeight := min(198, max(138, height*.285))
-			a.shelf(c, library, shown, density, width, available-detailHeight-12, controls)
-			if current := a.current(); current != nil {
-				a.work(c, current, min(1280, width*.88), detailHeight)
+			detailWidth := min(350, max(218, width*.27))
+			gutter := min(60, width*.047)
+			shelfWidth := width - detailWidth - gutter
+			rows, coverHeight := a.shelfRows(shown, shelfWidth-2*shelfInset, available-38-gap, density, a.listView)
+			var usedWidth float32
+			for _, row := range rows {
+				usedWidth = max(usedWidth, row.width)
 			}
+			ui.Row(c).FillWidth().Grow(1).MinHeight(0).Gap(gutter).AlignItems(ui.Stretch).Children(func() {
+				a.shelf(c, library, rows, coverHeight, usedWidth+2*shelfInset, density, a.listView)
+				if current := a.current(); current != nil {
+					a.work(c, current, detailWidth)
+				}
+			})
 		})
 	})
 }
 
 func (a *app) shelfHeader(c *ui.Context, count int, width float32, controls bool) {
+	p := skin(c)
 	ui.Row(c).Width(width).Height(38).AlignSelf(ui.Center).AlignItems(ui.Center).Gap(10).Children(func() {
-		ui.Text(c, "游戏库").FontSize(23).FontWeight(650).TextColor(heading).NoWrap()
-		countLabel := ui.Text(c, fmt.Sprintf("%d 部作品", count)).FontSize(12).FontWeight(600).TextColor(muted).
-			Padding(3, 9).Radius(12).Background(heading.Alpha(.07)).NoWrap()
-		if a.appearance.active() {
-			countLabel.Background(panel.Alpha(.85))
-		}
+		ui.Text(c, "游戏库").FontSize(27).FontWeight(650).TextColor(p.heading).NoWrap()
 		if !controls {
 			return
 		}
+		small(c, fmt.Sprintf("%d 部作品", count)).NoWrap()
 		ui.Spacer(c)
 		for _, option := range []struct {
 			list  bool
@@ -356,12 +344,12 @@ func (a *app) shelfHeader(c *ui.Context, count int, width float32, controls bool
 			active := a.listView == option.list
 			b := iconButton(c.Key(option.label), option.icon, option.label).Size(34, 32).AccessSelected(active)
 			if active {
-				b.Background(accent.Alpha(.13)).TextColor(accent)
+				b.Background(p.accent.Alpha(.13)).TextColor(p.accent)
 			}
 			if a.appearance.active() {
-				fill := panel.Alpha(.85)
+				fill := p.panel.Alpha(.85)
 				if active {
-					fill = panel.Mix(accent, .13)
+					fill = p.panel.Mix(p.accent, .13)
 				}
 				b.Background(fill)
 			}
@@ -376,7 +364,7 @@ func (a *app) shelfHeader(c *ui.Context, count int, width float32, controls bool
 			if a.density == densityAuto {
 				label = "封面大小 · " + densityLabels[a.coverDensity()] + "（自动）"
 			}
-			actionButton(c.Key("density"), iDown, label, false).Height(32).Border(1, line).
+			actionButton(c.Key("density"), iDown, label, false).Height(32).Border(1, p.line).
 				PopoverMenuButton(func(m *ui.Menu) {
 					for i, label := range densityLabels {
 						if m.Item(label).Radio(a.density == i).Chosen() {
@@ -385,20 +373,21 @@ func (a *app) shelfHeader(c *ui.Context, count int, width float32, controls bool
 							a.revealSelection = true
 						}
 					}
-				}, ui.PopoverMenuButtonOptions{Panel: menuPanel})
+				}, ui.PopoverMenuButtonOptions{Panel: menuPanel(c)})
 		}
 	})
 }
 
 func (a *app) notice(c *ui.Context, message, detail string, code icon, label string, disabled bool, action func()) {
-	fill := failure.Alpha(.07)
+	p := skin(c)
+	fill := p.failure.Alpha(.07)
 	if a.appearance.active() {
-		fill = panel.Mix(failure, .07)
+		fill = p.panel.Mix(p.failure, .07)
 	}
-	ui.Row(c).FillWidth().Height(44).Padding(0, 12).Gap(10).Radius(10).
+	ui.Row(c).FillWidth().Height(44).Padding(0, 12).Gap(10).Radius(controlRadius).
 		Background(fill).AlignItems(ui.Center).Children(func() {
-		glyph(c, iWarning).FontSize(18).TextColor(failure)
-		ui.Text(c, message).TextColor(failure).Grow(1).MinWidth(0).MaxLines(2).Tooltip(detail)
+		glyph(c, iWarning).FontSize(18).TextColor(p.failure)
+		ui.Text(c, message).TextColor(p.failure).Grow(1).MinWidth(0).MaxLines(2).Tooltip(detail)
 		if iconButton(c, code, label).Disabled(disabled).Clicked() {
 			action()
 		}
@@ -406,12 +395,13 @@ func (a *app) notice(c *ui.Context, message, detail string, code icon, label str
 }
 
 func (a *app) searchBox(c *ui.Context, width float32) {
-	box := ui.Row(c).Width(width).Height(34).Padding(0, 10).Gap(8).Radius(9).Background(panel.Alpha(.8)).Border(1, line).AlignItems(ui.Center)
+	p := skin(c)
+	box := ui.Row(c).Width(width).Height(34).Padding(0, 10).Gap(8).Radius(controlRadius).Background(p.panel.Alpha(.8)).Border(1, p.line).AlignItems(ui.Center)
 	if box.FocusWithin() {
-		box.Border(1, accent)
+		box.Border(1, p.accent)
 	}
 	box.Transition(colorMotion()).Children(func() {
-		glyph(c, iSearch).FontSize(18).TextColor(muted)
+		glyph(c, iSearch).FontSize(18).TextColor(p.muted)
 		input := ui.TextInputBase(c.Key("search"), &a.query).Label("搜索游戏").Placeholder("搜索游戏").Grow(1).MinWidth(0).Height(32).OnTextKey(func(k ui.TextKey) bool {
 			if k.Key != ui.KeyEscape || k.Mods != 0 || a.query == "" {
 				return false
@@ -434,6 +424,7 @@ func (a *app) searchBox(c *ui.Context, width float32) {
 }
 
 func (a *app) emptyLibrary(c *ui.Context) {
+	p := skin(c)
 	ui.Box(c).Grow(1).FillWidth().Center().Children(func() {
 		ui.Column(c).Gap(12).AlignItems(ui.Center).Children(func() {
 			code, title := iLibrary, "游戏库还是空的"
@@ -445,10 +436,10 @@ func (a *app) emptyLibrary(c *ui.Context) {
 			case strings.TrimSpace(a.query) != "":
 				code, title = iSearch, "没有找到匹配的游戏"
 			}
-			ui.Box(c).Size(58, 58).Radius(18).Background(accent.Alpha(.08)).Center().Children(func() {
-				glyph(c, code).FontSize(28).TextColor(accent)
+			ui.Box(c).Size(58, 58).Radius(18).Gradient(p.raised, p.sky, 135).Center().Children(func() {
+				glyph(c, code).FontSize(28).TextColor(p.accent)
 			})
-			ui.Text(c, title).FontSize(20).FontWeight(600).TextColor(heading).Tooltip(a.connectionError)
+			ui.Text(c, title).FontSize(20).FontWeight(600).TextColor(p.heading).Tooltip(a.connectionError)
 			switch code {
 			case iDisconnected:
 				if actionButton(c, iRefresh, "重试", false).Disabled(a.polling).Clicked() {
@@ -463,7 +454,10 @@ func (a *app) emptyLibrary(c *ui.Context) {
 	})
 }
 
-const shelfGap = 16
+const (
+	shelfGap   = 16
+	shelfInset = 5
+)
 
 type shelfCard struct {
 	game
@@ -476,29 +470,30 @@ type shelfRow struct {
 }
 
 func (a *app) shelfRows(games []game, width, height float32, density int, list bool) ([]shelfRow, float32) {
-	target := [...]float32{0, 210, 165, 122}[density]
+	target := [...]float32{0, 220, 156, 116}[density]
+	gallery := density == densityGallery && !list
 	columns := max(1, int((width+shelfGap)/(target+shelfGap)))
-	cell := min(target+36, (width-float32(columns-1)*shelfGap)/float32(columns))
-	coverHeight := (cell - 8) * 1.25
-	gallery := density == densityGallery
 	if gallery {
-		coverHeight = min(coverHeight, max(92, height-124))
-	} else if density == densityCompact {
-		coverHeight = min(coverHeight, max(96, (height-148)/2))
+		columns = max(3, columns)
 	}
+	cell := min(target+28, (width-float32(columns-1)*shelfGap)/float32(columns))
+	coverHeight := cell * 1.5
+	if gallery {
+		coverHeight = min(coverHeight, max(105, height-78))
+	} else if density == densityCompact {
+		coverHeight = min(coverHeight, max(96, (height-96)/2))
+	}
+	cell = min(cell, coverHeight/1.5)
 	if list {
 		columns, cell, coverHeight = 1, width, 46
 	}
 	var rows []shelfRow
 	used := columns
 	for _, g := range games {
-		span, ratio := 1, float32(.75)
-		if gallery && !list {
-			if w, h := ui.ImageSize(a.art(&g)); h > 0 {
-				ratio = w / h
-			}
-			if ratio >= 1.35 {
-				span = min(2, columns)
+		span := 1
+		if gallery {
+			if w, h := ui.ImageSize(a.art(&g)); h > 0 && w/h >= 1.35 {
+				span = 2
 			}
 		}
 		if used+span > columns {
@@ -507,9 +502,6 @@ func (a *app) shelfRows(games []game, width, height float32, density int, list b
 		}
 		row := &rows[len(rows)-1]
 		cardWidth := float32(span)*cell + float32(span-1)*shelfGap
-		if gallery && !list {
-			cardWidth = max(100, min(cardWidth, coverHeight*ratio+8))
-		}
 		if len(row.cards) > 0 {
 			row.width += shelfGap
 		}
@@ -520,16 +512,8 @@ func (a *app) shelfRows(games []game, width, height float32, density int, list b
 	return rows, coverHeight
 }
 
-func (a *app) shelf(c *ui.Context, library ui.Element, games []game, density int, width, height float32, controls bool) {
-	list := controls && a.listView
-	center := density == densityGallery && !list
-	rows, coverHeight := a.shelfRows(games, width-16, height, density, list)
-	headerWidth := width
-	if center && !controls {
-		headerWidth = max(250, rows[0].width)
-	}
-	a.shelfHeader(c, len(games), headerWidth, controls)
-	scroll := ui.Scroll(c.Key("covers")).TrackScroll(&a.libraryScroll).FillWidth().Grow(1).MinHeight(0).
+func (a *app) shelf(c *ui.Context, library ui.Element, rows []shelfRow, coverHeight, width float32, density int, list bool) {
+	scroll := ui.Scroll(c.Key("covers")).TrackScroll(&a.libraryScroll).Width(width).Shrink(0).MinHeight(0).
 		Label("游戏封面").Role(ui.RoleListBox)
 	if !a.editOpen && !a.confirmOpen && !a.logOpen {
 		shortcut := func(key ui.Key) bool {
@@ -537,7 +521,7 @@ func (a *app) shelf(c *ui.Context, library ui.Element, games []game, density int
 		}
 		for _, key := range []ui.Key{ui.KeyLeft, ui.KeyRight, ui.KeyUp, ui.KeyDown} {
 			if shortcut(key) {
-				if id := shelfNeighbor(rows, a.selected, key, center); id != a.selected {
+				if id := shelfNeighbor(rows, a.selected, key); id != a.selected {
 					a.selected = id
 					a.focusShelf = true
 				}
@@ -547,16 +531,14 @@ func (a *app) shelf(c *ui.Context, library ui.Element, games []game, density int
 			a.launch(a.selected)
 		}
 	}
-	justify, gap := ui.Start, float32(shelfGap)
-	if center {
-		justify = ui.Center
-	} else if list {
+	gap := float32(shelfGap)
+	if list {
 		gap = 6
 	}
 	scroll.Children(func() {
-		ui.Column(c).FillWidth().Padding(8, 8, 12, 8).Gap(gap).Children(func() {
+		ui.Column(c).FillWidth().Padding(shelfInset, shelfInset, 12, shelfInset).Gap(gap).Children(func() {
 			for _, row := range rows {
-				ui.Row(c.Key(row.cards[0].ID)).FillWidth().Gap(shelfGap).Justify(justify).AlignItems(ui.Start).Children(func() {
+				ui.Row(c.Key(row.cards[0].ID)).FillWidth().Gap(shelfGap).AlignItems(ui.Start).Children(func() {
 					for _, card := range row.cards {
 						a.tile(c.Key(card.ID), card, coverHeight, density, list)
 					}
@@ -566,7 +548,7 @@ func (a *app) shelf(c *ui.Context, library ui.Element, games []game, density int
 	})
 }
 
-func shelfNeighbor(rows []shelfRow, id uint64, key ui.Key, centered bool) uint64 {
+func shelfNeighbor(rows []shelfRow, id uint64, key ui.Key) uint64 {
 	for i, row := range rows {
 		for j, card := range row.cards {
 			if card.ID != id {
@@ -591,9 +573,6 @@ func shelfNeighbor(rows []shelfRow, id uint64, key ui.Key, centered bool) uint64
 				}
 				next := rows[dest]
 				x := card.center
-				if centered {
-					x += (next.width - row.width) / 2
-				}
 				for k, candidate := range next.cards {
 					if k+1 == len(next.cards) || x <= (candidate.center+next.cards[k+1].center)/2 {
 						return candidate.ID
@@ -607,17 +586,18 @@ func shelfNeighbor(rows []shelfRow, id uint64, key ui.Key, centered bool) uint64
 }
 
 func (a *app) tile(c *ui.Context, card shelfCard, coverHeight float32, density int, list bool) {
+	p := skin(c)
 	g := &card.game
 	tile := ui.ButtonBase(c).Width(card.width).Shrink(0).Padding(0).AlignItems(ui.Start).
 		Label(g.Name).FocusRing(true).Role(ui.RoleOption)
-	if tile.Clicked() {
+	if sparkleClick(c, tile) {
 		a.selected = g.ID
 	}
 	if tile.DoubleClicked() {
 		a.selected = g.ID
 		a.launch(g.ID)
 	}
-	tile.PopoverMenu(func(m *ui.Menu) { a.gameMenu(c, m, g) }, ui.PopoverMenuOptions{Panel: menuPanel})
+	tile.PopoverMenu(func(m *ui.Menu) { a.gameMenu(c, m, g) }, ui.PopoverMenuOptions{Panel: menuPanel(c)})
 	selected := a.selected == g.ID
 	tile.AccessSelected(selected).TabStop(selected)
 	if selected && a.focusShelf {
@@ -630,115 +610,85 @@ func (a *app) tile(c *ui.Context, card shelfCard, coverHeight float32, density i
 	}
 
 	state := a.session(g.ID).State
-	hoverTarget, selectedTarget := float32(0), float32(0)
-	if tile.Hovered() {
-		hoverTarget = 1
-	}
-	if selected {
-		selectedTarget = 1
-	}
-	coverStyle := func(box ui.Element) ui.Element {
-		hover := box.AnimateTo("hover", hoverTarget, ui.Animation{
-			Duration: 160 * time.Millisecond, Ease: ui.EaseOut, NonMotion: true,
-		})
-		active := box.AnimateTo("selection", selectedTarget, ui.Animation{
-			Duration: 180 * time.Millisecond, Ease: ui.EaseOut, NonMotion: true,
-		})
-		box.Radius(12).Padding(3).Border(2, selection.Alpha(.68*hover).Mix(selection, active))
-		if hover == 0 && active == 0 {
-			return box
-		}
-		if !a.reduceMotion && !c.Preferences().ReduceMotion {
-			box.Translate(0, -3*hover)
-		}
-		hoverFill := panel.Alpha(.77 * hover)
-		return box.Gradient(hoverFill.Mix(panel, active), hoverFill.Mix(ui.Hex("#cbdff7"), active), 150).
-			Shadow(0, 0, 10, 0, accent.Alpha(.23*active)).
-			Shadow(0, 5, 14, 0, heading.Alpha(.17*hover))
-	}
+	hovered := tile.Hovered()
 	tile.Children(func() {
 		if list {
-			coverStyle(ui.Row(c)).FillWidth().Padding(4, 12, 4, 6).Gap(12).AlignItems(ui.Center).
-				Children(func() {
-					ui.Box(c).Width(36).Children(func() { a.cover(c, g, coverHeight) })
-					ui.Text(c, g.Name).FontWeight(600).TextColor(heading).Grow(1).MinWidth(0).MaxLines(1)
-					if label := stateName(state); label != "" {
-						badge(c, label, stateColor(state))
-					}
-				})
+			row := ui.Row(c).FillWidth().Padding(4, 10, 4, 6).Gap(10).Radius(6).AlignItems(ui.Center)
+			if hovered || selected {
+				row.Background(p.raised)
+			}
+			row.Children(func() {
+				if selected {
+					ui.Box(c).Absolute().Left(0).Top(12).Bottom(12).Width(2).Radius(1).Background(p.selection)
+				}
+				ui.Box(c).Width(36).Children(func() { a.cover(c, g, coverHeight) })
+				ui.Text(c, g.Name).FontWeight(600).TextColor(p.heading).Grow(1).MinWidth(0).MaxLines(1)
+				if label := stateName(state); label != "" {
+					badge(c, label, stateColor(c, state))
+				}
+			})
 			return
 		}
-		ui.Column(c).FillWidth().Gap(5).AlignItems(ui.Center).Children(func() {
-			cardWidth := card.width
-			if density == densityStandard {
-				if w, h := ui.ImageSize(a.art(g)); h > 0 {
-					cardWidth = max(72, min(cardWidth, coverHeight*w/h+8))
+		ui.Column(c).FillWidth().Gap(4).Children(func() {
+			poster := ui.Box(c).FillWidth()
+			if !reducedMotion(c) {
+				var lift float32
+				if tile.Pressed() {
+					lift = 1
+				} else if hovered {
+					lift = -2
 				}
+				poster.Translate(0, poster.AnimateTo("lift", lift, quickSpring))
 			}
-			artHeight := coverHeight
-			if density == densityGallery {
-				if w, h := ui.ImageSize(a.art(g)); w > 0 {
-					artHeight = min(coverHeight, (cardWidth-8)*h/w)
+			poster.Children(func() { a.cover(c, g, coverHeight) })
+			mark := ui.Box(c).Width(20).Height(2).Radius(1)
+			if selected {
+				mark.Background(p.selection)
+			}
+			size, lines := float32(14), 2
+			if density == densityCompact {
+				size, lines = 12, 1
+			}
+			ui.Column(c).FillWidth().MinHeight(size * 1.3 * float32(lines)).Gap(2).Children(func() {
+				ui.Text(c, g.Name).FontSize(size).FontWeight(600).TextColor(p.heading).FillWidth().
+					LineHeight(1.3).MaxLines(lines).Tooltip(g.Name)
+				if label := stateName(state); label != "" {
+					small(c, label).TextColor(stateColor(c, state)).MaxLines(1)
 				}
-			}
-			ui.Box(c).Width(cardWidth).Height(coverHeight + 8).Center().Children(func() {
-				coverStyle(ui.Box(c)).FillWidth().Children(func() {
-					a.cover(c, g, artHeight)
-					if label := stateName(state); label != "" {
-						ui.Box(c).Absolute().Left(6).Bottom(6).Background(panel).Radius(9).Children(func() {
-							badge(c, label, stateColor(state))
-						})
-					}
-				})
 			})
-			size, lines := float32(13), 2
-			if density == densityGallery {
-				size = 15
-			} else if density == densityCompact {
-				lines = 1
-			}
-			ui.Text(c, g.Name).FontSize(size).FontWeight(600).TextColor(heading).FillWidth().
-				TextAlign(ui.Center).LineHeight(1.15).MaxLines(lines).Tooltip(g.Name)
 		})
 	})
 }
 
-func (a *app) work(c *ui.Context, g *game, width, height float32) {
-	ui.Box(c.Key("current-work")).Width(width).Height(height).AlignSelf(ui.Center).Radius(24).
-		Background(panel).Border(1, panel).Shadow(0, 7, 22, 0, heading.Alpha(.15)).Children(func() {
-		ui.Box(c.Key(g.ID)).Fill().Transition(ui.ElementTransition{
-			Duration: 100 * time.Millisecond, ExitEase: ui.EaseIn,
-			Enter: &ui.Motion{}, Exit: &ui.Motion{}, AfterExits: true,
-		}).Children(func() {
-			a.workContent(c, g, width, min(132, height-34))
-		})
-	})
-}
-
-func (a *app) workContent(c *ui.Context, g *game, width, coverHeight float32) {
-	session := a.session(g.ID)
-	ui.Box(c).Absolute().Fill().ZIndex(-1).Radius(23).Clip().PassThrough().Gradient(panel, bg, 90).Children(func() {
-		if src := a.art(g); src != nil {
-			ui.Image(c, src).Absolute().Right(0).Top(0).Width(width*.55).FillHeight().
-				Fit(ui.Cover).ObjectPosition(.5, .23).Opacity(.62).AccessHidden(true)
-			ui.Box(c).Absolute().Fill().ZIndex(1).LinearGradient(ui.LinearGradient{Angle: 90, Stops: []ui.GradientStop{
-				{Color: panel, At: .48}, {Color: panel.Alpha(.68), At: .64}, {Color: panel.Alpha(.21), At: 1},
-			}})
+func (a *app) work(c *ui.Context, g *game, width float32) {
+	p := skin(c)
+	ui.Scroll(c.Key("current-work")).Width(width).Shrink(0).MinHeight(0).Children(func() {
+		body := ui.Column(c.Key(g.ID)).FillWidth().Padding(shelfInset, 0, 6, 0).Gap(16).
+			Transition(ui.ElementTransition{Duration: 100 * time.Millisecond, Enter: &ui.Motion{}})
+		if a.appearance.active() {
+			body.Padding(12).Radius(panelRadius).Background(p.panel.Alpha(.94))
 		}
-	})
-	ui.Row(c).Fill().Padding(12, 24).Gap(22).AlignItems(ui.Center).Children(func() {
-		ui.Box(c).Width(coverWidth(coverHeight)).Radius(9).Shadow(0, 4, 10, 0, heading.Alpha(.17)).Children(func() {
-			a.cover(c, g, coverHeight)
-		})
-		ui.Column(c).Grow(1).MinWidth(0).Gap(7).Children(func() {
-			ui.Column(c).FillWidth().Gap(4).Children(func() {
-				ui.Text(c, g.Name).FontSize(26).FontWeight(700).TextColor(heading).
-					FillWidth().LineHeight(1.16).MaxLines(1).Tooltip(g.Name)
+		body.Children(func() {
+			session := a.session(g.ID)
+			title, subtitle, _ := strings.Cut(g.Name, " - ")
+			font := "Noto Serif"
+			if strings.IndexFunc(title, func(r rune) bool {
+				return unicode.Is(unicode.Han, r) || unicode.Is(unicode.Hiragana, r) || unicode.Is(unicode.Katakana, r)
+			}) >= 0 {
+				font = "Noto Serif CJK JP"
+			}
+			ui.Column(c).FillWidth().Gap(6).Children(func() {
+				ui.Text(c, title).Font(font).FontSize(min(32, width*.109)).FontWeight(500).TextColor(p.heading).
+					FillWidth().LineHeight(1.22).Balance().MaxLines(3).Tooltip(g.Name)
+				if subtitle != "" {
+					ui.Text(c, subtitle).Font(font).FontSize(16).TextColor(p.muted).
+						FillWidth().MaxLines(2).Tooltip(g.Name)
+				}
 				small(c, a.pictureSummary(g)).MaxLines(1)
 			})
 			a.workActions(c, g, session)
 			if session.Error != "" {
-				small(c, session.Error).TextColor(failure).FillWidth().MaxLines(1).Tooltip(session.Error)
+				small(c, session.Error).TextColor(p.failure).FillWidth().MaxLines(2).Tooltip(session.Error)
 			}
 		})
 	})
@@ -765,37 +715,31 @@ func (a *app) pictureSummary(g *game) string {
 }
 
 func (a *app) workActions(c *ui.Context, g *game, session session) {
-	ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(8).Children(func() {
-		disabled := !a.connected || a.busy
-		if a.active(g.ID) {
-			code, color := iLoading, stateColor(session.State)
-			if session.State == "running" {
-				code = iCheck
-			}
-			ui.Row(c).Height(36).MinWidth(110).Padding(0, 15).Gap(8).Center().Radius(10).
-				Background(color.Alpha(.14)).Children(func() {
-				glyph(c, code).FontSize(18).TextColor(color)
-				ui.Text(c, stateName(session.State)).FontWeight(600).TextColor(color).NoWrap()
-			})
-		} else {
-			label, code := "开始游戏", iPlay
-			if session.State == "failed" || session.State == "interrupted" {
-				label, code = "重新启动", iRefresh
-			}
-			if actionButton(c.Key("play"), code, label, true).Height(36).MinWidth(110).Disabled(disabled).Clicked() {
-				a.launch(g.ID)
-			}
+	disabled := !a.connected || a.busy
+	if a.active(g.ID) {
+		ui.Text(c, stateName(session.State)).FontSize(13).FontWeight(600).TextColor(stateColor(c, session.State))
+	} else {
+		label, code := "开始游戏", iPlay
+		if session.State == "failed" || session.State == "interrupted" {
+			label, code = "重新启动", iRefresh
 		}
-		if actionButton(c.Key("picture"), iSliders, "画质", false).Height(36).
-			Background(panel).Border(1, line).Disabled(disabled).Clicked() {
+		start := actionButton(c.Key("play"), code, label, true).Height(40).MinWidth(120).
+			AlignSelf(ui.Start).Disabled(disabled)
+		if sparkleClick(c, start) {
+			a.launch(g.ID)
+		}
+	}
+	ui.Row(c).FillWidth().AlignItems(ui.Center).Gap(4).Children(func() {
+		picture := quietButton(c, ui.Button(c.Key("picture"), "画质设置")).Height(34).Padding(0, 5).FontSize(12)
+		if pressButton(c, picture).Disabled(disabled).Clicked() {
 			a.openEditor(editQuality)
 		}
-		if actionButton(c.Key("settings"), iGear, "游戏设置", false).Height(36).
-			Background(panel).Border(1, line).Tooltip("Ctrl E").Disabled(disabled).Clicked() {
+		settings := quietButton(c, ui.Button(c.Key("settings"), "游戏设置")).Height(34).Padding(0, 5).FontSize(12)
+		if pressButton(c, settings).Tooltip("Ctrl E").Disabled(disabled).Clicked() {
 			a.openEditor(editGame)
 		}
-		iconButton(c.Key("more"), iMore, "更多操作").Size(36, 36).Background(panel).Border(1, line).
-			PopoverMenuButton(func(m *ui.Menu) { a.gameMenu(c, m, g) }, ui.PopoverMenuButtonOptions{Panel: menuPanel})
+		iconButton(c.Key("more"), iMore, "更多操作").Size(32, 34).
+			PopoverMenuButton(func(m *ui.Menu) { a.gameMenu(c, m, g) }, ui.PopoverMenuButtonOptions{Panel: menuPanel(c)})
 	})
 }
 
@@ -841,22 +785,17 @@ func (a *app) gameMenu(c *ui.Context, m *ui.Menu, g *game) {
 	}
 }
 
-func coverWidth(height float32) float32 { return height * 3 / 4 }
-
 func (a *app) cover(c *ui.Context, g *game, height float32) {
-	box := ui.Box(c).FillWidth().Height(height).Radius(9).Clip().Center()
+	p := skin(c)
+	box := ui.Box(c).FillWidth().Height(height).Radius(min(controlRadius, height*.13)).Border(1, p.line).Clip().Center()
 	if src := a.art(g); src != nil {
-		box.Background(ui.Hex("#e6eef7")).Children(func() {
+		box.Background(p.canvas).Children(func() {
 			ui.Image(c, src).Fill().Fit(ui.Contain)
 		})
 		return
 	}
-	colors := [][2]string{{"#e9f5ff", "#c6e0f5"}, {"#fff1e9", "#f2d6d3"}, {"#edf7f4", "#cce5e7"}}
-	pair := colors[(g.ID-1)%uint64(len(colors))]
-	box.Gradient(ui.Hex(pair[0]), ui.Hex(pair[1]), 135).Children(func() {
-		ui.Box(c).Size(48, 48).Radius(24).Background(panel.Alpha(.46)).Center().Children(func() {
-			glyph(c, iImage).FontSize(22).TextColor(ink.Alpha(.72))
-		})
+	box.Gradient(p.raised, p.sky, 135).Children(func() {
+		glyph(c, iImage).FontSize(min(23, height*.44)).TextColor(p.accent)
 	})
 }
 
@@ -875,7 +814,7 @@ func disclosure(c *ui.Context, label string, open *bool) bool {
 	if *open {
 		code = iDown
 	}
-	button := pressButton(ui.Button(c, "")).Height(36).Padding(0, 12).Gap(7).
+	button := pressButton(c, ui.Button(c, "")).Height(36).Padding(0, 12).Gap(7).
 		AlignSelf(ui.Start).Label(label).AccessSelected(*open).Children(func() {
 		glyph(c, code).FontSize(17)
 		ui.Text(c, label).FontWeight(550).NoWrap()
@@ -887,20 +826,31 @@ func disclosure(c *ui.Context, label string, open *bool) bool {
 }
 
 func (a *app) settingsView(c *ui.Context, width float32) {
+	p := skin(c)
 	ui.Column(c).FillWidth().MaxWidth(1060).Grow(1).MinHeight(0).AlignSelf(ui.Center).Gap(14).Children(func() {
 		header := ui.Row(c).FillWidth().Gap(12).AlignItems(ui.Center).Padding(4, 2)
 		if a.appearance.active() {
-			header.Background(panel.Alpha(.94)).Radius(12).Padding(8, 12)
+			header.Background(p.panel.Alpha(.94)).Radius(panelRadius).Padding(8, 12)
 		}
 		header.Children(func() {
-			ui.Text(c, "全局设置").FontSize(27).FontWeight(700).TextColor(heading).Grow(1)
-			ui.Segmented(c.Key("settings-tab"), &a.settingsTab, "游戏启动", "界面外观").
-				Label("设置类别").Width(204)
+			ui.Text(c, "全局设置").FontSize(27).FontWeight(700).TextColor(p.heading).Grow(1)
+			if ui.Segmented(c.Key("settings-tab"), &a.settingsTab, "游戏启动", "界面外观", "局域网连接").
+				Label("设置类别").Width(264).Changed() && a.settingsTab == 2 {
+				if a.polling {
+					a.refreshAgain = true
+				} else {
+					a.refresh()
+				}
+			}
 		})
 		ui.Scroll(c.Key(a.settingsTab)).Grow(1).MinHeight(0).FillWidth().Children(func() {
 			ui.Column(c).FillWidth().Padding(2, 8, 8, 2).Gap(14).Children(func() {
 				if a.settingsTab == 1 {
 					a.appearance.view(c.Key("appearance"), a.win)
+					return
+				}
+				if a.settingsTab == 2 {
+					a.lanView(c.Key("lan"))
 					return
 				}
 				if a.defaults == nil {
@@ -932,14 +882,127 @@ func (a *app) settingsView(c *ui.Context, width float32) {
 	})
 }
 
+func (a *app) lanView(c *ui.Context) {
+	p := skin(c)
+	if a.lanError != "" {
+		small(c, a.lanError).TextColor(p.failure)
+		return
+	}
+	if a.lan == nil {
+		if a.connected {
+			small(c, "读取中…")
+		}
+		return
+	}
+	lan := a.lan
+	enabled := lan.Enabled
+	disabled := !a.connected || a.busy
+	settingsGroup(c).MaxWidth(720).Children(func() {
+		ui.Row(c).FillWidth().Gap(10).AlignItems(ui.Center).Children(func() {
+			settingsHeading(c, iNetwork, "允许局域网连接")
+			if ui.Switch(c.Key("enabled"), &enabled).Label("允许局域网连接").Disabled(disabled).Changed() {
+				if enabled && !lan.HasPassword {
+					a.openLanPassword(true)
+				} else {
+					a.send(object{"op": "set_lan", "enabled": enabled})
+				}
+			}
+		})
+		if lan.Error != "" {
+			small(c, lan.Error).TextColor(p.failure)
+		}
+		if lan.Name != "" {
+			rule(c)
+			ui.Row(c).FillWidth().MinHeight(36).Gap(10).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, "设备名称").Grow(1)
+				ui.Text(c, lan.Name).FontWeight(600).TextColor(p.heading).MaxWidth(400)
+			})
+		}
+		rule(c)
+		ui.Row(c).FillWidth().MinHeight(36).Gap(10).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, "连接地址").Grow(1)
+			if lan.Address == "" || !a.connected {
+				small(c, "开启后显示")
+				return
+			}
+			code := iCopy
+			if time.Since(a.lanCopied) < 3*time.Second {
+				code = iCheck
+			}
+			if actionButton(c.Key("address"), code, lan.Address, false).Height(36).
+				Label("复制连接地址 " + lan.Address).Tooltip("复制连接地址").Clicked() {
+				mygo.Clipboard.WriteText(lan.Address)
+				a.lanCopied = time.Now()
+			}
+		})
+		rule(c)
+		ui.Row(c).FillWidth().MinHeight(36).Gap(10).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, "连接密码").Grow(1)
+			label := "设置密码"
+			if lan.HasPassword {
+				label = "修改密码"
+			}
+			if pressButton(c, ui.Button(c.Key("password"), label)).Height(36).Disabled(disabled).Clicked() {
+				a.openLanPassword(lan.Enabled)
+			}
+		})
+	})
+}
+
+func (a *app) openLanPassword(enable bool) {
+	a.err = ""
+	a.lanPassword = ""
+	a.lanEnable = enable
+	a.lanPasswordOpen = true
+}
+
+func (a *app) lanPasswordView(c *ui.Context) {
+	p := skin(c)
+	if !a.lanPasswordOpen {
+		a.lanPassword = ""
+	}
+	wasOpen := a.lanPasswordOpen
+	dialog(c, &a.lanPasswordOpen, func() {
+		ui.Text(c, "设置连接密码").FontSize(21).FontWeight(600).TextColor(p.heading)
+		input := ui.TextInput(c.Key("password"), &a.lanPassword).Label("连接密码").
+			Placeholder("6–64 个字符").Password().AutoFocus().FillWidth().Height(40).Disabled(a.busy)
+		if a.err != "" {
+			small(c, a.err).TextColor(p.failure)
+		}
+		ui.Row(c).FillWidth().Gap(8).Children(func() {
+			ui.Spacer(c)
+			if pressButton(c, ui.Button(c.Key("cancel"), "取消")).Height(36).Disabled(a.busy).Clicked() {
+				a.lanPasswordOpen = false
+			}
+			label := "保存密码"
+			if a.lanEnable && a.lan != nil && !a.lan.Enabled {
+				label = "保存并开启"
+			}
+			length := len([]rune(a.lanPassword))
+			valid := length >= 6 && length <= 64 && strings.TrimSpace(a.lanPassword) != ""
+			save := actionButton(c.Key("save"), iCheck, label, true).Height(36).
+				Disabled(!valid || a.busy || !a.connected)
+			saved := sparkleClick(c, save)
+			if valid && a.connected && (saved || input.Submitted()) {
+				a.send(object{"op": "set_lan", "enabled": a.lanEnable, "password": a.lanPassword})
+			}
+		})
+	}).Width(420)
+	if wasOpen && !a.lanPasswordOpen && !a.busy {
+		a.err = ""
+	}
+}
+
 func settingsGroup(c *ui.Context) ui.Element {
+	p := skin(c)
 	return ui.Column(c).FillWidth().Padding(16, 20).Gap(14).
-		Background(panel.Alpha(.94)).Border(1, line).Radius(14)
+		Background(p.panel.Alpha(.94)).Border(1, p.line).Radius(panelRadius)
 }
 
 func settingsHeading(c *ui.Context, code icon, title string) {
-	glyph(c, code).FontSize(19).TextColor(accent)
-	ui.Text(c, title).FontSize(17).FontWeight(650).TextColor(heading).Grow(1)
+	p := skin(c)
+	glyph(c, code).FontSize(19).TextColor(p.accent)
+	ui.Text(c, title).FontSize(17).FontWeight(650).TextColor(p.heading).Grow(1)
 }
 
 func (a *app) pictureSettings(c *ui.Context) {
@@ -960,6 +1023,7 @@ func (a *app) pictureSettings(c *ui.Context) {
 }
 
 func (a *app) runtimeSettings(c *ui.Context) {
+	p := skin(c)
 	d := a.diagnostics
 	var problems []string
 	if d != nil {
@@ -983,9 +1047,9 @@ func (a *app) runtimeSettings(c *ui.Context) {
 			case a.checking:
 				small(c, "检查中…")
 			case a.connected && d != nil && len(problems) == 0:
-				small(c, "环境正常").TextColor(live)
+				small(c, "环境正常").TextColor(p.live)
 			case len(problems) != 0:
-				small(c, "需检查").TextColor(gold)
+				small(c, "需检查").TextColor(p.gold)
 			}
 			if iconButton(c.Key("check-now"), iRefresh, "重新检查 · F5").Size(30, 30).
 				Disabled(!a.connected || a.checking).Clicked() {
@@ -995,8 +1059,8 @@ func (a *app) runtimeSettings(c *ui.Context) {
 		a.protonField(c, &a.settingsDraft, nil, false)
 		for _, problem := range problems {
 			ui.Row(c).FillWidth().Gap(7).AlignItems(ui.Center).Children(func() {
-				glyph(c, iWarning).FontSize(15).TextColor(gold)
-				small(c, problem).TextColor(gold).Grow(1).MinWidth(0)
+				glyph(c, iWarning).FontSize(15).TextColor(p.gold)
+				small(c, problem).TextColor(p.gold).Grow(1).MinWidth(0)
 			})
 		}
 	})
@@ -1015,17 +1079,18 @@ func (a *app) advancedSettings(c *ui.Context) {
 }
 
 func (a *app) settingsActions(c *ui.Context) {
+	p := skin(c)
 	dirty := a.settingsDraft != form(*a.defaults)
 	ui.Row(c).FillWidth().Gap(10).AlignItems(ui.Center).Padding(8, 12).
-		Background(panel.Alpha(.94)).Border(1, line).Radius(12).Children(func() {
+		Background(p.panel.Alpha(.94)).Border(1, p.line).Radius(panelRadius).Children(func() {
 		if dirty {
-			small(c, "未保存").TextColor(gold)
+			small(c, "未保存").TextColor(p.gold)
 		} else if time.Since(a.settingsSaved) < 5*time.Second {
-			glyph(c, iCheck).FontSize(16).TextColor(live)
-			small(c, "已保存").TextColor(live).Tooltip("下次启动游戏时生效")
+			glyph(c, iCheck).FontSize(16).TextColor(p.live)
+			small(c, "已保存").TextColor(p.live).Tooltip("下次启动游戏时生效")
 		}
 		ui.Spacer(c)
-		if dirty && pressButton(ui.Button(c.Key("discard"), "放弃修改")).Height(36).Disabled(a.busy).Clicked() {
+		if dirty && pressButton(c, ui.Button(c.Key("discard"), "放弃修改")).Height(36).Disabled(a.busy).Clicked() {
 			a.settingsDraft = form(*a.defaults)
 			a.settingsCustomOutput = false
 			a.err = ""
@@ -1034,8 +1099,9 @@ func (a *app) settingsActions(c *ui.Context) {
 		if a.busy {
 			label = "正在保存…"
 		}
-		if actionButton(c.Key("save-settings"), iCheck, label, true).Height(36).
-			Tooltip("Ctrl Enter").Disabled(!dirty || !a.connected || a.busy).Clicked() {
+		save := actionButton(c.Key("save-settings"), iCheck, label, true).Height(36).
+			Tooltip("Ctrl Enter").Disabled(!dirty || !a.connected || a.busy)
+		if sparkleClick(c, save) {
 			a.saveSettings()
 		}
 	})
@@ -1232,6 +1298,7 @@ func (a *app) entryField(c *ui.Context) {
 }
 
 func (a *app) editorView(c *ui.Context, height float32) {
+	p := skin(c)
 	d := &a.draft
 	edit := d.ID != 0
 	canSave := func() bool {
@@ -1253,7 +1320,7 @@ func (a *app) editorView(c *ui.Context, height float32) {
 			title = "游戏设置"
 		}
 		ui.Row(c).FillWidth().Gap(12).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, title).FontSize(23).FontWeight(600).TextColor(heading).Grow(1)
+			ui.Text(c, title).FontSize(23).FontWeight(600).TextColor(p.heading).Grow(1)
 			if iconButton(c, iClose, "关闭 · Esc").Disabled(a.busy).Clicked() {
 				a.editOpen = false
 			}
@@ -1262,9 +1329,9 @@ func (a *app) editorView(c *ui.Context, height float32) {
 			ui.Row(c).FillWidth().Gap(6).Children(func() {
 				for i, label := range []string{"基本信息", "启动与画面"} {
 					selected := d.LaunchTab == (i == 1)
-					button := pressButton(ui.Button(c.Key(label), label)).Height(36).AccessSelected(selected)
+					button := pressButton(c, ui.Button(c.Key(label), label)).Height(36).AccessSelected(selected)
 					if selected {
-						button.Background(accent.Alpha(.14)).TextColor(accent)
+						button.Background(p.accent.Alpha(.14)).TextColor(p.accent)
 					}
 					if button.Clicked() {
 						d.LaunchTab = i == 1
@@ -1276,7 +1343,7 @@ func (a *app) editorView(c *ui.Context, height float32) {
 			ui.Column(c).FillWidth().Padding(2, 10, 4, 2).Gap(12).Children(func() {
 				if edit && d.LaunchTab {
 					if d.Launch != (launchDraft{}) {
-						if pressButton(ui.Button(c.Key("reset-launch"), "恢复全局设置")).
+						if pressButton(c, ui.Button(c.Key("reset-launch"), "恢复全局设置")).
 							Height(36).AlignSelf(ui.End).Disabled(a.busy).Clicked() {
 							d.Launch = launchDraft{}
 							d.CustomOutput = false
@@ -1287,7 +1354,7 @@ func (a *app) editorView(c *ui.Context, height float32) {
 					settingSelect(c, "prefix", "兼容环境", &d.Prefix,
 						[]string{"shared", "independent"}, []string{"共享环境", "独立环境"}, "")
 					if g := a.current(); g != nil && g.ID == d.ID && d.Prefix != g.Prefix {
-						small(c, "存档保留在原环境").TextColor(gold)
+						small(c, "存档保留在原环境").TextColor(p.gold)
 					}
 					base := form(*a.defaults)
 					a.launchFields(c, &d.Launch, &base, d.Prefix == "shared")
@@ -1317,12 +1384,12 @@ func (a *app) editorView(c *ui.Context, height float32) {
 			errorText = "暂时连不上 GalScaler，请稍后再试。"
 		}
 		if errorText != "" {
-			small(c, errorText).TextColor(failure).FillWidth().MaxLines(2).Tooltip(errorText)
+			small(c, errorText).TextColor(p.failure).FillWidth().MaxLines(2).Tooltip(errorText)
 		}
 		rule(c)
 		ui.Row(c).FillWidth().Gap(10).AlignItems(ui.Center).Children(func() {
 			if edit {
-				if iconButton(c, iTrash, "移出游戏库").TextColor(failure).
+				if iconButton(c, iTrash, "移出游戏库").TextColor(p.failure).
 					Disabled(!a.connected || a.busy || a.active(a.draft.ID)).Clicked() {
 					a.err = ""
 					a.confirmOpen = true
@@ -1339,7 +1406,8 @@ func (a *app) editorView(c *ui.Context, height float32) {
 			if a.busy && !a.confirmOpen {
 				label = "正在保存…"
 			}
-			if pressButton(ui.PrimaryButton(c, label)).Height(40).Tooltip("Ctrl Enter").Disabled(!canSave()).Clicked() {
+			save := pressButton(c, primaryButton(c, label)).Height(40).Tooltip("Ctrl Enter").Disabled(!canSave())
+			if sparkleClick(c, save) {
 				a.save()
 			}
 		})
@@ -1347,6 +1415,7 @@ func (a *app) editorView(c *ui.Context, height float32) {
 }
 
 func (a *app) coverField(c *ui.Context) {
+	p := skin(c)
 	e := &a.draft
 	disabled := !a.connected || a.busy || e.Pending
 	title := strings.TrimSpace(e.Name)
@@ -1382,10 +1451,10 @@ func (a *app) coverField(c *ui.Context) {
 		}
 		for _, candidate := range e.CoverCandidates {
 			row := ui.ButtonBase(c.Key(candidate.URL)).FillWidth().Padding(6, 10).Radius(8).
-				Background(raised).Label(candidate.Title).FocusRing(true).Disabled(disabled)
+				Background(p.raised).Label(candidate.Title).FocusRing(true).Disabled(disabled)
 			row.Children(func() {
 				ui.Row(c).FillWidth().Gap(12).AlignItems(ui.Center).Children(func() {
-					ui.Box(c).Size(42, 54).Background(panel).Radius(5).Clip().Center().Children(func() {
+					ui.Box(c).Size(42, 54).Background(p.panel).Radius(5).Clip().Center().Children(func() {
 						if src := a.art(&game{Cover: candidate.Thumbnail}); src != nil {
 							ui.Image(c, src).Fill().Fit(ui.Contain)
 						} else {
