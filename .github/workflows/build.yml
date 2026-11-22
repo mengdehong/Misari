@@ -119,7 +119,9 @@ jobs:
           distribution: temurin
           java-version: '17'
       - name: Install Android SDK and NDK
-        run: sdkmanager 'platforms;android-36' 'build-tools;35.0.0' 'ndk;27.3.13750724'
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            'platforms;android-36' 'build-tools;35.0.0' 'ndk;27.3.13750724'
       - name: Build GalScaler APK
         working-directory: tools/galscaler/mobile
         run: |
