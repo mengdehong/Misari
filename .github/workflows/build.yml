@@ -164,7 +164,12 @@ jobs:
           if [[ "$COMPONENT" == galscaler ]]; then
             assets+=(packages/*.apk)
           fi
-          gh release create "$TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+          if [[ $(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft) == true ]]; then
+            gh release upload "$TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          else
+            gh release create "$TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+          fi
 
   android:
     if: inputs.mode == 'android' || needs.plan.outputs.component == 'galscaler'

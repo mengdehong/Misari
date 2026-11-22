@@ -1,6 +1,6 @@
 pkgbase = wallpaperd-git
 	pkgdesc = Session wallpaper daemon with image, video, shader and Wallpaper Engine backends
-	pkgver = 0.1.0.r17.gb9c5c01
+	pkgver = 0.2.0.r51.g97172d1
 	pkgrel = 1
 	url = https://github.com/mengdehong/Misari
 	arch = x86_64
@@ -48,7 +48,7 @@ pkgbase = wallpaperd-git
 	depends = libmpv.so=2-64
 	depends = libEGL.so=1-64
 	depends = libGLESv2.so=2-64
-	provides = wallpaperd=0.1.0
+	provides = wallpaperd=0.2.0
 	conflicts = wallpaperd
 	options = !debug
 	options = !strip
