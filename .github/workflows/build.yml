@@ -1,0 +1,135 @@
+name: Build packages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Build type
+        type: choice
+        options: [arch, release, android]
+        default: arch
+      release_tag:
+        description: Existing component tag for release mode (e.g. wallpaperd-v0.2.0)
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    if: inputs.mode != 'android'
+    runs-on: ubuntu-24.04
+    outputs:
+      packages: ${{ steps.select.outputs.packages }}
+      commit: ${{ steps.select.outputs.commit }}
+      version: ${{ steps.select.outputs.version }}
+    steps:
+      - id: select
+        env:
+          MODE: ${{ inputs.mode }}
+          TAG: ${{ inputs.release_tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$MODE" == release ]]; then
+            if [[ ! "$TAG" =~ ^(misari|wallpaperd|galscaler)-v([0-9][A-Za-z0-9._+]*)$ ]]; then
+              echo 'Specify an existing misari-v*, wallpaperd-v*, or galscaler-v* tag.' >&2
+              exit 1
+            fi
+            printf 'packages=["%s"]\nversion=%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" >> "$GITHUB_OUTPUT"
+            commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$TAG" --jq .sha)
+          else
+            echo 'packages=["misari","wallpaperd","galscaler"]' >> "$GITHUB_OUTPUT"
+            commit=$GITHUB_SHA
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+  arch:
+    needs: plan
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJSON(needs.plan.outputs.packages) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Build Arch package
+        env:
+          PACKAGE: ${{ matrix.package }}
+          MISARI_RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/packages"
+          docker run --rm \
+            --volume "$PWD:/checkout:ro" --volume "$RUNNER_TEMP/packages:/packages" \
+            --env "BUILD_UID=$(id -u)" --env MISARI_RELEASE_VERSION \
+            archlinux:base-devel bash /checkout/packaging/build-arch.sh "$PACKAGE"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.package }}-arch-x86_64-${{ needs.plan.outputs.commit }}
+          path: ${{ runner.temp }}/packages/*.pkg.tar.zst
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+          overwrite: true
+
+  release:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'release'
+    needs: [plan, arch]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: packages
+          pattern: '*-arch-x86_64-${{ needs.plan.outputs.commit }}'
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+          COMMIT: ${{ needs.plan.outputs.commit }}
+        run: |
+          if [[ $(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$TAG" --jq .sha) != "$COMMIT" ]]; then
+            echo 'The release tag no longer points to the packaged commit.' >&2
+            exit 1
+          fi
+          shopt -s failglob
+          gh release create "$TAG" packages/*.pkg.tar.zst --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+
+  android:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'android'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: tools/galscaler/mobile/go.mod
+          cache-dependency-path: tools/galscaler/mobile/go.sum
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install Android SDK and NDK
+        run: sdkmanager 'platforms;android-36' 'build-tools;35.0.0' 'ndk;27.3.13750724'
+      - name: Build GalScaler APK
+        working-directory: tools/galscaler/mobile
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.3.13750724"
+          go run github.com/egoist/mygo/cmd/mygo@v0.10.0 build -platform android
+      - uses: actions/upload-artifact@v7
+        with:
+          name: galscaler-android-${{ github.sha }}
+          path: tools/galscaler/mobile/dist/android/*.apk
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+          overwrite: true

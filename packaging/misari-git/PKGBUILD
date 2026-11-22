@@ -2,6 +2,10 @@
 # shellcheck disable=SC2034,SC2154
 pkgname=misari-git
 pkgver=26.4.0.v1.0.r17.gb9c5c01
+if [[ -n ${MISARI_RELEASE_VERSION:-} ]]; then
+  pkgname=misari
+  pkgver=$MISARI_RELEASE_VERSION
+fi
 pkgrel=1
 _upstreamver=26.4.0
 pkgdesc='Personal niri fork with a scrollable tiling Wayland desktop'
@@ -24,12 +28,22 @@ optdepends=(
 )
 provides=("misari=${pkgver%%.r*}" "niri=$_upstreamver" 'wayland-compositor')
 conflicts=('misari' 'niri')
+if [[ $pkgname == misari ]]; then
+  conflicts=('niri')
+fi
 # Cargo controls Rust LTO; GCC LTO objects cannot be linked by rustc's lld.
 options=('!debug' '!lto')
 source=("misari::git+https://github.com/mengdehong/Misari.git#branch=main")
+if [[ -n ${MISARI_CHECKOUT:-} ]]; then
+  source[0]="misari::git+file://$MISARI_CHECKOUT#commit=$(git -C "$MISARI_CHECKOUT" rev-parse HEAD)"
+fi
 sha256sums=('SKIP')
 
 pkgver() {
+  if [[ -n ${MISARI_RELEASE_VERSION:-} ]]; then
+    printf '%s\n' "$MISARI_RELEASE_VERSION"
+    return
+  fi
   cd "$srcdir/$_srcname" || return
   local version="${pkgver%%.r*}"
   printf '%s.r%s.g%s\n' "$version" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"

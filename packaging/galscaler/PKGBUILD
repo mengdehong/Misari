@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # shellcheck disable=SC2034,SC2154
 pkgname=galscaler
-pkgver=0.1.0
+pkgver=${MISARI_RELEASE_VERSION:-0.1.0}
 pkgrel=1
 pkgdesc='Windows visual novel launcher with upscaling and LAN streaming'
 arch=('x86_64')

@@ -43,6 +43,8 @@ pkgbase = wallpaperd-git
 	depends = wayland
 	depends = pulse-native-provider
 	depends = ttf-font
+	depends = vulkan-icd-loader
+	depends = xdg-desktop-portal
 	depends = libmpv.so=2-64
 	depends = libEGL.so=1-64
 	depends = libGLESv2.so=2-64
