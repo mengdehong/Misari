@@ -1,6 +1,6 @@
 {
   "name": "GalScaler",
   "identifier": "io.misari.galscaler",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "android": { "minSdk": 26 }
 }

@@ -1,12 +1,15 @@
 use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
+    collections::HashMap,
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::LazyLock,
+    time::{Duration, Instant},
 };
-use tokio::{process::Command, task::JoinSet};
+use tokio::{process::Command, sync::Mutex, task::JoinSet};
 
 #[derive(Deserialize)]
 struct Results {
@@ -16,6 +19,7 @@ struct Results {
 
 #[derive(Deserialize)]
 struct Entry {
+    id: Option<String>,
     title: String,
     alttitle: Option<String>,
     released: Option<String>,
@@ -95,7 +99,13 @@ fn title_key(title: &str) -> String {
         })
         .flat_map(char::to_lowercase)
         .collect();
-    folded.split_whitespace().collect::<Vec<_>>().join(" ")
+    folded
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace(" - ", ": ")
+        .replace(" – ", ": ")
+        .replace(" — ", ": ")
 }
 
 fn automatic<'a>(
@@ -200,6 +210,165 @@ pub async fn find_automatic(data: &Path, title: &str) -> Result<Option<PathBuf>>
         Some(url) => download(data, url).await.map(Some),
         None => Ok(None),
     }
+}
+
+#[derive(Clone, Serialize)]
+pub struct Metadata {
+    edition: bool,
+    released: Option<String>,
+    description: Option<String>,
+    languages: Vec<String>,
+    platforms: Vec<String>,
+    developers: Vec<String>,
+    publishers: Vec<String>,
+    tags: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct WorkInfo {
+    released: Option<String>,
+    description: Option<String>,
+    languages: Vec<String>,
+    platforms: Vec<String>,
+    developers: Vec<Producer>,
+    tags: Vec<Tag>,
+}
+
+#[derive(Deserialize)]
+struct Producer {
+    name: String,
+    #[serde(default)]
+    publisher: bool,
+    #[serde(default)]
+    developer: bool,
+}
+
+#[derive(Deserialize)]
+struct Tag {
+    name: String,
+    rating: f32,
+    spoiler: u8,
+    lie: bool,
+}
+
+#[derive(Deserialize)]
+struct EditionInfo {
+    released: Option<String>,
+    languages: Vec<EditionLanguage>,
+    platforms: Vec<String>,
+    producers: Vec<Producer>,
+    vns: Vec<WorkInfo>,
+}
+
+#[derive(Deserialize)]
+struct EditionLanguage {
+    lang: String,
+    mtl: bool,
+}
+
+impl From<WorkInfo> for Metadata {
+    fn from(mut work: WorkInfo) -> Self {
+        work.tags.retain(|tag| tag.spoiler == 0 && !tag.lie);
+        work.tags.sort_by(|a, b| b.rating.total_cmp(&a.rating));
+        Self {
+            edition: false,
+            released: work.released,
+            description: work.description,
+            languages: work.languages,
+            platforms: work.platforms,
+            developers: work
+                .developers
+                .into_iter()
+                .map(|producer| producer.name)
+                .collect(),
+            publishers: Vec::new(),
+            tags: work.tags.into_iter().take(6).map(|tag| tag.name).collect(),
+        }
+    }
+}
+
+fn exact_entry<'a>(results: &'a Results, key: &str) -> Option<&'a Entry> {
+    if results.more {
+        return None;
+    }
+    let mut matches = results.results.iter().filter(|entry| entry.exact(key));
+    let entry = matches.next()?;
+    matches.next().is_none().then_some(entry)
+}
+
+async fn info<T: DeserializeOwned>(kind: &str, id: &str, fields: &str) -> Result<Option<T>> {
+    #[derive(Deserialize)]
+    struct Rows<T> {
+        results: Vec<T>,
+    }
+
+    let query = json!({"filters": ["id", "=", id], "fields": fields, "results": 1});
+    let data = get(
+        &format!("https://api.vndb.org/kana/{kind}"),
+        Some(query),
+        "1048576",
+    )
+    .await?;
+    let mut rows: Rows<T> = serde_json::from_slice(&data).context("VNDB 返回了无效资料")?;
+    Ok(rows.results.pop())
+}
+
+async fn fetch_metadata(title: &str) -> Result<Option<Metadata>> {
+    const WORK: &str =
+        "released,description,languages,platforms,developers{name},tags{name,rating,spoiler,lie}";
+
+    let (works, editions) = lookup(title).await?;
+    let key = title_key(title);
+    if let Some(edition) = editions.as_ref().and_then(|rows| exact_entry(rows, &key))
+        && let [work] = edition.vns.as_slice()
+        && work.rtype == "complete"
+        && let Some(id) = &edition.id
+        && let Some(mut info) = info::<EditionInfo>(
+            "release",
+            id,
+            &format!("released,languages{{lang,mtl}},platforms,producers{{name,developer,publisher}},vns{{{WORK}}}"),
+        )
+        .await?
+        && let Some(work) = info.vns.pop()
+    {
+        let mut metadata = Metadata::from(work);
+        metadata.edition = true;
+        metadata.released = info.released;
+        metadata.platforms = info.platforms;
+        metadata.languages = info.languages.into_iter().filter(|lang| !lang.mtl).map(|lang| lang.lang).collect();
+        let developers: Vec<_> = info.producers.iter().filter(|producer| producer.developer).map(|producer| producer.name.clone()).collect();
+        if !developers.is_empty() {
+            metadata.developers = developers;
+        }
+        metadata.publishers = info.producers.into_iter().filter(|producer| producer.publisher).map(|producer| producer.name).collect();
+        return Ok(Some(metadata));
+    }
+
+    let Some(id) = exact_entry(&works, &key).and_then(|work| work.id.as_deref()) else {
+        return Ok(None);
+    };
+    Ok(info::<WorkInfo>("vn", id, WORK).await?.map(Metadata::from))
+}
+
+pub async fn metadata(title: &str) -> Result<Option<Metadata>> {
+    type Cache = HashMap<String, (Instant, Option<Metadata>)>;
+    static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    let key = title_key(title);
+    {
+        let mut cache = CACHE.lock().await;
+        cache.retain(|_, (expires, _)| *expires > Instant::now());
+        if let Some((_, info)) = cache.get(&key) {
+            return Ok(info.clone());
+        }
+    }
+    let info = fetch_metadata(title).await?;
+    let ttl = if info.is_some() { 86400 } else { 300 };
+    CACHE.lock().await.insert(
+        key,
+        (Instant::now() + Duration::from_secs(ttl), info.clone()),
+    );
+    Ok(info)
 }
 
 #[derive(Serialize)]
@@ -324,6 +493,22 @@ pub async fn download(data: &Path, url: &str) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn equivalent_title_separators_can_match_without_matching_other_editions() -> Result<()> {
+        let works = serde_json::from_value(json!({"more": false, "results": [
+            {"title": "YOU and ME and HER: A Love Story", "image": {"url": "work-cover"}}
+        ]}))?;
+        assert_eq!(
+            automatic("YOU and ME and HER - A Love Story", &works, None),
+            Some("work-cover")
+        );
+        assert_eq!(
+            automatic("YOU and ME and HER - A Love Story Deluxe", &works, None),
+            None
+        );
+        Ok(())
+    }
 
     #[test]
     fn automatically_uses_only_a_unique_exact_title() -> anyhow::Result<()> {

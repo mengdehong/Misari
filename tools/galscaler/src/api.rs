@@ -15,6 +15,9 @@ pub enum Request {
     CoverPath {
         id: u64,
     },
+    GameMetadata {
+        id: u64,
+    },
     Library,
     SetSettings {
         settings: Settings,

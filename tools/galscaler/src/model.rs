@@ -7,7 +7,15 @@ use std::{
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     str::FromStr,
+    time::{SystemTime, UNIX_EPOCH},
 };
+
+pub fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Resolution {
@@ -152,6 +160,8 @@ pub enum Prefix {
 pub struct Game<C = Overrides> {
     pub id: u64,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_at: Option<u64>,
     pub executable: PathBuf,
     pub cover: Option<PathBuf>,
     #[serde(default)]
@@ -332,6 +342,7 @@ impl Game {
         Game {
             id: self.id,
             name: self.name.clone(),
+            added_at: self.added_at,
             executable: self.executable.clone(),
             cover: self.cover.clone(),
             arguments: self.arguments.clone(),
@@ -531,6 +542,7 @@ impl Library {
         self.unique(&path, None)?;
         let game = Game {
             id: self.next_id,
+            added_at: Some(now()),
             name: name
                 .unwrap_or_else(|| {
                     path.parent()

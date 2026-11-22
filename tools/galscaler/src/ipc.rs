@@ -33,6 +33,7 @@ pub async fn dispatch(queue: &Queue, bytes: &[u8], local: Option<&Paths>) -> Rep
                     request,
                     Request::List
                         | Request::Status
+                        | Request::GameMetadata { .. }
                         | Request::Log { .. }
                         | Request::SetPicture { .. }
                         | Request::Stop { .. }
@@ -40,6 +41,13 @@ pub async fn dispatch(queue: &Queue, bytes: &[u8], local: Option<&Paths>) -> Rep
                 ),
             "该操作仅支持本地连接"
         );
+        if matches!(request, Request::GameMetadata { .. }) {
+            let name: String = serde_json::from_value(call(queue, request).await?.into_result()?)?;
+            let info = timeout(Duration::from_secs(11), cover::metadata(&name))
+                .await
+                .context("读取 VNDB 资料超时")??;
+            return Ok(Reply::from_result(Ok(serde_json::to_value(info)?)));
+        }
         if let Some(paths) = local {
             let value = match &request {
                 Request::FindCovers { title } => Some(serde_json::to_value(

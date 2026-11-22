@@ -405,6 +405,199 @@
     color: var(--end-game);
   }
   #save-picture { margin-inline-start: auto; min-width: 5rem; }
+  #game-details:not(.android-details) .android-detail { display: none; }
+  #game-details:not(.android-details) .details-body { display: contents; }
+  #game-details.android-details[open] {
+    --detail-inset: max(1rem, calc(50% - 18rem));
+    position: fixed;
+    inset: var(--sheet-top, 38%) 0 0;
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    height: auto;
+    max-width: none;
+    max-height: none;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    border-radius: var(--sheet-radius, 1.5rem) var(--sheet-radius, 1.5rem) 0 0;
+    background: radial-gradient(ellipse 100% 12rem at 100% 0, var(--sky), transparent), var(--sheet);
+  }
+  #game-details.android-details::backdrop { opacity: var(--sheet-scrim, 1); }
+  .android-details .details-chrome {
+    position: relative;
+    flex: 0 0 3rem;
+    touch-action: none;
+  }
+  .details-chrome button { position: absolute; top: 0; min-height: 3rem; }
+  .details-chrome button:focus-visible { outline-offset: -3px; }
+  #expand-details {
+    inset-inline: 0;
+    width: min(12rem, 100%);
+    margin-inline: auto;
+    display: grid;
+    justify-items: center;
+    align-content: center;
+    gap: .35rem;
+    background: transparent;
+    color: var(--muted);
+    font-size: .75rem;
+    opacity: var(--sheet-hint, 1);
+  }
+  #expand-details::before {
+    content: "";
+    width: 2.375rem;
+    height: .25rem;
+    border-radius: 999px;
+    background: currentColor;
+    opacity: .45;
+  }
+  #collapse-details { inset-inline-start: calc(var(--detail-inset) - .25rem); opacity: var(--sheet-reveal, 0); }
+  .android-details .details-body {
+    min-height: 0;
+    flex: 1;
+    overflow: auto;
+    overscroll-behavior-y: contain;
+  }
+  #game-details.android-details .sheet-heading {
+    display: grid;
+    grid-template-columns: var(--sheet-cover, 4.5rem) minmax(0, 1fr);
+    align-items: center;
+    position: relative;
+    gap: .875rem;
+    margin: 0;
+    padding: .25rem calc(var(--detail-inset) + 2.5rem) .75rem var(--detail-inset);
+    touch-action: none;
+  }
+  #game-details[data-expanded] .sheet-heading { touch-action: pan-y; }
+  .android-details .sheet-heading button {
+    position: absolute;
+    inset: 0 calc(var(--detail-inset) - .375rem) auto auto;
+    margin: 0;
+  }
+  .details-cover {
+    display: grid;
+    place-items: center;
+    aspect-ratio: 4 / 5;
+    overflow: hidden;
+    border-radius: var(--radius-control);
+    background: var(--panel);
+    color: var(--muted);
+    box-shadow: 0 .25rem .875rem #152b4215;
+  }
+  .details-cover img { width: 100%; height: 100%; object-fit: cover; }
+  .android-details #game-title { font-size: clamp(1.25rem, 6vw, 1.75rem); }
+  .android-details .work-subtitle { font-style: italic; }
+  .details-extra {
+    display: grid;
+    grid-template-rows: var(--sheet-extra, 0fr);
+    opacity: var(--sheet-reveal, 0);
+  }
+  .details-extra > div { min-height: 0; overflow: hidden; }
+  .detail-section { padding: .625rem var(--detail-inset); border-bottom: 1px solid var(--line); }
+  .detail-section h3 { margin: 0 0 .375rem; font-size: .9375rem; }
+  .detail-section dl { display: grid; gap: .25rem .75rem; margin: 0; font-size: .8125rem; line-height: 1.4; }
+  .detail-section dt { color: var(--muted); }
+  .detail-section dd { margin: 0; overflow-wrap: anywhere; }
+  #record-section { padding-block: 0 .5rem; border-bottom: 0; }
+  #play-record {
+    grid-template-columns: repeat(auto-fit, minmax(min(5.5rem, 100%), 1fr));
+    padding: .5rem .625rem;
+    border-radius: var(--radius-control);
+    background: var(--raised);
+    font-variant-numeric: tabular-nums;
+  }
+  #play-record dt { margin-bottom: .125rem; font-size: .75rem; }
+  #game-facts { grid-template-columns: auto minmax(0, 1fr); }
+  .detail-section summary { cursor: pointer; font-size: .9375rem; font-weight: 650; }
+  .detail-section summary::-webkit-details-marker { display: none; }
+  #game-facts summary { display: block; padding-block: .125rem; font: inherit; }
+  #game-facts summary small {
+    margin-inline-start: .375rem;
+    padding: .125rem .375rem;
+    border-radius: 1rem;
+    background: var(--raised);
+    white-space: nowrap;
+  }
+  #game-facts details p { margin-top: .25rem; }
+  #synopsis summary { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+  #synopsis summary .icon { width: 1rem; height: 1rem; rotate: 90deg; color: var(--muted); }
+  #synopsis[open] summary .icon { rotate: -90deg; }
+  #game-description { margin-top: .375rem; white-space: pre-line; overflow-wrap: anywhere; }
+  #synopsis-preview {
+    display: -webkit-box;
+    grid-column: 1 / -1;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    margin-top: .25rem;
+    font-weight: 400;
+  }
+  #synopsis[open] #synopsis-preview { display: none; }
+  #game-tags {
+    display: flex;
+    gap: .375rem;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: thin;
+    margin: .375rem 0 0;
+    padding: 0;
+    list-style: none;
+  }
+  #game-tags li {
+    flex: none;
+    padding: .125rem .5rem;
+    border-radius: 1rem;
+    background: var(--raised);
+    font-size: .75rem;
+    white-space: nowrap;
+  }
+  .android-details #picture-settings { padding: .125rem var(--detail-inset) .75rem; }
+  .android-details #settings-heading {
+    display: grid;
+    grid-template-rows: var(--sheet-extra, 0fr);
+    opacity: var(--sheet-reveal, 0);
+    margin: 0;
+    font-size: .9375rem;
+    line-height: 2.125rem;
+  }
+  #settings-heading span { min-height: 0; overflow: hidden; }
+  .android-details #picture-fields {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: .75rem;
+    margin-top: 0;
+  }
+  .android-details .picture-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: .25rem;
+    min-height: 0;
+    border: 0;
+  }
+  .android-details .picture-row select { width: 100%; }
+  .android-details .picture-actions {
+    display: grid;
+    grid-template-columns: 1fr 1.25fr;
+    gap: .625rem;
+    padding: .625rem var(--detail-inset) max(.75rem, env(safe-area-inset-bottom));
+    margin: 0;
+    border-top: 1px solid var(--line);
+    background: var(--sheet);
+  }
+  .android-details #save-picture {
+    margin: 0;
+    border: 1px solid var(--line);
+    background: var(--raised);
+    color: var(--ink);
+    box-shadow: none;
+  }
+  .android-details #game-stop { margin-top: .75rem; }
+  .android-details .game-error { padding-inline: var(--detail-inset); font-size: .875rem; }
+  .android-details #details-error { grid-column: 1 / -1; margin: 0; font-size: .8125rem; }
+  .android-details #details-error:empty { display: none; }
+  #play-unavailable:not(:empty) { grid-column: 1 / -1; font-size: .75rem; }
+  #play-unavailable:empty { display: none; }
   @media (min-width: 42rem) and (min-height: 30rem) {
     dialog { width: min(34rem, calc(100% - 2rem)); margin: auto; border-radius: var(--radius-sheet); }
   }
@@ -691,38 +884,75 @@
   </div>
 </dialog>
 <dialog id="game-details" aria-labelledby="game-title">
-  <div class="sheet-heading">
-    <h2 id="game-title"><span class="work-name"></span><span class="work-subtitle" hidden></span></h2>
-    <button id="favorite" type="button" class="secondary icon-button" aria-label="收藏并置顶" aria-pressed="false">
-      <svg class="icon" aria-hidden="true"><use href="#icon-star" /></svg>
+  <div class="details-chrome android-detail">
+    <button id="expand-details" type="button" aria-controls="details-extra" aria-expanded="false">上滑查看更多</button>
+    <button id="collapse-details" type="button" class="secondary icon-button" aria-label="收起游戏详情" inert>
+      <svg class="icon" aria-hidden="true"><use href="#icon-arrow-left" /></svg>
     </button>
   </div>
-  <p class="game-error error" hidden></p>
-  <form id="picture-settings">
-    <fieldset id="picture-fields" aria-label="画质设置">
-      <label class="picture-row">
-        画质增强
-        <select id="picture-mode">
-          <option value="off">原始画质</option>
-          <option value="anime4k">Anime4K</option>
-          <option value="cunny">CuNNy</option>
-        </select>
-      </label>
-      <label class="picture-row">
-        帧率
-        <select id="picture-fps">
-          <option value="30">30 FPS</option>
-          <option value="60">60 FPS</option>
-          <option value="120">120 FPS</option>
-        </select>
-      </label>
-    </fieldset>
-    <p id="details-error" class="error" role="alert"></p>
-    <div class="picture-actions">
-      <button id="game-stop" type="button" class="danger" hidden>结束游戏</button>
-      <button id="save-picture" type="submit" class="primary" disabled>保存</button>
+  <div class="details-body">
+    <div class="sheet-heading">
+      <span class="details-cover android-detail">
+        <svg class="icon" aria-hidden="true"><use href="#icon-gamepad" /></svg>
+        <img id="details-cover" alt="" hidden>
+      </span>
+      <h2 id="game-title"><span class="work-name"></span><span class="work-subtitle" hidden></span></h2>
+      <button id="favorite" type="button" class="secondary icon-button" aria-label="收藏并置顶" aria-pressed="false">
+        <svg class="icon" aria-hidden="true"><use href="#icon-star" /></svg>
+      </button>
     </div>
-  </form>
+    <p class="game-error error" hidden></p>
+    <div id="details-extra" class="details-extra android-detail" inert>
+      <div>
+        <section id="record-section" class="detail-section" aria-label="游玩记录" hidden>
+          <dl id="play-record"></dl>
+        </section>
+        <section id="facts-section" class="detail-section" aria-labelledby="facts-title">
+          <h3 id="facts-title">游戏信息</h3>
+          <p id="metadata-status" class="muted" role="status"></p>
+          <dl id="game-facts"></dl>
+          <ul id="game-tags" aria-label="游戏标签" tabindex="0" hidden></ul>
+        </section>
+        <details id="synopsis" class="detail-section" hidden>
+          <summary>
+            <span>游戏简介</span>
+            <svg class="icon" aria-hidden="true"><use href="#icon-chevron-right" /></svg>
+            <span id="synopsis-preview" class="muted" aria-hidden="true"></span>
+          </summary>
+          <p id="game-description" class="muted"></p>
+        </details>
+      </div>
+    </div>
+    <form id="picture-settings">
+      <h3 id="settings-heading" class="android-detail" aria-hidden="true"><span>画质与帧率</span></h3>
+      <fieldset id="picture-fields" aria-label="画质设置">
+        <label class="picture-row">
+          画质增强
+          <select id="picture-mode">
+            <option value="off">原始画质</option>
+            <option value="anime4k">Anime4K</option>
+            <option value="cunny">CuNNy</option>
+          </select>
+        </label>
+        <label class="picture-row">
+          帧率
+          <select id="picture-fps">
+            <option value="30">30 FPS</option>
+            <option value="60">60 FPS</option>
+            <option value="120">120 FPS</option>
+          </select>
+        </label>
+      </fieldset>
+      <p id="details-error" class="error" role="alert"></p>
+    </form>
+  </div>
+  <div class="picture-actions">
+    <button id="game-stop" type="button" class="danger" hidden>结束游戏</button>
+    <button id="save-picture" type="submit" form="picture-settings" class="primary" disabled>保存</button>
+    <button id="game-play" type="button" class="primary android-detail">开始游玩</button>
+    <small id="play-unavailable" class="muted android-detail"></small>
+    <span id="save-status" class="sr-only" role="status"></span>
+  </div>
 </dialog>
 <dialog id="takeover" aria-labelledby="takeover-title" aria-describedby="takeover-warning">
   <div class="sheet-heading"><h2 id="takeover-title">接管游戏串流？</h2></div>
@@ -823,6 +1053,8 @@
   const details = $('game-details'), detailsError = $('details-error'), gameStop = $('game-stop'), favorite = $('favorite');
   const pictureSettings = $('picture-settings'), pictureFields = $('picture-fields'), savePicture = $('save-picture');
   const pictureMode = $('picture-mode'), pictureFPS = $('picture-fps');
+  const gamePlay = $('game-play'), expandDetails = $('expand-details'), collapseDetails = $('collapse-details');
+  const detailsBody = details.querySelector('.details-body');
   const cards = new Map(), pending = new Set();
   let favorites = new Set();
   const states = {
@@ -830,10 +1062,15 @@
     exited: '已结束', failed: '启动失败', interrupted: '会话中断',
   };
   const active = (state) => ['starting', 'running', 'stopping'].includes(state);
-  let password = '', connectedAddress = '', games = [], sessions = new Map(), revision = 0, refreshing = false;
+  let password = '', connectedAddress = '', games = [], sessions = new Map(), records = {}, revision = 0, refreshing = false;
   let restoreRevision = 0, computerName = '', selectedGame = null, originalPicture = null, disconnectMessage = '';
 
   const mobile = window.mygo?.call;
+  if (mobile) {
+    details.classList.add('android-details');
+    pictureSettings.append(gameStop);
+    details.querySelector('.picture-actions').prepend(detailsError);
+  }
   const defaultComputerKey = 'galscaler-default-computer';
   let defaultComputer = mobile ? loadDefaultComputer() : null;
   let screen = mobile ? 'computers' : 'connect';
@@ -861,7 +1098,77 @@
     });
   }
 
-  let closingDetails = false, pressedBackdrop = false;
+  let closingDetails = false, pressedBackdrop = false, detailsProgress = 0, detailsFrame = 0;
+  let detailsDrag = null, compactOffset = 0, metadataRequest = null, savedTimer = 0;
+
+  function compactTop() {
+    const height = document.documentElement.clientHeight;
+    return Math.min(height * .5, Math.max(48, height - 340));
+  }
+
+  const clamp = value => Math.max(0, Math.min(1, value));
+
+  function drawDetails(progress) {
+    detailsProgress = progress;
+    const reveal = clamp((progress - .34) / .5);
+    const style = details.style;
+    style.setProperty('--sheet-top', compactOffset * (1 - progress) + 'px');
+    style.setProperty('--sheet-radius', 24 * (1 - progress) + 'px');
+    style.setProperty('--sheet-cover', 72 + 16 * progress + 'px');
+    style.setProperty('--sheet-extra', reveal + 'fr');
+    style.setProperty('--sheet-reveal', reveal);
+    style.setProperty('--sheet-hint', 1 - clamp(progress / .55));
+    style.setProperty('--sheet-scrim', 1 - clamp((progress - .67) / .33));
+  }
+
+  function settleDetails(expanded, animate = true) {
+    if (!mobile) return;
+    const target = Number(expanded);
+    const start = detailsProgress;
+    const scrollTop = expanded ? 0 : detailsBody.scrollTop;
+    cancelAnimationFrame(detailsFrame);
+    compactOffset = compactTop();
+    details.toggleAttribute('data-expanded', expanded);
+    expandDetails.setAttribute('aria-expanded', String(expanded));
+    expandDetails.inert = expanded;
+    collapseDetails.inert = !expanded;
+    $('details-extra').inert = !expanded;
+    $('settings-heading').setAttribute('aria-hidden', String(!expanded));
+    gameStop.hidden = !expanded || !active(sessions.get(selectedGame)?.state);
+    if (expanded) {
+      const game = games.find(item => item.id === selectedGame);
+      if (game) renderRecord(game);
+      loadMetadata();
+    }
+    if (!animate || start === target || document.documentElement.hasAttribute('data-reduced-motion')) {
+      drawDetails(target);
+      if (!expanded) detailsBody.scrollTop = 0;
+      return;
+    }
+    const began = performance.now();
+    const duration = 240 + 70 * Math.abs(target - start);
+    function frame(now) {
+      const elapsed = clamp((now - began) / duration);
+      const eased = 1 - (1 - elapsed) ** 3;
+      drawDetails(start + (target - start) * eased);
+      if (scrollTop) detailsBody.scrollTop = scrollTop * (1 - eased);
+      if (elapsed < 1) detailsFrame = requestAnimationFrame(frame);
+    }
+    detailsFrame = requestAnimationFrame(frame);
+  }
+
+  function setDetailsExpanded(expanded) {
+    const state = history.state;
+    if (state?.panel !== details.id || Boolean(state.expanded) === expanded) return;
+    if (expanded) {
+      history.pushState({ ...state, expanded: true, depth: state.depth + 1 }, '', '#game-details-full');
+      settleDetails(true);
+      collapseDetails.focus({ preventScroll: true });
+    } else {
+      dismissDetails();
+    }
+  }
+
   function dismissDetails() {
     if (!details.open || closingDetails || history.state?.panel !== details.id) return;
     closingDetails = true;
@@ -884,6 +1191,66 @@
     event.preventDefault();
     dismissDetails();
   });
+
+  if (mobile) {
+    const chrome = details.querySelector('.details-chrome');
+    const heading = details.querySelector('.sheet-heading');
+    expandDetails.addEventListener('click', () => setDetailsExpanded(true));
+    collapseDetails.addEventListener('click', () => setDetailsExpanded(false));
+    details.addEventListener('touchstart', event => {
+      const onCompactHeading = !history.state.expanded && heading.contains(event.target) && !event.target.closest('button');
+      if (event.touches.length !== 1 || (!chrome.contains(event.target) && !onCompactHeading)) return;
+      const { identifier: id, clientX: x, clientY: y } = event.touches[0];
+      detailsDrag = { id, x, y, last: y, time: event.timeStamp };
+    }, { passive: true });
+    details.addEventListener('touchmove', event => {
+      const drag = detailsDrag;
+      if (!drag || event.touches.length !== 1 || event.touches[0].identifier !== drag.id) return;
+      const { clientX, clientY } = event.touches[0];
+      const dy = clientY - drag.y;
+      if (!('start' in drag)) {
+        const dx = Math.abs(clientX - drag.x);
+        if (dx > Math.abs(dy) && dx > 8) {
+          detailsDrag = null;
+          return;
+        }
+        if (Math.abs(dy) < 8) return;
+        if (dy > 0 && !chrome.contains(event.target)) return;
+        cancelAnimationFrame(detailsFrame);
+        drag.start = detailsProgress;
+      }
+      if (event.cancelable) event.preventDefault();
+      if (clientY !== drag.last) {
+        drag.velocity = (clientY - drag.last) / Math.max(1, event.timeStamp - drag.time);
+        drag.last = clientY;
+        drag.time = event.timeStamp;
+      }
+      drawDetails(clamp(drag.start - dy / compactOffset));
+    }, { passive: false });
+    function finishDrag(event) {
+      const drag = detailsDrag;
+      if (!drag) return;
+      const touch = Array.from(event.changedTouches).find(item => item.identifier === drag.id);
+      if (!touch) return;
+      detailsDrag = null;
+      if (!('start' in drag)) return;
+      const expanded = Boolean(history.state.expanded);
+      const dy = touch.clientY - drag.y;
+      const flick = event.timeStamp - drag.time < 85 && Math.abs(dy) >= 22 && Math.abs(drag.velocity) > .5;
+      const target = event.type === 'touchcancel' ? expanded
+        : flick ? drag.velocity < 0 : detailsProgress > (expanded ? .64 : .36);
+      if (target === expanded) settleDetails(expanded);
+      else setDetailsExpanded(target);
+    }
+    details.addEventListener('touchend', finishDrag);
+    details.addEventListener('touchcancel', finishDrag);
+    window.addEventListener('resize', () => {
+      if (details.open) {
+        compactOffset = compactTop();
+        drawDetails(detailsProgress);
+      }
+    });
+  }
 
   const passwordKey = (address) => 'galscaler-password:' + address;
   const favoritesKey = (address) => 'galscaler-favorites:' + address;
@@ -1193,15 +1560,148 @@
 
   const enhancementMode = ({ enabled, filter }) => enabled && filter !== 'linear' ? filter : 'off';
 
+  const dateTime = new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
+  });
+  const languageNames = Intl.DisplayNames && new Intl.DisplayNames(['zh-CN'], { type: 'language' });
+  const platformNames = { win: 'Windows', lin: 'Linux', mac: 'macOS', and: 'Android', ios: 'iOS', swi: 'Switch' };
+  const tagNames = {
+    ADV: '冒险', School: '校园', 'High School': '高中', Romance: '恋爱',
+    'Multiple Endings': '多结局', 'Love Triangle': '三角恋', 'Dramatic Love Triangle': '三角恋',
+    'Male Protagonist': '男性主角', 'High School Student Heroine': '高中生女主',
+    "Protagonist's Childhood Friend as a Heroine": '青梅竹马',
+  };
+
+  function showPairs(list, pairs, grouped = false) {
+    const rows = pairs.filter(([, value]) => value).map(([label, value]) => {
+      const term = document.createElement('dt'), text = document.createElement('dd');
+      term.textContent = label;
+      text.append(value);
+      if (!grouped) return [term, text];
+      const row = document.createElement('div');
+      row.append(term, text);
+      return row;
+    });
+    list.replaceChildren(...rows.flat());
+    return rows.length > 0;
+  }
+
+  function renderRecord(game) {
+    const record = records[game.id];
+    const minutes = Math.floor((record?.played_ms ?? 0) / 60000);
+    const duration = minutes >= 60 ? (minutes / 60).toFixed(1) + ' 小时' : minutes ? minutes + ' 分钟' : '不足 1 分钟';
+    $('record-section').hidden = !showPairs($('play-record'), [
+      ['游玩时间', record?.played_ms == null ? null : duration],
+      ['添加时间', game.added_at ? dateTime.format(game.added_at) : null],
+      ['上次游玩', record?.last_played_at ? dateTime.format(record.last_played_at) : null],
+    ], true);
+  }
+
+  function detailLanguages(codes = []) {
+    const preferred = ['zh-Hans', 'zh-Hant', 'ja', 'en'].filter(code => codes.includes(code));
+    const names = [...new Set([...preferred, ...codes])].map(code => languageNames?.of(code) ?? code);
+    if (names.length <= 3) return names.join(' / ');
+    const more = document.createElement('details'), summary = document.createElement('summary');
+    const count = document.createElement('small'), remaining = document.createElement('p');
+    count.className = 'muted';
+    count.textContent = '+' + (names.length - 2);
+    summary.append(names.slice(0, 2).join(' / '), count);
+    remaining.textContent = names.slice(2).join(' / ');
+    more.append(summary, remaining);
+    return more;
+  }
+
+  function renderMetadata(info) {
+    const platforms = info?.platforms.map(code => platformNames[code] ?? code).join(' / ');
+    const date = info?.edition ? [info.released, platforms].filter(Boolean).join(' · ') : info?.released;
+    const hasFacts = showPairs($('game-facts'), [
+      ['开发商', info?.developers.join(' / ')],
+      ['发行商', info?.publishers.join(' / ')],
+      [info?.edition ? '发售日期' : '作品首发', date],
+      [info?.edition ? '游戏语言' : '收录语言', detailLanguages(info?.languages)],
+    ]);
+    const labels = new Set((info?.tags ?? []).map(name => tagNames[name] ?? name));
+    const tags = [...labels].map(label => {
+      const tag = document.createElement('li');
+      tag.textContent = label;
+      return tag;
+    });
+    $('game-tags').replaceChildren(...tags);
+    $('game-tags').hidden = !tags.length;
+    $('metadata-status').textContent = hasFacts || tags.length || info?.description ? '' : '暂无游戏资料';
+    const description = (info?.description ?? '')
+      .replace(/\[spoiler\][\s\S]*?\[\/spoiler\]/gi, '')
+      .replace(/\[\/?(?:url|b|i|u|s|quote)(?:=[^\]]*)?\]/gi, '')
+      .trim();
+    $('synopsis-preview').textContent = description;
+    $('game-description').textContent = description;
+    $('synopsis').hidden = !description;
+  }
+
+  async function loadMetadata() {
+    if (metadataRequest) return;
+    const request = metadataRequest = { id: selectedGame, key: password };
+    $('metadata-status').textContent = '正在读取游戏资料…';
+    try {
+      const info = await rpc(request.key, 'game_metadata', { id: request.id });
+      if (metadataRequest === request) renderMetadata(info);
+    } catch {
+      if (metadataRequest === request) {
+        metadataRequest = null;
+        $('metadata-status').textContent = '暂时无法读取游戏资料';
+      }
+    }
+  }
+
+  function renderDetailsCover(game) {
+    const cover = $('details-cover');
+    const key = JSON.stringify([connectedAddress, game.id, game.cover]);
+    if (cover.dataset.key === key) return;
+    cover.dataset.key = key;
+    cover.hidden = true;
+    cover.previousElementSibling.removeAttribute('hidden');
+    cover.removeAttribute('src');
+    if (!game.cover) return;
+    const art = cards.get(game.id)?.querySelector('img')?.getAttribute('src');
+    function show(source) {
+      if (!source || cover.dataset.key !== key) return;
+      cover.onload = () => {
+        cover.hidden = false;
+        cover.previousElementSibling.setAttribute('hidden', '');
+      };
+      cover.src = source;
+    }
+    if (art) show(art);
+    else fetchCover(game.id, password).then(show).catch(() => {});
+  }
+
+  function showSaved(saved) {
+    clearTimeout(savedTimer);
+    savePicture.textContent = saved ? '已保存' : '保存';
+    $('save-status').textContent = saved ? '设置已保存' : '';
+    if (saved) savedTimer = setTimeout(() => showSaved(false), 1500);
+  }
+
+  function setPictureDraft(picture) {
+    originalPicture = picture;
+    pictureMode.value = enhancementMode(picture);
+    chooseOption(pictureFPS, String(picture.fps), picture.fps + ' FPS');
+  }
+
   function openDetails(id) {
     selectedGame = id;
-    originalPicture = games.find((game) => game.id === id).enhancement;
-    const { fps } = originalPicture;
-    pictureMode.value = enhancementMode(originalPicture);
-    chooseOption(pictureFPS, String(fps), fps + ' FPS');
+    setPictureDraft(games.find(game => game.id === id).enhancement);
     detailsError.textContent = '';
+    if (mobile) {
+      metadataRequest = null;
+      $('synopsis').open = false;
+      renderMetadata(null);
+      showSaved(false);
+      settleDetails(false, false);
+    }
     render();
     openPanel(details);
+    if (mobile) expandDetails.focus({ preventScroll: true });
   }
 
   function pictureChanges() {
@@ -1239,8 +1739,17 @@
     const failure = details.querySelector('.game-error');
     failure.textContent = session?.error ?? '';
     failure.hidden = !session?.error;
-    gameStop.hidden = !active(state);
+    gameStop.hidden = !active(state) || Boolean(mobile && !history.state.expanded);
     gameStop.disabled = busy || state === 'stopping';
+    if (mobile) {
+      renderDetailsCover(game);
+      if (history.state.expanded) renderRecord(game);
+      const unavailable = active(state) && !session?.streaming;
+      gamePlay.textContent = gamePlay.hasAttribute('aria-busy') ? '正在连接…'
+        : state === 'stopping' ? '正在停止' : active(state) ? '继续游玩' : '开始游玩';
+      gamePlay.disabled = pending.size > 0 || state === 'stopping' || unavailable;
+      $('play-unavailable').textContent = unavailable && state !== 'stopping' ? '电脑上的会话未开启串流' : '';
+    }
     updatePictureFields();
   }
 
@@ -1301,7 +1810,7 @@
 
   async function snapshot(key) {
     const [library, status] = await Promise.all([rpc(key, 'list'), rpc(key, 'status')]);
-    return [library, new Map(status.sessions.map((session) => [session.game_id, session]))];
+    return [library, new Map(status.sessions.map((session) => [session.game_id, session])), status.play_records ?? {}];
   }
 
   async function refresh() {
@@ -1311,7 +1820,7 @@
     try {
       const data = await snapshot(key);
       if (current !== revision) return;
-      [games, sessions] = data;
+      [games, sessions, records] = data;
       setConnected(true);
       render();
     } catch (failure) {
@@ -1323,28 +1832,44 @@
     }
   }
 
-  async function command(id, op, fields = {}) {
+  async function command(id, op, fields = {}, fromDetails = false) {
     const key = password;
     ++revision;
     pending.add(id);
-    const feedback = op === 'play' ? error : detailsError;
+    if (fromDetails) gamePlay.setAttribute('aria-busy', 'true');
+    const feedback = op === 'play' && !fromDetails ? error : detailsError;
     feedback.textContent = '';
     render();
     try {
       if (op === 'play') {
+        if (fromDetails) {
+          if (!window.RTCPeerConnection) throw new Error('当前 WebView 无法播放 WebRTC');
+          const changes = pictureChanges();
+          if (Object.keys(changes).length) await saveGamePicture(id, key, changes);
+          if (key !== password || !details.open || selectedGame !== id) return;
+        }
         if (!active(sessions.get(id)?.state)) {
           sessions.set(id, await rpc(key, 'launch_stream', { id, auto_output: true }));
+        }
+        if (fromDetails && key === password) {
+          if (!details.open || selectedGame !== id) return;
+          await new Promise(resolve => {
+            window.addEventListener('popstate', resolve, { once: true });
+            history.go(history.state.expanded ? -2 : -1);
+          });
         }
         if (key === password) await playGame(id, key);
         return;
       }
-      const result = await rpc(key, op, { id, ...fields });
-      if (key !== password) return;
       if (op === 'set_picture') {
-        games = games.map(game => game.id === id ? result : game);
-        if (selectedGame === id) dismissDetails();
+        await saveGamePicture(id, key, fields);
+        if (key === password && details.open && selectedGame === id) {
+          if (mobile) showSaved(true);
+          else dismissDetails();
+        }
       } else {
-        sessions.set(id, result);
+        const result = await rpc(key, op, { id, ...fields });
+        if (key === password) sessions.set(id, result);
       }
     } catch (failure) {
       if (key !== password) return;
@@ -1352,8 +1877,16 @@
       else (details.open && selectedGame === id ? feedback : error).textContent = failure.message;
     } finally {
       pending.delete(id);
+      if (fromDetails) gamePlay.removeAttribute('aria-busy');
       if (key === password) render();
     }
+  }
+
+  async function saveGamePicture(id, key, changes) {
+    const game = await rpc(key, 'set_picture', { id, ...changes });
+    if (key !== password) return;
+    games = games.map(item => item.id === id ? game : item);
+    if (selectedGame === id) setPictureDraft(game.enhancement);
   }
 
   form.addEventListener('submit', async (event) => {
@@ -1377,7 +1910,7 @@
       try { await savePassword(address, save ? key : ''); }
       catch { error.textContent = save ? '无法记住密码' : '无法清除记住的密码'; }
       if (attempt !== restoreRevision) return;
-      [games, sessions] = data;
+      [games, sessions, records] = data;
       connectedAddress = address;
       favorites = loadFavorites(address);
       password = key;
@@ -1787,8 +2320,12 @@
     render();
   });
   gameStop.addEventListener('click', () => command(selectedGame, 'stop'));
+  gamePlay.addEventListener('click', () => {
+    if (!gamePlay.disabled) command(selectedGame, 'play', {}, true);
+  });
   pictureSettings.addEventListener('change', () => {
     detailsError.textContent = '';
+    if (mobile) showSaved(false);
     updatePictureFields();
   });
   pictureSettings.addEventListener('submit', (event) => {
@@ -1802,6 +2339,18 @@
     if (open !== panel) {
       open?.close();
       panel?.showModal();
+    }
+    if (mobile) {
+      detailsDrag = null;
+      if (panel === details) {
+        const expanded = Boolean(state.expanded);
+        settleDetails(expanded);
+        (expanded ? collapseDetails : expandDetails).focus({ preventScroll: true });
+      } else if (open === details) {
+        cancelAnimationFrame(detailsFrame);
+        drawDetails(0);
+        cards.get(selectedGame)?.querySelector('.game-info').focus({ preventScroll: true });
+      }
     }
     if (screen === 'player') scheduleControls();
     if (screen === 'player' && state?.screen !== 'player') {

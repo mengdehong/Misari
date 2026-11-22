@@ -1,7 +1,7 @@
 use crate::{
     api::{Desktop, Paths, Request},
     cover,
-    model::{Changes, Enhancement, Filter, Library, Prefix},
+    model::{Changes, Enhancement, Filter, Library, Prefix, now},
     platform, stream,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -12,7 +12,7 @@ use std::{
     fs,
     io::{Read, Seek, SeekFrom},
     path::PathBuf,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 use tokio::{
     process::Child,
@@ -54,6 +54,40 @@ pub struct Session {
     pub metrics: Option<crate::render::Metrics>,
     #[serde(default)]
     pub streaming: bool,
+    #[serde(default)]
+    play: Option<SessionPlay>,
+}
+
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+struct SessionPlay {
+    previous: Option<PlayRecord>,
+    running_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct PlayRecord {
+    played_ms: u64,
+    last_played_at: u64,
+}
+
+impl Session {
+    fn play_record(&self, timestamp: u64) -> Option<PlayRecord> {
+        let play = self.play?;
+        let Some(running_at) = play.running_at else {
+            return play.previous;
+        };
+        let elapsed = self
+            .finished_at
+            .unwrap_or(timestamp)
+            .saturating_sub(running_at);
+        Some(PlayRecord {
+            played_ms: play
+                .previous
+                .map_or(0, |record| record.played_ms)
+                .saturating_add(elapsed),
+            last_played_at: running_at,
+        })
+    }
 }
 
 struct Run {
@@ -68,13 +102,6 @@ pub struct Engine {
     pub cover_jobs: JoinSet<(u64, Result<Option<PathBuf>>)>,
     pending_covers: BTreeMap<u64, AbortHandle>,
     pub streaming: bool,
-}
-
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 fn stream_picture(picture: &mut Enhancement, auto_output: bool) {
@@ -99,7 +126,15 @@ impl Engine {
         };
         let runs = sessions
             .into_iter()
-            .map(|session| {
+            .map(|mut session| {
+                if session.play.is_none() {
+                    let played = matches!(session.state, State::Running | State::Exited)
+                        || session.metrics.is_some();
+                    session.play = Some(SessionPlay {
+                        previous: None,
+                        running_at: played.then_some(session.started_at),
+                    });
+                }
                 (
                     session.game_id,
                     Run {
@@ -193,6 +228,7 @@ impl Engine {
                     .collect::<Vec<_>>(),
             )?),
             Request::CoverPath { id } => Ok(json!(self.library.get(id)?.cover)),
+            Request::GameMetadata { id } => Ok(json!(self.library.get(id)?.name)),
             Request::Library => Ok(serde_json::to_value(&self.library)?),
             Request::SetSettings { mut settings } => {
                 settings.validate()?;
@@ -361,6 +397,13 @@ impl Engine {
                     .into(),
                     metrics: None,
                     streaming,
+                    play: Some(SessionPlay {
+                        previous: self
+                            .runs
+                            .get(&id)
+                            .and_then(|run| run.session.play_record(started_at)),
+                        running_at: None,
+                    }),
                 };
                 // Persist the scope before spawning so a restarted engine can recover it.
                 self.runs.insert(
@@ -412,11 +455,24 @@ impl Engine {
                 self.save_sessions()?;
                 Ok(serde_json::to_value(session)?)
             }
-            Request::Status => Ok(json!({
-                "pid": std::process::id(), "data_dir": self.paths.data,
-                "games": self.library.games.len(),
-                "sessions": self.runs.values().map(|r| &r.session).collect::<Vec<_>>(),
-            })),
+            Request::Status => {
+                let timestamp = now();
+                let records: BTreeMap<_, _> = self
+                    .runs
+                    .iter()
+                    .filter_map(|(id, run)| {
+                        run.session
+                            .play_record(timestamp)
+                            .map(|record| (id, record))
+                    })
+                    .collect();
+                Ok(json!({
+                    "pid": std::process::id(), "data_dir": self.paths.data,
+                    "games": self.library.games.len(),
+                    "sessions": self.runs.values().map(|r| &r.session).collect::<Vec<_>>(),
+                    "play_records": records,
+                }))
+            }
             Request::Log { id, lines } => {
                 ensure!((1..=1000).contains(&lines), "日志行数必须在 1–1000 之间");
                 let run = self.runs.get(&id).context("这款游戏还没有启动记录")?;
@@ -484,6 +540,10 @@ impl Engine {
                         && (run.session.backend != "native" || run.session.metrics.is_some())
                     {
                         run.session.state = State::Running;
+                        run.session
+                            .play
+                            .get_or_insert_with(SessionPlay::default)
+                            .running_at = Some(now());
                         changed = true;
                     }
                 } else if run.child.is_none() {
@@ -562,6 +622,27 @@ mod tests {
         let mut legacy = original;
         stream_picture(&mut legacy, false);
         assert_eq!(legacy.output, legacy.source);
+    }
+
+    #[tokio::test]
+    async fn status_reports_play_time_from_an_existing_session_file() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = Paths {
+            data: dir.path().to_owned(),
+            socket: dir.path().join("engine.sock"),
+        };
+        fs::write(
+            paths.data.join("sessions.json"),
+            br#"[{"game_id":3,"state":"exited","started_at":1000,"finished_at":64000,
+                   "exit_code":0,"log":"game.log","scope":"game.scope","error":null}]"#,
+        )?;
+        let mut engine = Engine::open(paths, false)?;
+        let status = engine.handle(Request::Status).await?;
+        assert_eq!(
+            status["play_records"]["3"],
+            json!({"played_ms": 63000, "last_played_at": 1000})
+        );
+        Ok(())
     }
 
     #[tokio::test]
