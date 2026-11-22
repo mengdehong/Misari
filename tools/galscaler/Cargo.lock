@@ -574,6 +574,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing-subscriber",
+ "wayland-egl",
 ]
 
 [[package]]

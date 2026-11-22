@@ -716,11 +716,13 @@ func (a *app) pictureSummary(g *game) string {
 
 func (a *app) workActions(c *ui.Context, g *game, session session) {
 	disabled := !a.connected || a.busy
-	if a.active(g.ID) {
+	if a.active(g.ID) && !session.canResume() {
 		ui.Text(c, stateName(session.State)).FontSize(13).FontWeight(600).TextColor(stateColor(c, session.State))
 	} else {
 		label, code := "开始游戏", iPlay
-		if session.State == "failed" || session.State == "interrupted" {
+		if session.canResume() {
+			label = "在电脑上继续"
+		} else if session.State == "failed" || session.State == "interrupted" {
 			label, code = "重新启动", iRefresh
 		}
 		start := actionButton(c.Key("play"), code, label, true).Height(40).MinWidth(120).
@@ -744,10 +746,14 @@ func (a *app) workActions(c *ui.Context, g *game, session session) {
 }
 
 func (a *app) gameMenu(c *ui.Context, m *ui.Menu, g *game) {
-	state := a.session(g.ID).State
+	session := a.session(g.ID)
+	state := session.State
 	disabled := !a.connected || a.busy
 	switch state {
 	case "starting", "running":
+		if session.canResume() && m.Item("在电脑上继续").Disabled(disabled).Chosen() {
+			a.launch(g.ID)
+		}
 		label := "停止游戏"
 		if state == "starting" {
 			label = "取消启动"

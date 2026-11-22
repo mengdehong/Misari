@@ -21,6 +21,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+mod desktop;
 mod protocol;
 
 use crate::{
@@ -29,16 +30,12 @@ use crate::{
     stream::{self, Stream},
 };
 use anyhow::{Context, Result, anyhow};
+use desktop::{Desktop, DesktopView};
 use smithay::{
     backend::{
         drm::DrmNode,
-        egl::{
-            EGLContext, EGLDevice, EGLDisplay, context::GlAttributes, native::EGLSurfacelessDisplay,
-        },
-        input::{
-            AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
-            InputTime, KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
-        },
+        egl::{EGLContext, EGLDevice, EGLDisplay, native::EGLSurfacelessDisplay},
+        input::{Axis, AxisSource, ButtonState, InputTime, KeyState},
         renderer::{
             Bind, Frame, ImportDma, Renderer,
             element::{
@@ -48,7 +45,6 @@ use smithay::{
             gles::GlesRenderer,
             utils::draw_render_elements,
         },
-        winit::{self, WinitEvent, WinitGraphicsBackend},
     },
     desktop::{PopupManager, Space, Window, WindowSurfaceType},
     input::{
@@ -65,8 +61,10 @@ use smithay::{
         },
         wayland_server::{Display, DisplayHandle, protocol::wl_surface::WlSurface},
         winit::{
-            cursor::Cursor, dpi::PhysicalSize, monitor::Fullscreen,
-            platform::wayland::WindowAttributesWayland, window::WindowAttributes,
+            cursor::Cursor,
+            event::{ButtonSource, MouseButton, MouseScrollDelta, PointerSource, WindowEvent},
+            monitor::Fullscreen,
+            platform::scancode::PhysicalKeyExtScancode,
         },
     },
     utils::{Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Transform},
@@ -93,14 +91,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-type Backend = Rc<RefCell<WinitGraphicsBackend<GlesRenderer>>>;
-
 struct State {
     display: DisplayHandle,
     handle: LoopHandle<'static, Self>,
     signal: LoopSignal,
-    backend: Option<Backend>,
-    offscreen: Option<GlesRenderer>,
+    desktop: Option<Desktop>,
+    renderer: Rc<RefCell<GlesRenderer>>,
     stream: Option<Stream>,
     remote_buttons: Vec<u32>,
     remote_keys: Vec<u32>,
@@ -207,34 +203,11 @@ pub fn run(
     let mut event_loop: EventLoop<State> = EventLoop::try_new()?;
     let display = Display::<State>::new()?;
     let dh = display.handle();
-    let (mut backend, mut offscreen) = if headless {
-        (None, Some(headless_renderer()?))
+    let (desktop, renderer) = if headless {
+        (None, headless_renderer()?)
     } else {
-        let attributes = WindowAttributes::default()
-            .with_title("GalScaler — 启动中")
-            .with_platform_attributes(Box::new(
-                WindowAttributesWayland::default().with_name("io.misari.galscaler", "GalScaler"),
-            ))
-            .with_surface_size(PhysicalSize::new(
-                settings.output.width,
-                settings.output.height,
-            ))
-            .with_fullscreen(settings.fullscreen.then_some(Fullscreen::Borderless(None)));
-        let (backend, events) = winit::init_from_attributes_with_gl_attr::<GlesRenderer>(
-            attributes,
-            GlAttributes {
-                version: (3, 2),
-                profile: None,
-                debug: false,
-                vsync: true,
-            },
-        )
-        .map_err(|e| anyhow!(e.to_string()))?;
-        (Some((backend, events)), None)
-    };
-    let renderer = match &mut backend {
-        Some((backend, _)) => backend.renderer(),
-        None => offscreen.as_mut().unwrap(),
+        let (desktop, renderer) = Desktop::new(&settings)?;
+        (Some(desktop), renderer)
     };
 
     let mode = Mode {
@@ -280,8 +253,14 @@ pub fn run(
             event_loop
                 .handle()
                 .insert_source(events, |event, _, state| {
-                    if let channel::Event::Msg(input) = event {
-                        state.remote_input(input);
+                    if let channel::Event::Msg(event) = event {
+                        match event {
+                            stream::Event::Input(input) => state.remote_input(input),
+                            stream::Event::Desktop { show, reply } if !reply.is_closed() => {
+                                let _ = reply.send(state.set_desktop(show));
+                            }
+                            stream::Event::Desktop { .. } => (),
+                        }
                         let _ = state.display.flush_clients();
                     }
                 })
@@ -291,6 +270,7 @@ pub fn run(
                 node.dev_path().as_deref(),
                 settings.fps.into(),
                 input,
+                !headless,
             )
         })
         .transpose()?;
@@ -348,16 +328,13 @@ pub fn run(
     if let Some(prime) = &prime {
         launch.env("DRI_PRIME", prime);
     }
-    let (backend, events) = match backend {
-        Some((backend, events)) => (Some(Rc::new(RefCell::new(backend))), Some(events)),
-        None => (None, None),
-    };
+    let desktop_fd = desktop.as_ref().map(Desktop::event_fd).transpose()?;
     let mut state = State {
         display: dh.clone(),
         handle: event_loop.handle(),
         signal: event_loop.get_signal(),
-        backend,
-        offscreen,
+        desktop,
+        renderer: Rc::new(RefCell::new(renderer)),
         stream,
         remote_buttons: Vec::new(),
         remote_keys: Vec::new(),
@@ -455,28 +432,16 @@ pub fn run(
         })
         .map_err(|e| anyhow!("{}", e.error))?;
 
-    if let Some(events) = events {
+    if let Some(fd) = desktop_fd {
         event_loop
             .handle()
-            .insert_source(events, |event, _, state| match event {
-                WinitEvent::Input(event) => state.input(event),
-                WinitEvent::Resized { .. } => state
-                    .backend
-                    .as_ref()
-                    .unwrap()
-                    .borrow()
-                    .window()
-                    .request_redraw(),
-                WinitEvent::Redraw => {
-                    let backend = state.backend.as_ref().unwrap().clone();
-                    if let Err(error) = state.draw(&mut backend.borrow_mut()) {
-                        state.fail(error);
-                    }
-                }
-                WinitEvent::CloseRequested => state.close_game(),
-                WinitEvent::Focus(false) => state.release_input(),
-                _ => (),
-            })
+            .insert_source(
+                Generic::new(fd, Interest::READ, PollMode::Level),
+                |_, _, state| {
+                    state.desktop_events();
+                    Ok(PostAction::Continue)
+                },
+            )
             .map_err(|e| anyhow!("{}", e.error))?;
     }
     let interval = Duration::from_secs_f64(1.0 / state.settings.fps as f64);
@@ -518,17 +483,21 @@ pub fn run(
             if let Some(stream) = &mut state.stream {
                 stream.release_idle_capture();
             }
-            if let Some(backend) = &state.backend {
-                backend.borrow().window().request_redraw();
+            if let Some(view) = state
+                .desktop
+                .as_ref()
+                .and_then(|desktop| desktop.view.as_ref())
+            {
+                view.window.request_redraw();
             } else if let Some(window) = state.primary() {
-                let mut renderer = state.offscreen.take().unwrap();
+                let renderer = state.renderer.clone();
                 let source = state.client_area(&window).unwrap();
-                let result = state.render_game(&mut renderer, source);
-                state.offscreen = Some(renderer);
+                let result = state.render_game(&mut renderer.borrow_mut(), source, false);
                 if let Err(error) = result {
                     state.fail(error);
                 } else if let Some(pipeline) = &mut state.pipeline {
                     pipeline.metrics.display = pipeline.metrics.enhanced;
+                    pipeline.metrics.desktop_hidden = state.desktop.is_some();
                     if state
                         .last_metrics
                         .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
@@ -555,6 +524,59 @@ pub fn run(
 }
 
 impl State {
+    fn desktop_events(&mut self) {
+        let events = self.desktop.as_mut().unwrap().events();
+        for event in events {
+            match event {
+                WindowEvent::SurfaceResized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                    if let Some(view) = &self.desktop.as_ref().unwrap().view {
+                        view.window.request_redraw();
+                    }
+                }
+                WindowEvent::RedrawRequested => {
+                    let Some(mut view) = self.desktop.as_mut().unwrap().view.take() else {
+                        continue;
+                    };
+                    let renderer = self.renderer.clone();
+                    let result = self.draw(&mut renderer.borrow_mut(), &mut view);
+                    self.desktop.as_mut().unwrap().view = Some(view);
+                    if let Err(error) = result {
+                        self.fail(error);
+                    }
+                }
+                WindowEvent::CloseRequested => self.close_game(),
+                WindowEvent::Focused(false) => self.release_input(),
+                event => self.input(event),
+            }
+        }
+    }
+
+    fn set_desktop(&mut self, show: bool) -> Result<()> {
+        let Some(desktop) = &mut self.desktop else {
+            anyhow::ensure!(!show, "该会话没有电脑游戏窗口");
+            return Ok(());
+        };
+        if desktop.view.is_some() == show {
+            return Ok(());
+        }
+        let stream = self.stream.as_mut().unwrap();
+        if show {
+            desktop.show(&self.renderer.borrow())?;
+            if let Err(error) = stream.set_desktop_audio(true) {
+                desktop.hide();
+                return Err(error);
+            }
+        } else {
+            self.renderer.borrow().egl_context().unbind()?;
+            stream.set_desktop_audio(false)?;
+            desktop.hide();
+            self.release_input();
+            self.viewport = None;
+        }
+        self.last_metrics = None;
+        Ok(())
+    }
+
     fn release_input(&mut self) {
         let keyboard = self.seat.get_keyboard().unwrap();
         for key in keyboard.pressed_keys() {
@@ -651,8 +673,8 @@ impl State {
         }
     }
 
-    fn draw(&mut self, backend: &mut WinitGraphicsBackend<GlesRenderer>) -> Result<()> {
-        let display_size = backend.window_size();
+    fn draw(&mut self, renderer: &mut GlesRenderer, desktop: &mut DesktopView) -> Result<()> {
+        let display_size = desktop.size();
         if display_size.w == 0 || display_size.h == 0 {
             return Ok(());
         }
@@ -664,7 +686,7 @@ impl State {
             let cursor_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = match &self.cursor
             {
                 CursorImageStatus::Surface(surface) if inside => {
-                    backend.window().set_cursor_visible(false);
+                    desktop.window.set_cursor_visible(false);
                     let hotspot = smithay::wayland::compositor::with_states(surface, |states| {
                         states
                             .data_map
@@ -678,7 +700,7 @@ impl State {
                         self.pointer.y - hotspot.y as f64 * scale,
                     );
                     render_elements_from_surface_tree(
-                        backend.renderer(),
+                        renderer,
                         surface,
                         (location.0.round() as i32, location.1.round() as i32),
                         scale,
@@ -687,11 +709,11 @@ impl State {
                     )
                 }
                 CursorImageStatus::Hidden if inside => {
-                    backend.window().set_cursor_visible(false);
+                    desktop.window.set_cursor_visible(false);
                     Vec::new()
                 }
                 status => {
-                    backend.window().set_cursor_visible(true);
+                    desktop.window.set_cursor_visible(true);
                     let icon = if inside {
                         if let CursorImageStatus::Named(icon) = status {
                             *icon
@@ -701,13 +723,13 @@ impl State {
                     } else {
                         Default::default()
                     };
-                    backend.window().set_cursor(Cursor::Icon(icon));
+                    desktop.window.set_cursor(Cursor::Icon(icon));
                     Vec::new()
                 }
             };
-            self.render_game(backend.renderer(), source)?;
+            self.render_game(renderer, source, true)?;
             let pipeline = self.pipeline.as_mut().unwrap();
-            let (renderer, mut target) = backend.bind()?;
+            let mut target = renderer.bind(&mut desktop.surface)?;
             let mut frame = renderer.render(&mut target, display_size, Transform::Flipped180)?;
             let damage = [Rectangle::from_size(display_size)];
             frame.clear([0.0, 0.0, 0.0, 1.0].into(), &damage)?;
@@ -731,8 +753,9 @@ impl State {
             draw_render_elements(&mut frame, 1.0, &cursor_elements, &damage)?;
             let _frame_done = frame.finish()?;
             drop(target);
-            backend.submit(Some(&damage))?;
+            desktop.submit()?;
             pipeline.metrics.display = [display_size.w, display_size.h];
+            pipeline.metrics.desktop_hidden = false;
             if self
                 .last_metrics
                 .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
@@ -743,20 +766,20 @@ impl State {
                     .x11_surface()
                     .map(|s| s.title())
                     .unwrap_or_else(|| "游戏".into());
-                backend.window().set_title(&format!(
+                desktop.window.set_title(&format!(
                     "GalScaler — {title} [{}]",
                     self.settings.filter.name()
                 ));
             }
         } else {
             self.viewport = None;
-            let (renderer, mut target) = backend.bind()?;
+            let mut target = renderer.bind(&mut desktop.surface)?;
             let mut frame = renderer.render(&mut target, display_size, Transform::Flipped180)?;
             let damage = [Rectangle::from_size(display_size)];
             frame.clear([0.0, 0.0, 0.0, 1.0].into(), &damage)?;
             let _frame_done = frame.finish()?;
             drop(target);
-            backend.submit(Some(&damage))?;
+            desktop.submit()?;
         }
         Ok(())
     }
@@ -765,6 +788,7 @@ impl State {
         &mut self,
         renderer: &mut GlesRenderer,
         source: Rectangle<i32, Logical>,
+        presenting: bool,
     ) -> Result<()> {
         let configured = (
             self.settings.output.width as i32,
@@ -778,7 +802,7 @@ impl State {
             .and_then(|stream| stream.resolution(source.size, limit));
         // Publish launch metrics once, then leave the offscreen pipeline
         // unloaded while no one can see its output.
-        if self.backend.is_none()
+        if !presenting
             && self.stream.is_some()
             && streaming.is_none()
             && self.last_metrics.is_some()
@@ -788,7 +812,7 @@ impl State {
             }
             return Ok(());
         }
-        let enhanced = if self.backend.is_some() {
+        let enhanced = if presenting {
             limit
         } else {
             streaming.unwrap_or_else(|| {
@@ -996,19 +1020,25 @@ impl State {
             })
     }
 
-    fn input<I: InputBackend>(&mut self, event: InputEvent<I>) {
+    fn input(&mut self, event: WindowEvent) {
+        let time = InputTime::now();
         match event {
-            InputEvent::Keyboard { event, .. } => {
-                if self.remote_keys.contains(&event.key_code().raw()) {
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic: false,
+                ..
+            } if !event.repeat => {
+                let code = event.physical_key.to_scancode().unwrap_or(0) + 8;
+                if self.remote_keys.contains(&code) {
                     return;
                 }
-                let state = event.state();
+                let state = KeyState::from(event.state);
                 let fullscreen = self.seat.get_keyboard().unwrap().input::<bool, _>(
                     self,
-                    event.key_code(),
+                    code.into(),
                     state,
                     SERIAL_COUNTER.next_serial(),
-                    event.time(),
+                    time,
                     |data, _, key| {
                         if key.modified_sym().raw() == keysyms::KEY_F11 {
                             let toggle = state == KeyState::Pressed && !data.fullscreen_key;
@@ -1020,18 +1050,19 @@ impl State {
                     },
                 );
                 if fullscreen == Some(true) {
-                    let backend = self.backend.as_ref().unwrap().borrow();
-                    let fullscreen = backend
-                        .window()
+                    let window = &self.desktop.as_ref().unwrap().view.as_ref().unwrap().window;
+                    let fullscreen = window
                         .fullscreen()
                         .is_none()
                         .then_some(Fullscreen::Borderless(None));
-                    backend.window().set_fullscreen(fullscreen);
+                    window.set_fullscreen(fullscreen);
                 }
             }
-            InputEvent::PointerMotionAbsolute { event, .. } => {
-                let size = self.backend.as_ref().unwrap().borrow().window_size();
-                let position = event.position_transformed((size.w, size.h).into());
+            WindowEvent::PointerMoved {
+                position,
+                source: PointerSource::Mouse,
+                ..
+            } => {
                 self.pointer = (position.x, position.y).into();
                 if let Some(view) = self.viewport {
                     let pointer = self.seat.get_pointer().unwrap();
@@ -1043,7 +1074,7 @@ impl State {
                             &MotionEvent {
                                 location,
                                 serial: SERIAL_COUNTER.next_serial(),
-                                time: event.time(),
+                                time,
                             },
                         );
                     } else {
@@ -1053,14 +1084,27 @@ impl State {
                             &MotionEvent {
                                 location: pointer.current_location(),
                                 serial: SERIAL_COUNTER.next_serial(),
-                                time: event.time(),
+                                time,
                             },
                         );
                     }
                     pointer.frame(self);
                 }
             }
-            InputEvent::PointerButton { event, .. } => {
+            WindowEvent::PointerButton {
+                button: ButtonSource::Mouse(button),
+                state,
+                ..
+            } => {
+                let button = match button {
+                    MouseButton::Left => 0x110,
+                    MouseButton::Right => 0x111,
+                    MouseButton::Middle => 0x112,
+                    MouseButton::Forward => 0x115,
+                    MouseButton::Back => 0x116,
+                    other => other as u32 + 1,
+                };
+                let state = ButtonState::from(state);
                 let pointer = self.seat.get_pointer().unwrap();
                 if !pointer.is_grabbed()
                     && self
@@ -1069,7 +1113,7 @@ impl State {
                 {
                     return;
                 }
-                if event.state() == ButtonState::Pressed
+                if state == ButtonState::Pressed
                     && !pointer.is_grabbed()
                     && let Some((window, _)) = self
                         .space
@@ -1078,37 +1122,50 @@ impl State {
                 {
                     self.focus(&window);
                 }
-                match event.state() {
-                    ButtonState::Pressed => self.buttons.push(event.button_code()),
-                    ButtonState::Released => self.buttons.retain(|b| *b != event.button_code()),
+                match state {
+                    ButtonState::Pressed => self.buttons.push(button),
+                    ButtonState::Released => self.buttons.retain(|b| *b != button),
                 }
-                if self.remote_buttons.contains(&event.button_code()) {
+                if self.remote_buttons.contains(&button) {
                     return;
                 }
                 pointer.button(
                     self,
                     &ButtonEvent {
-                        button: event.button_code(),
-                        state: event.state(),
+                        button,
+                        state,
                         serial: SERIAL_COUNTER.next_serial(),
-                        time: event.time(),
+                        time,
                     },
                 );
                 pointer.frame(self);
             }
-            InputEvent::PointerAxis { event, .. } => {
-                let mut frame = AxisFrame::new(event.time()).source(event.source());
-                for axis in [Axis::Horizontal, Axis::Vertical] {
-                    let value = event
-                        .amount(axis)
-                        .unwrap_or_else(|| event.amount_v120(axis).unwrap_or(0.0) / 8.0);
-                    if value != 0.0 {
-                        frame = frame.value(axis, value);
+            WindowEvent::MouseWheel { delta, .. } => {
+                let frame = AxisFrame::new(time);
+                let frame = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => {
+                        let mut frame = frame.source(AxisSource::Wheel);
+                        for (axis, steps) in [(Axis::Horizontal, x), (Axis::Vertical, y)] {
+                            if steps != 0.0 {
+                                frame = frame.value(axis, -f64::from(steps) * 15.0);
+                            }
+                            frame = frame.v120(axis, (-steps * 120.0) as i32);
+                        }
+                        frame
                     }
-                    if let Some(discrete) = event.amount_v120(axis) {
-                        frame = frame.v120(axis, discrete as i32);
+                    MouseScrollDelta::PixelDelta(position) => {
+                        let mut frame = frame.source(AxisSource::Continuous);
+                        for (axis, value) in
+                            [(Axis::Horizontal, position.x), (Axis::Vertical, position.y)]
+                        {
+                            if value != 0.0 {
+                                frame = frame.value(axis, -value);
+                            }
+                        }
+                        frame
                     }
-                }
+                    _ => frame,
+                };
                 let pointer = self.seat.get_pointer().unwrap();
                 pointer.axis(self, frame);
                 pointer.frame(self);

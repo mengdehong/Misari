@@ -248,14 +248,7 @@ impl DmabufHandler for State {
         &mut self.dmabuf
     }
     fn dmabuf_imported(&mut self, _: &DmabufGlobal, dmabuf: Dmabuf, notifier: ImportNotifier) {
-        let imported = match &self.backend {
-            Some(backend) => backend.borrow_mut().renderer().import_dmabuf(&dmabuf, None),
-            None => self
-                .offscreen
-                .as_mut()
-                .unwrap()
-                .import_dmabuf(&dmabuf, None),
-        };
+        let imported = self.renderer.borrow_mut().import_dmabuf(&dmabuf, None);
         if imported.is_ok() {
             let _ = notifier.successful::<State>();
         } else {

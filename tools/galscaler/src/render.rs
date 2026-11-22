@@ -47,6 +47,8 @@ pub struct Metrics {
     pub source: [i32; 2],
     pub enhanced: [i32; 2],
     pub display: [i32; 2],
+    #[serde(default)]
+    pub desktop_hidden: bool,
     pub frames: u64,
     pub passes: i32,
     pub neural_passes: i32,

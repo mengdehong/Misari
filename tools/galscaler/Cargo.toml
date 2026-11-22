@@ -12,7 +12,7 @@ required-features = ["daemon"]
 
 [features]
 default = ["daemon"]
-daemon = ["dep:axum", "dep:base64", "dep:cc", "dep:pkg-config", "dep:smithay", "dep:subtle", "dep:tempfile", "dep:tracing-subscriber", "tokio/process", "tokio/signal", "tokio/sync"]
+daemon = ["dep:axum", "dep:base64", "dep:cc", "dep:pkg-config", "dep:smithay", "dep:subtle", "dep:tempfile", "dep:tracing-subscriber", "dep:wayland-egl", "tokio/process", "tokio/signal", "tokio/sync"]
 
 [dependencies]
 anyhow = "1"
@@ -26,6 +26,7 @@ subtle = { version = "2", optional = true, default-features = false }
 tempfile = { version = "3", optional = true }
 tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time"] }
 tracing-subscriber = { version = "0.3", optional = true, default-features = false, features = ["fmt", "env-filter"] }
+wayland-egl = { version = "0.32", optional = true }
 
 [build-dependencies]
 cc = { version = "1", optional = true }

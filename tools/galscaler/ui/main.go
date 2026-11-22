@@ -56,10 +56,18 @@ type game struct {
 	launchSettings
 }
 type session struct {
-	ID    uint64 `json:"game_id"`
-	State string `json:"state"`
-	Error string `json:"error"`
+	ID      uint64 `json:"game_id"`
+	State   string `json:"state"`
+	Error   string `json:"error"`
+	Metrics struct {
+		DesktopHidden bool `json:"desktop_hidden"`
+	} `json:"metrics"`
 }
+
+func (s session) canResume() bool {
+	return s.State == "running" && s.Metrics.DesktopHidden
+}
+
 type proton struct {
 	Name string `json:"name"`
 	Path string `json:"path"`
@@ -602,15 +610,20 @@ func (a *app) launchOrStop() {
 	if a.settingsOpen || a.current() == nil || !a.connected || a.busy || a.session(a.selected).State == "stopping" {
 		return
 	}
-	op := "launch"
-	if a.active(a.selected) {
-		op = "stop"
+	if a.active(a.selected) && !a.session(a.selected).canResume() {
+		a.send(object{"op": "stop", "id": a.selected})
+		return
 	}
-	a.send(object{"op": op, "id": a.selected})
+	a.launch(a.selected)
 }
 
 func (a *app) launch(id uint64) {
-	if a.connected && !a.busy && !a.active(id) {
+	if !a.connected || a.busy {
+		return
+	}
+	if a.session(id).canResume() {
+		a.send(object{"op": "resume_desktop", "id": id})
+	} else if !a.active(id) {
 		a.send(object{"op": "launch", "id": id})
 	}
 }

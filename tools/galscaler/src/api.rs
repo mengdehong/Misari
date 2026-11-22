@@ -74,6 +74,9 @@ pub enum Request {
     Stream {
         id: u64,
     },
+    ResumeDesktop {
+        id: u64,
+    },
     Stop {
         id: u64,
     },

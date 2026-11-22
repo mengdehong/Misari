@@ -33,7 +33,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
-    sync::{Notify, mpsc},
+    sync::{Notify, mpsc, oneshot},
     time::{interval, sleep, timeout},
 };
 
@@ -119,6 +119,7 @@ unsafe extern "C" {
 pub struct Stream {
     pub sink: String,
     audio: Child,
+    desktop_mute: Option<bool>,
     viewport: Arc<AtomicU32>,
     frames: mpsc::Sender<Video>,
     target: Option<(Size<i32, Physical>, GlesTexture)>,
@@ -148,6 +149,27 @@ pub enum Input {
         pressed: bool,
     },
     Release,
+}
+
+pub enum Event {
+    Input(Input),
+    Desktop {
+        show: bool,
+        reply: oneshot::Sender<Result<()>>,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DesktopAction {
+    ResumeDesktop,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Signal {
+    Offer(Offer),
+    Desktop(DesktopAction),
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -181,6 +203,8 @@ pub struct Offer {
     pub sdp: String,
     pub width: u32,
     pub height: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub takeover: Option<String>,
 }
 
 struct Video {
@@ -305,13 +329,19 @@ impl Stream {
         socket: PathBuf,
         device: Option<&Path>,
         fps: u32,
-        input: SyncSender<Input>,
+        input: SyncSender<Event>,
+        local_audio: bool,
     ) -> Result<Self> {
         let sink = format!("galscaler-{}", std::process::id());
+        let playback = if local_audio {
+            r#"{"node.passive":true}"#
+        } else {
+            r#"{"node.passive":true,"node.autoconnect":false}"#
+        };
         let mut audio = Command::new("pw-loopback")
             .args(["-n", &sink, "-c", "2", "-l", "20", "-i"])
             .arg(format!(r#"{{"media.class":"Audio/Sink","node.name":"{sink}","node.description":"GalScaler"}}"#))
-            .args(["-o", r#"{"node.passive":true}"#])
+            .args(["-o", playback])
             .stdin(Stdio::null())
             .spawn()
             .context("无法创建 PipeWire 游戏音频输出（需要 pw-loopback）")?;
@@ -354,6 +384,7 @@ impl Stream {
         let stream = Self {
             sink,
             audio,
+            desktop_mute: None,
             viewport,
             frames,
             target: None,
@@ -384,6 +415,36 @@ impl Stream {
                 let _ = std::fs::remove_file(socket);
             })?;
         Ok(stream)
+    }
+
+    pub fn set_desktop_audio(&mut self, show: bool) -> Result<()> {
+        let output = Command::new("pactl")
+            .args(["--format=json", "list", "sink-inputs"])
+            .output()
+            .context("无法检查电脑端音频输出")?;
+        ensure!(output.status.success(), "无法检查电脑端音频输出");
+        let playback = format!("output.{}", self.sink);
+        let inputs: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
+        let input = inputs
+            .iter()
+            .find(|input| input["properties"]["node.name"] == playback.as_str())
+            .context("找不到电脑端的游戏音频播放流")?;
+        let index = input["index"].as_u64().context("缺少游戏音频播放流编号")?;
+        let current = input["mute"].as_bool().context("缺少游戏音频播放流状态")?;
+        let mute = !show || self.desktop_mute.unwrap_or(false);
+        if mute != current {
+            let status = Command::new("pactl")
+                .args([
+                    "set-sink-input-mute",
+                    &index.to_string(),
+                    if mute { "1" } else { "0" },
+                ])
+                .status()
+                .context("无法切换电脑端游戏音频")?;
+            ensure!(status.success(), "无法切换电脑端游戏音频");
+        }
+        self.desktop_mute = (!show).then_some(current);
+        Ok(())
     }
 
     pub fn resolution(
@@ -556,15 +617,24 @@ struct Worker {
     device: Option<CString>,
     use_dmabuf: Arc<AtomicBool>,
     events: Arc<PeerEvents>,
-    input: SyncSender<Input>,
+    input: SyncSender<Event>,
     viewport: Arc<AtomicU32>,
     video: mpsc::Receiver<Video>,
     fps: u32,
 }
 
 impl Worker {
+    async fn set_desktop(&self, show: bool) -> Result<()> {
+        let (reply, response) = oneshot::channel();
+        self.input.send(Event::Desktop { show, reply })?;
+        timeout(Duration::from_secs(4), response)
+            .await
+            .context("等待电脑游戏窗口超时")??
+    }
+
     async fn run(mut self, listener: UnixListener) -> Result<()> {
         let mut peer: Option<Peer> = None;
+        let mut generation = 0u64;
         let mut audio: Option<Audio> = None;
         let mut encoder = None;
         let mut tick = interval(Duration::from_secs(1));
@@ -573,32 +643,52 @@ impl Worker {
             tokio::select! {
                 conn = listener.accept() => {
                     let (mut conn, _) = conn?;
-                    let offer = async {
+                    let negotiate = async {
                         // A null offer disconnects the peer while leaving the game running.
-                        let offer: Option<Offer> = serde_json::from_slice(&frame(&mut conn).await?)?;
-                        match offer {
-                            Some(offer) => Peer::answer(offer, &self.events).await.map(Some),
-                            None => Ok(None),
-                        }
-                    };
-                    let reply = match timeout(Duration::from_secs(5), offer).await {
-                        Ok(Ok(answer)) => {
-                            self.input.send(Input::Release)?;
-                            self.viewport.store(0, Relaxed);
-                            self.events.keyframe.store(true, Relaxed);
-                            peer = None;
-                            audio = None;
-                            encoder = None;
-                            if let Some((next, sdp)) = answer {
-                                peer = Some(next);
-                                Ok(serde_json::json!({ "sdp": sdp }))
-                            } else {
-                                Ok(serde_json::Value::Null)
+                        let request: Option<Signal> = serde_json::from_slice(&frame(&mut conn).await?)?;
+                        let offer = match request {
+                            Some(Signal::Offer(offer)) => Some(offer),
+                            Some(Signal::Desktop(DesktopAction::ResumeDesktop)) => {
+                                self.input.send(Event::Input(Input::Release))?;
+                                self.set_desktop(true).await?;
+                                if let Some(active) = &peer {
+                                    active.report("游戏已切回电脑");
+                                }
+                                None
+                            }
+                            None => None,
+                        };
+                        let occupied = peer.as_ref().filter(|peer| !peer.failed && !peer.expired());
+                        if let (Some(_), Some(offer)) = (occupied, &offer) {
+                            let takeover = format!("{}-{generation}", std::process::id());
+                            if offer.takeover.as_deref() != Some(takeover.as_str()) {
+                                return Ok(serde_json::json!({ "takeover": takeover }));
                             }
                         }
-                        Ok(Err(error)) => Err(error),
-                        Err(_) => Err(anyhow!("WebRTC 协商超时")),
+                        let answer = match offer {
+                            Some(offer) => Some(Peer::answer(offer, &self.events).await?),
+                            None => None,
+                        };
+                        self.input.send(Event::Input(Input::Release))?;
+                        self.viewport.store(0, Relaxed);
+                        self.events.keyframe.store(true, Relaxed);
+                        if let (Some(old), Some(_)) = (occupied, &answer) {
+                            old.report("游戏串流已被另一个客户端接管");
+                        }
+                        audio = None;
+                        encoder = None;
+                        if let Some((next, sdp)) = answer {
+                            generation += 1;
+                            peer = Some(next);
+                            Ok(serde_json::json!({ "sdp": sdp }))
+                        } else {
+                            peer = None;
+                            Ok(serde_json::Value::Null)
+                        }
                     };
+                    let reply = timeout(Duration::from_secs(5), negotiate)
+                        .await
+                        .unwrap_or_else(|_| Err(anyhow!("WebRTC 协商超时")));
                     let mut bytes = serde_json::to_vec(&Reply::from_result(reply))?;
                     bytes.push(b'\n');
                     let _ = timeout(Duration::from_secs(1), conn.write_all(&bytes)).await;
@@ -610,19 +700,36 @@ impl Worker {
                     }
                 }, if peer.is_some() => {
                     if let Some(active) = &mut peer {
-                        if active.closed() || active.last_input.elapsed() > Duration::from_secs(15) {
+                        if active.expired() {
                             self.viewport.store(0, Relaxed);
-                            self.input.send(Input::Release)?;
+                            self.input.send(Event::Input(Input::Release))?;
                             peer = None;
                             audio = None;
                             encoder = None;
                         } else if active.open() {
+                            if audio.is_none() {
+                                let start = async {
+                                    let capture = Audio::start(&self.sink)?;
+                                    self.set_desktop(false).await?;
+                                    Ok::<_, anyhow::Error>(capture)
+                                }.await;
+                                match start {
+                                    Ok(capture) => audio = Some(capture),
+                                    Err(error) => {
+                                        active.report(&format!("{error:#}"));
+                                        active.failed = true;
+                                        self.viewport.store(0, Relaxed);
+                                        self.input.send(Event::Input(Input::Release))?;
+                                        continue;
+                                    }
+                                }
+                            }
                             for command in active.controls() {
                                 match command {
                                     Control::Viewport { width, height } => active.viewport = viewport(width, height),
                                     Control::Input(input) => {
-                                        if self.input.try_send(input).is_err() {
-                                            self.input.send(Input::Release)?;
+                                        if self.input.try_send(Event::Input(input)).is_err() {
+                                            self.input.send(Event::Input(Input::Release))?;
                                             break;
                                         }
                                     }
@@ -631,20 +738,7 @@ impl Worker {
                             if unsafe { rtcGetAvailableAmount(active.dc) } > 0 {
                                 self.events.ready.notify_one();
                             }
-                            if audio.is_none() {
-                                match Audio::start(&self.sink) {
-                                    Ok(started) => audio = Some(started),
-                                    Err(error) => {
-                                        active.report(&format!("{error:#}"));
-                                        active.failed = true;
-                                        self.viewport.store(0, Relaxed);
-                                        self.input.send(Input::Release)?;
-                                    }
-                                }
-                            }
-                            if !active.failed {
-                                self.viewport.store(active.viewport, Relaxed);
-                            }
+                            self.viewport.store(active.viewport, Relaxed);
                         }
                     }
                 }
@@ -664,7 +758,7 @@ impl Worker {
                         }
                         active.report(&format!("{error:#}"));
                         self.viewport.store(0, Relaxed);
-                        self.input.send(Input::Release)?;
+                        self.input.send(Event::Input(Input::Release))?;
                         audio = None;
                         encoder = None;
                         active.failed = true;
@@ -684,7 +778,7 @@ impl Worker {
                             active.report("游戏音频捕获已断开");
                             active.failed = true;
                             self.viewport.store(0, Relaxed);
-                            self.input.send(Input::Release)?;
+                            self.input.send(Event::Input(Input::Release))?;
                             audio = None;
                             encoder = None;
                         }
@@ -693,7 +787,7 @@ impl Worker {
             }
         }
         self.viewport.store(0, Relaxed);
-        let _ = self.input.try_send(Input::Release);
+        let _ = self.input.try_send(Event::Input(Input::Release));
         Ok(())
     }
 
@@ -941,8 +1035,8 @@ impl Peer {
         !self.failed && unsafe { rtcIsOpen(self.dc) && rtcIsOpen(self.video) }
     }
 
-    fn closed(&self) -> bool {
-        unsafe { rtcIsClosed(self.dc) }
+    fn expired(&self) -> bool {
+        self.last_input.elapsed() > Duration::from_secs(15) || unsafe { rtcIsClosed(self.dc) }
     }
 
     fn controls(&mut self) -> Vec<Control> {
@@ -1061,7 +1155,16 @@ fn media(sdp: &str, kind: &str) -> Result<(CString, i32, u8)> {
 }
 
 pub async fn signal(path: &Path, offer: Offer) -> Result<serde_json::Value> {
-    let mut bytes = serde_json::to_vec(&offer)?;
+    send_signal(path, &offer).await
+}
+
+pub async fn resume_desktop(path: &Path) -> Result<()> {
+    send_signal(path, &DesktopAction::ResumeDesktop).await?;
+    Ok(())
+}
+
+async fn send_signal(path: &Path, signal: &impl Serialize) -> Result<serde_json::Value> {
+    let mut bytes = serde_json::to_vec(signal)?;
     ensure!(bytes.len() < FRAME_LIMIT, "WebRTC 请求过大");
     bytes.push(b'\n');
     timeout(Duration::from_secs(10), async {

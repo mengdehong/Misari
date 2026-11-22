@@ -724,6 +724,14 @@
     </div>
   </form>
 </dialog>
+<dialog id="takeover" aria-labelledby="takeover-title" aria-describedby="takeover-warning">
+  <div class="sheet-heading"><h2 id="takeover-title">接管游戏串流？</h2></div>
+  <p id="takeover-warning">另一个客户端正在串流此游戏。接管会断开对方的连接，并把画面和操作切换到这里。</p>
+  <form method="dialog" class="picture-actions">
+    <button class="secondary" value="cancel" autofocus>取消</button>
+    <button class="primary" value="takeover">接管</button>
+  </form>
+</dialog>
 <section id="player" aria-label="游戏画面" hidden>
   <video id="picture" autoplay playsinline></video>
   <div id="touch" aria-label="游戏触控"></div>
@@ -1401,7 +1409,7 @@
   const playerView = $('player'), picture = $('picture'), touch = $('touch'), loading = $('loading');
   const mute = $('mute'), muteIcon = mute.querySelector('use');
   const playerControls = $('controls'), actions = $('actions'), more = $('more');
-  const pin = $('pin'), skip = $('skip'), help = $('gesture-help');
+  const pin = $('pin'), skip = $('skip'), help = $('gesture-help'), takeover = $('takeover');
   const shell = document.querySelectorAll('.app-bar, main');
   let player = null, playerError = '', gesture = null, lastPoint = { x: .5, y: .5 };
   let controlsTimer, hoveringControls = false, skipInput = null;
@@ -1467,6 +1475,7 @@
     releaseSkip();
     send({ type: 'release' });
     player = null;
+    takeover.close();
     showControls(false);
     hoveringControls = false;
     current.abort.abort();
@@ -1481,6 +1490,14 @@
     playerError = '';
     render();
     refresh();
+  }
+
+  function confirmTakeover() {
+    takeover.returnValue = '';
+    takeover.showModal();
+    return new Promise(resolve => {
+      takeover.addEventListener('close', () => resolve(takeover.returnValue === 'takeover'), { once: true });
+    });
   }
 
   async function playGame(id, key) {
@@ -1529,11 +1546,12 @@
         } catch {}
       };
       dc.onclose = () => {
-        if (player === current) leavePlayer('游戏串流已结束');
+        if (player === current) leavePlayer();
       };
-      current.deadline = setTimeout(() => {
+      const waitForPicture = () => setTimeout(() => {
         if (player === current && !picture.videoWidth) leavePlayer('等待游戏画面超时');
       }, 25000);
+      current.deadline = waitForPicture();
       pc.addTransceiver('video', { direction: 'recvonly' });
       pc.addTransceiver('audio', { direction: 'recvonly' });
       await pc.setLocalDescription(await pc.createOffer());
@@ -1555,8 +1573,22 @@
         if (current.abort.signal.aborted) aborted();
         else done();
       });
-      const answer = await request(key, '/api/v1/stream/' + id, { sdp: pc.localDescription.sdp, ...viewport() });
-      if (player === current) await pc.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
+      const offer = { sdp: pc.localDescription.sdp, ...viewport() };
+      while (player === current && !current.leaving) {
+        const answer = await request(key, '/api/v1/stream/' + id, offer);
+        if (player !== current || current.leaving) return;
+        if (!answer.takeover) {
+          await pc.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
+          return;
+        }
+        clearTimeout(current.deadline);
+        if (!await confirmTakeover()) {
+          if (player === current) leavePlayer();
+          return;
+        }
+        offer.takeover = answer.takeover;
+        current.deadline = waitForPicture();
+      }
     } catch (failure) {
       if (player === current) {
         if (failure.status === 401) await rejectPassword(failure.message);

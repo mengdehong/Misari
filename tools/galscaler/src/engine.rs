@@ -288,6 +288,14 @@ impl Engine {
                     }
                     _ => unreachable!(),
                 };
+                if desktop.is_none()
+                    && self.streaming
+                    && let Some(run) = self.runs.get(&id)
+                    && run.session.streaming
+                    && matches!(run.session.state, State::Starting | State::Running)
+                {
+                    return Ok(serde_json::to_value(&run.session)?);
+                }
                 ensure!(!self.active(id), "游戏 {id} 已有运行中的会话");
                 let mut game = self.library.get(id)?.effective(&self.library);
                 let shared = game.prefix == Prefix::Shared;
@@ -385,6 +393,15 @@ impl Engine {
                     .context("请先启动游戏")?;
                 ensure!(run.session.streaming, "该会话未开启局域网串流");
                 Ok(json!(run.session.log.with_extension("stream")))
+            }
+            Request::ResumeDesktop { id } => {
+                let run = self
+                    .runs
+                    .get(&id)
+                    .filter(|run| run.session.state == State::Running && run.session.streaming)
+                    .context("该游戏没有可切回电脑的会话")?;
+                stream::resume_desktop(&run.session.log.with_extension("stream")).await?;
+                Ok(Value::Null)
             }
             Request::Stop { id } => {
                 ensure!(self.active(id), "游戏 {id} 当前没有运行中的会话");
