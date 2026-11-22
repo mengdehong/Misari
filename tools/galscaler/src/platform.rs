@@ -13,6 +13,8 @@ use std::{
 };
 use tokio::process::Command;
 
+pub mod ge;
+
 pub fn which(name: &str) -> Option<PathBuf> {
     env::split_paths(&env::var_os("PATH")?)
         .map(|p| p.join(name))
@@ -61,26 +63,31 @@ fn steam_roots() -> Vec<PathBuf> {
     roots.into_iter().collect()
 }
 
-pub fn protons() -> Vec<Proton> {
-    let mut paths = BTreeSet::new();
-    for root in steam_roots() {
-        for dir in [
-            root.join("compatibilitytools.d"),
-            root.join("steamapps/common"),
-        ] {
-            if let Ok(entries) = fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.join("proton").is_file()
-                        && let Ok(path) = fs::canonicalize(path)
-                    {
-                        paths.insert(path);
-                    }
+pub fn protons(paths: &Paths) -> Vec<Proton> {
+    let mut installed = BTreeSet::new();
+    for dir in steam_roots()
+        .into_iter()
+        .flat_map(|root| {
+            [
+                root.join("compatibilitytools.d"),
+                root.join("steamapps/common"),
+            ]
+        })
+        .chain(std::iter::once(ge::directory(paths)))
+    {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !entry.file_name().as_encoded_bytes().starts_with(b".")
+                    && path.join("proton").is_file()
+                    && let Ok(path) = fs::canonicalize(path)
+                {
+                    installed.insert(path);
                 }
             }
         }
     }
-    let mut tools: Vec<_> = paths
+    let mut tools: Vec<_> = installed
         .into_iter()
         .map(|path| Proton {
             name: path
@@ -102,7 +109,7 @@ pub fn protons() -> Vec<Proton> {
     tools
 }
 
-pub fn resolve_proton(value: &str) -> Result<PathBuf> {
+pub fn resolve_proton(value: &str, paths: &Paths) -> Result<PathBuf> {
     let path = Path::new(value);
     if path.exists() {
         let path = fs::canonicalize(path)?;
@@ -114,7 +121,10 @@ pub fn resolve_proton(value: &str) -> Result<PathBuf> {
         file(&dir.join("proton"))?;
         return Ok(dir);
     }
-    let found: Vec<_> = protons().into_iter().filter(|p| p.name == value).collect();
+    let found: Vec<_> = protons(paths)
+        .into_iter()
+        .filter(|p| p.name == value)
+        .collect();
     ensure!(found.len() <= 1, "存在多个同名 Proton，请指定完整目录路径");
     found
         .into_iter()
@@ -123,11 +133,18 @@ pub fn resolve_proton(value: &str) -> Result<PathBuf> {
         .with_context(|| format!("未找到 Proton：{value}；使用 runtimes 查看已安装版本"))
 }
 
-pub fn selected_proton(configured: Option<&Path>) -> Result<PathBuf> {
+fn automatic_proton(paths: &Paths, installed: &[Proton]) -> Option<PathBuf> {
+    fs::canonicalize(ge::directory(paths).join(".default"))
+        .ok()
+        .filter(|path| path.join("proton").is_file())
+        .or_else(|| installed.first().map(|proton| proton.path.clone()))
+}
+
+pub fn selected_proton(configured: Option<&Path>, paths: &Paths) -> Result<PathBuf> {
     let proton = configured
         .map(Path::to_path_buf)
-        .or_else(|| protons().into_iter().next().map(|p| p.path))
-        .context("未找到 Proton，请在全局设置中选择 Proton/GE 版本")?;
+        .or_else(|| automatic_proton(paths, &protons(paths)))
+        .context("未找到 Proton，请在全局设置中安装 GE-Proton 或选择已有版本")?;
     file(&proton.join("proton"))?;
     Ok(proton)
 }
@@ -271,12 +288,15 @@ pub async fn doctor(paths: &Paths, desktop: &Desktop) -> serde_json::Value {
         .output()
         .await
         .is_ok_and(|o| o.status.success());
+    let runtimes = protons(paths);
     serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "data_dir": paths.data, "socket": paths.socket,
         "wayland": desktop.wayland_display,
         "umu_run": which("umu-run"),
-        "systemd_user": systemd, "runtimes": protons(),
+        "systemd_user": systemd, "runtimes": runtimes,
+        "automatic_proton": automatic_proton(paths, &runtimes),
+        "ge_tools": which("curl").is_some() && which("tar").is_some(),
         "native": { "renderer": "Smithay/EGL/libplacebo", "cunny": "4x16 DS", "anime4k": "Restore CNN M + Upscale CNN x2 M" },
         "filters": [Filter::Linear, Filter::Anime4k, Filter::Cunny],
     })

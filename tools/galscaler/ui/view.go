@@ -1037,7 +1037,7 @@ func (a *app) runtimeSettings(c *ui.Context) {
 			problems = append(problems, "systemd 用户会话不可用。")
 		}
 		if len(d.Runtimes) == 0 && a.defaults.Proton == "" {
-			problems = append(problems, "请填写 Proton 安装路径。")
+			problems = append(problems, "游戏启动需要 Proton。")
 		}
 	}
 	settingsGroup(c).Children(func() {
@@ -1056,7 +1056,8 @@ func (a *app) runtimeSettings(c *ui.Context) {
 				a.reload()
 			}
 		})
-		a.protonField(c, &a.settingsDraft, nil, false)
+		rule(c)
+		a.managedProton(c.Key("ge-proton"))
 		for _, problem := range problems {
 			ui.Row(c).FillWidth().Gap(7).AlignItems(ui.Center).Children(func() {
 				glyph(c, iWarning).FontSize(15).TextColor(p.gold)
@@ -1066,10 +1067,66 @@ func (a *app) runtimeSettings(c *ui.Context) {
 	})
 }
 
+func (a *app) managedProton(c *ui.Context) {
+	p := skin(c)
+	var installed proton
+	for _, runtime := range a.runtimes {
+		if strings.HasPrefix(runtime.Name, "GE-Proton") {
+			installed = runtime
+			break
+		}
+	}
+	label, status := "检查更新", "已安装 · "+installed.Name
+	install := installed.Path == ""
+	if install {
+		label, status = "安装 GE-Proton", "尚未安装"
+	}
+	if a.geLatest != nil {
+		if *a.geLatest == "" && installed.Path != "" {
+			status = "已是最新版 · " + installed.Name
+		} else if *a.geLatest != "" {
+			label, status, install = "安装新版", "可用版本 · "+*a.geLatest, true
+		}
+	}
+	d := a.diagnostics
+	available := d != nil && d.GeTools
+	ui.Column(c).FillWidth().Gap(6).Children(func() {
+		ui.Text(c, "GE-Proton").FontWeight(600).TextColor(p.heading)
+		if a.geAction != "" {
+			status = a.geAction
+		}
+		small(c, status)
+		if a.geAction == "" && d != nil {
+			defaultPath := a.defaults.Proton
+			if defaultPath == "" {
+				defaultPath = d.AutomaticProton
+			}
+			if defaultPath != "" && (defaultPath != installed.Path || a.geLatest != nil && *a.geLatest != "") {
+				small(c, "默认使用 · "+filepath.Base(defaultPath))
+			}
+		}
+		if d != nil && !available {
+			small(c, "下载和安装需要 curl 与 tar。").TextColor(p.gold)
+		}
+		if a.geError != "" {
+			small(c, a.geError).TextColor(p.failure)
+		}
+		code := iRefresh
+		if install {
+			code = iAdd
+		}
+		if actionButton(c.Key("action"), code, label, install).Height(36).AlignSelf(ui.Start).
+			Disabled(!a.connected || !available || a.geAction != "").Clicked() {
+			a.manageProton(install)
+		}
+	})
+}
+
 func (a *app) advancedSettings(c *ui.Context) {
 	settingsGroup(c).Children(func() {
 		ui.Collapsible(c.Key("advanced"), "高级选项", &a.settingsAdvanced, func() {
 			ui.Column(c).FillWidth().Gap(6).Padding(8, 0, 0, 0).Children(func() {
+				a.protonField(c.Key("runtime"), &a.settingsDraft, nil, false)
 				small(c, "环境变量（JSON）")
 				ui.TextArea(c.Key("environment"), &a.settingsDraft.Environment).Label("环境变量（JSON）").
 					FillWidth().Height(112).Placeholder(`{"LC_ALL":"ja_JP.UTF-8"}`).Disabled(a.busy)

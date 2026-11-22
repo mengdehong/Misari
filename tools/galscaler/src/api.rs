@@ -53,6 +53,10 @@ pub enum Request {
         id: u64,
     },
     Runtimes,
+    CheckGeProton,
+    InstallGeProton {
+        version: Option<String>,
+    },
     Doctor {
         #[serde(default)]
         desktop: Option<Desktop>,

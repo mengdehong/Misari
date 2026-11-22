@@ -158,12 +158,13 @@ impl Engine {
         let proton = changes.proton.clone();
         game.apply(changes)?;
         if let Some(value) = proton {
-            game.settings.proton = Some(platform::resolve_proton(&value)?);
+            game.settings.proton = Some(platform::resolve_proton(&value, &self.paths)?);
         } else if let Some(path) = &game.settings.proton
             && game.settings.proton != original.settings.proton
         {
             game.settings.proton = Some(platform::resolve_proton(
                 path.to_str().context("无效的 Proton 路径")?,
+                &self.paths,
             )?);
         }
         let effective = game.effective(&self.library);
@@ -200,6 +201,7 @@ impl Engine {
                 {
                     settings.proton = Some(platform::resolve_proton(
                         path.to_str().context("无效的 Proton 路径")?,
+                        &self.paths,
                     )?);
                 }
                 let mut library = self.library.clone();
@@ -218,7 +220,7 @@ impl Engine {
             } => {
                 let proton = proton
                     .as_deref()
-                    .map(platform::resolve_proton)
+                    .map(|value| platform::resolve_proton(value, &self.paths))
                     .transpose()?;
                 let mut library = self.library.clone();
                 let game = library.add(&executable, name, proton)?;
@@ -269,7 +271,10 @@ impl Engine {
                 // Prefixes and game files contain user saves and are retained.
                 Ok(json!({ "removed": id }))
             }
-            Request::Runtimes => Ok(serde_json::to_value(platform::protons())?),
+            Request::Runtimes => Ok(serde_json::to_value(platform::protons(&self.paths))?),
+            Request::CheckGeProton | Request::InstallGeProton { .. } => {
+                unreachable!("handled by local IPC")
+            }
             Request::Doctor { desktop } => {
                 Ok(platform::doctor(&self.paths, &desktop.unwrap_or_else(Desktop::current)).await)
             }
@@ -306,7 +311,8 @@ impl Engine {
                     stream_picture(&mut game.settings.enhancement, auto_output);
                 }
                 let streaming = self.streaming && game.settings.enhancement.enabled;
-                let proton = platform::selected_proton(game.settings.proton.as_deref())?;
+                let proton =
+                    platform::selected_proton(game.settings.proton.as_deref(), &self.paths)?;
                 let started_at = now();
                 let scope = format!("galscaler-{}-{id}-{started_at}.scope", std::process::id());
                 let log = self

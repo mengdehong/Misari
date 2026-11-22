@@ -2,6 +2,7 @@ use crate::{
     api::{Paths, Reply, Request, frame},
     cover,
     engine::Engine,
+    platform::ge,
     web,
 };
 use anyhow::{Context, Result, anyhow, ensure};
@@ -46,6 +47,10 @@ pub async fn dispatch(queue: &Queue, bytes: &[u8], local: Option<&Paths>) -> Rep
                 )?),
                 Request::DownloadCover { url } => Some(serde_json::to_value(
                     cover::download(&paths.data, url).await?,
+                )?),
+                Request::CheckGeProton => Some(serde_json::to_value(ge::check(paths).await?)?),
+                Request::InstallGeProton { version } => Some(serde_json::to_value(
+                    ge::install(paths, version.as_deref()).await?,
                 )?),
                 _ => None,
             };

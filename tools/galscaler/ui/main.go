@@ -65,10 +65,12 @@ type proton struct {
 	Path string `json:"path"`
 }
 type diagnostics struct {
-	Wayland     string   `json:"wayland"`
-	UmuRun      string   `json:"umu_run"`
-	SystemdUser bool     `json:"systemd_user"`
-	Runtimes    []proton `json:"runtimes"`
+	Wayland         string   `json:"wayland"`
+	UmuRun          string   `json:"umu_run"`
+	SystemdUser     bool     `json:"systemd_user"`
+	Runtimes        []proton `json:"runtimes"`
+	AutomaticProton string   `json:"automatic_proton"`
+	GeTools         bool     `json:"ge_tools"`
 }
 type lanStatus struct {
 	Name        string `json:"name"`
@@ -117,6 +119,8 @@ type app struct {
 	sessions                       []session
 	runtimes                       []proton
 	sharedProton                   string
+	geLatest                       *string
+	geAction, geError              string
 	selected                       uint64
 	query                          string
 	settingsOpen                   bool
@@ -211,8 +215,11 @@ func dialDaemon(ctx context.Context) (net.Conn, error) {
 
 func call(request object) (json.RawMessage, error) {
 	wait := 15 * time.Second
-	if request["op"] == "find_covers" {
+	switch request["op"] {
+	case "find_covers", "check_ge_proton":
 		wait = 30 * time.Second
+	case "install_ge_proton":
+		wait = 62 * time.Minute
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), wait)
 	defer cancel()
@@ -403,6 +410,40 @@ func (a *app) checkEnvironment() {
 			}
 			a.diagnostics = &result
 			a.runtimes = result.Runtimes
+		})
+	}()
+}
+
+func (a *app) manageProton(install bool) {
+	if !a.connected || a.geAction != "" {
+		return
+	}
+	request := object{"op": "check_ge_proton"}
+	a.geAction = "正在检查更新…"
+	if install {
+		request["op"] = "install_ge_proton"
+		if a.geLatest != nil && *a.geLatest != "" {
+			request["version"] = *a.geLatest
+		}
+		a.geAction = "正在下载和安装…"
+	}
+	a.geError = ""
+	go func() {
+		data, err := call(request)
+		var latest string
+		if err == nil && !install {
+			err = json.Unmarshal(data, &latest)
+		}
+		a.win.Update(func() {
+			a.geAction = ""
+			if err != nil {
+				a.geError = err.Error()
+			} else if install {
+				a.geLatest = nil
+				a.checkEnvironment()
+			} else {
+				a.geLatest = &latest
+			}
 		})
 	}()
 }

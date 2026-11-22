@@ -14,7 +14,8 @@ depends=(
 makedepends=('clang' 'git' 'go' 'libdrm' 'lld' 'pkgconf' 'rust>=1.96' 'wine')
 optdepends=(
   'umu-launcher: run Windows games with Proton'
-  'curl: find and download covers from VNDB'
+  'curl: download GE-Proton and covers'
+  'tar: unpack GE-Proton'
   'iproute2: select the LAN streaming address'
   'pipewire-audio: capture game audio for streaming'
   'pipewire-pulse: PulseAudio server for game audio capture'

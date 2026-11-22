@@ -59,6 +59,10 @@ enum Action {
     Remove { id: u64 },
     /// 列出本机 Steam 与 GE-Proton 版本，也可在配置中使用自定义路径。
     Runtimes,
+    /// 检查是否有可安装的 GE-Proton 新版本。
+    CheckGeProton,
+    /// 安装指定版本或最新的 GE-Proton。
+    InstallGeProton { version: Option<String> },
     /// 检查 Wayland、umu 和运行环境。
     Doctor,
     /// 启动游戏并立即返回会话；用 status 和 log 查看后续结果。
@@ -128,6 +132,8 @@ async fn run() -> Result<()> {
         }
         Action::Remove { id } => Request::Remove { id },
         Action::Runtimes => Request::Runtimes,
+        Action::CheckGeProton => Request::CheckGeProton,
+        Action::InstallGeProton { version } => Request::InstallGeProton { version },
         Action::Doctor => Request::Doctor { desktop: None },
         Action::Launch { id } => Request::Launch { id, desktop: None },
         Action::Stop { id } => Request::Stop { id },
@@ -186,10 +192,14 @@ async fn call(paths: &Paths, request: &Request) -> Result<serde_json::Value> {
         Err(error) => return Err(error).context("无法连接 GalScaler 引擎"),
     };
     stream.write_all(&bytes).await?;
-    let reply = if matches!(request, Request::FindCovers { .. }) {
-        frame_with_timeout(stream, Duration::from_secs(30)).await?
-    } else {
-        frame(stream).await?
+    let reply = match request {
+        Request::FindCovers { .. } | Request::CheckGeProton => {
+            frame_with_timeout(stream, Duration::from_secs(30)).await?
+        }
+        Request::InstallGeProton { .. } => {
+            frame_with_timeout(stream, Duration::from_secs(62 * 60)).await?
+        }
+        _ => frame(stream).await?,
     };
     serde_json::from_slice::<Reply>(&reply)?.into_result()
 }
