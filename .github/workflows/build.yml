@@ -3,6 +3,7 @@ name: Build packages
 on:
   push:
     branches: [main]
+    tags: ['misari-v*', 'wallpaperd-v*', 'galscaler-v*']
   workflow_dispatch:
     inputs:
       mode:
@@ -19,12 +20,14 @@ permissions:
 
 jobs:
   plan:
-    if: inputs.mode != 'android'
+    if: ${{ !github.event.deleted }}
     runs-on: ubuntu-24.04
     outputs:
       packages: ${{ steps.select.outputs.packages }}
       commit: ${{ steps.select.outputs.commit }}
       version: ${{ steps.select.outputs.version }}
+      tag: ${{ steps.select.outputs.tag }}
+      component: ${{ steps.select.outputs.component }}
     steps:
       - id: select
         env:
@@ -32,20 +35,36 @@ jobs:
           TAG: ${{ inputs.release_tag }}
           GH_TOKEN: ${{ github.token }}
         run: |
+          commit=$GITHUB_SHA
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_TYPE" == tag ]]; then
+            TAG=$GITHUB_REF_NAME
+            MODE=release
+          fi
           if [[ "$MODE" == release ]]; then
-            if [[ ! "$TAG" =~ ^(misari|wallpaperd|galscaler)-v([0-9][A-Za-z0-9._+]*)$ ]]; then
-              echo 'Specify an existing misari-v*, wallpaperd-v*, or galscaler-v* tag.' >&2
+            version_pattern='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+            if [[ ! "$TAG" =~ ^misari-v$version_pattern\.v[1-9][0-9]*\.(0|[1-9][0-9]*)$ &&
+                  ! "$TAG" =~ ^(wallpaperd|galscaler)-v$version_pattern$ ]]; then
+              echo 'Use misari-vX.Y.Z.vA.B, wallpaperd-vX.Y.Z, or galscaler-vX.Y.Z.' >&2
               exit 1
             fi
-            printf 'packages=["%s"]\nversion=%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" >> "$GITHUB_OUTPUT"
-            commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$TAG" --jq .sha)
+            component=${TAG%%-v*}
+            version=${TAG#*-v}
+            if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+              if [[ "$component" == galscaler && ("$GITHUB_REF_TYPE" != tag || "$GITHUB_REF_NAME" != "$TAG") ]]; then
+                echo 'For a GalScaler release, run this workflow on the same tag as release_tag.' >&2
+                exit 1
+              fi
+              commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$TAG" --jq .sha)
+            fi
+            printf 'packages=["%s"]\ntag=%s\ncomponent=%s\nversion=%s\n' \
+              "$component" "$TAG" "$component" "$version" >> "$GITHUB_OUTPUT"
           else
             echo 'packages=["misari","wallpaperd","galscaler"]' >> "$GITHUB_OUTPUT"
-            commit=$GITHUB_SHA
           fi
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
 
   arch:
+    if: inputs.mode != 'android'
     needs: plan
     runs-on: ubuntu-24.04
     strategy:
@@ -58,6 +77,37 @@ jobs:
           ref: ${{ needs.plan.outputs.commit }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Check release version
+        if: needs.plan.outputs.tag != ''
+        env:
+          COMPONENT: ${{ matrix.package }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import tomllib
+          from pathlib import Path
+
+          component = os.environ["COMPONENT"]
+          version = os.environ["VERSION"]
+          if component == "misari":
+              manifest = Path("niri/Cargo.toml")
+              expected = version.split(".v", 1)[0]
+              actual = tomllib.loads(manifest.read_text())["workspace"]["package"]["version"]
+          else:
+              manifest = Path("tools", component, "Cargo.toml")
+              expected = version
+              actual = tomllib.loads(manifest.read_text())["package"]["version"]
+          if actual != expected:
+              raise SystemExit(f"{manifest} has version {actual}, expected {expected}")
+
+          if component == "galscaler":
+              manifest = Path("tools/galscaler/mobile/mygo.json")
+              actual = json.loads(manifest.read_text())["version"]
+              if actual != version:
+                  raise SystemExit(f"{manifest} has version {actual}, expected {version}")
+          PY
       - name: Build Arch package
         env:
           PACKAGE: ${{ matrix.package }}
@@ -78,8 +128,13 @@ jobs:
           overwrite: true
 
   release:
-    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'release'
-    needs: [plan, arch]
+    if: >-
+      !cancelled() && needs.plan.outputs.tag != '' && needs.arch.result == 'success'
+      && (needs.plan.outputs.component != 'galscaler' || needs.sign_android.result == 'success')
+    needs: [plan, arch, sign_android]
+    concurrency:
+      group: release-${{ needs.plan.outputs.tag }}
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -87,12 +142,17 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           path: packages
-          pattern: '*-arch-x86_64-${{ needs.plan.outputs.commit }}'
-          merge-multiple: true
+          name: ${{ needs.plan.outputs.component }}-arch-x86_64-${{ needs.plan.outputs.commit }}
+      - uses: actions/download-artifact@v8
+        if: needs.plan.outputs.component == 'galscaler'
+        with:
+          path: packages
+          name: galscaler-android-signed-${{ needs.plan.outputs.commit }}
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.release_tag }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          COMPONENT: ${{ needs.plan.outputs.component }}
           COMMIT: ${{ needs.plan.outputs.commit }}
         run: |
           if [[ $(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$TAG" --jq .sha) != "$COMMIT" ]]; then
@@ -100,15 +160,20 @@ jobs:
             exit 1
           fi
           shopt -s failglob
-          gh release create "$TAG" packages/*.pkg.tar.zst --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+          assets=(packages/*.pkg.tar.zst)
+          if [[ "$COMPONENT" == galscaler ]]; then
+            assets+=(packages/*.apk)
+          fi
+          gh release create "$TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
 
   android:
-    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'android'
+    if: inputs.mode == 'android' || needs.plan.outputs.component == 'galscaler'
+    needs: plan
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.plan.outputs.commit }}
           persist-credentials: false
       - uses: actions/setup-go@v7
         with:
@@ -129,8 +194,77 @@ jobs:
           go run github.com/egoist/mygo/cmd/mygo@v0.10.0 build -platform android
       - uses: actions/upload-artifact@v7
         with:
-          name: galscaler-android-${{ github.sha }}
+          name: galscaler-android-${{ needs.plan.outputs.commit }}
           path: tools/galscaler/mobile/dist/android/*.apk
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+          overwrite: true
+
+  sign_android:
+    if: >-
+      needs.plan.outputs.component == 'galscaler' && github.ref_type == 'tag'
+      && needs.plan.outputs.tag == github.ref_name
+    needs: [plan, arch, android]
+    runs-on: ubuntu-24.04
+    environment: android-release-signing
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: galscaler-android-${{ needs.plan.outputs.commit }}
+          path: apk-input
+      - name: Sign GalScaler APK
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          ANDROID_SIGNING_KEYSTORE_BASE64: ${{ secrets.ANDROID_SIGNING_KEYSTORE_BASE64 }}
+          ANDROID_SIGNING_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEYSTORE_PASSWORD }}
+          ANDROID_SIGNING_CERT_SHA256: ${{ vars.ANDROID_SIGNING_CERT_SHA256 }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import os
+          import re
+          import subprocess
+          import tempfile
+          from pathlib import Path
+
+          encoded = os.environ.pop("ANDROID_SIGNING_KEYSTORE_BASE64")
+          password = os.environ.pop("ANDROID_SIGNING_KEYSTORE_PASSWORD")
+          expected = os.environ["ANDROID_SIGNING_CERT_SHA256"].replace(":", "").lower()
+          if not encoded or not password or not re.fullmatch(r"[0-9a-f]{64}", expected):
+              raise SystemExit("Android signing environment is incomplete.")
+
+          sdk = Path(os.environ["ANDROID_HOME"])
+          apkanalyzer = sdk / "cmdline-tools/latest/bin/apkanalyzer"
+          apksigner = sdk / "build-tools/35.0.0/apksigner"
+          version = os.environ["VERSION"]
+          filename = f"galscaler-{version}.apk"
+          source = Path("apk-input", filename)
+          output = Path("signed", filename)
+          identity = subprocess.check_output([apkanalyzer, "apk", "summary", source], text=True).split()
+          if len(identity) != 3 or identity[0] != "io.misari.galscaler" or identity[2] != version:
+              raise SystemExit("APK identity or version does not match the GalScaler release.")
+
+          output.parent.mkdir()
+          with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as directory:
+              keystore = Path(directory, "android-release.p12")
+              keystore.write_bytes(base64.b64decode(encoded, validate=True))
+              subprocess.run(
+                  [apksigner, "sign", "--ks", keystore, "--ks-type", "PKCS12",
+                   "--ks-key-alias", "android-release", "--ks-pass", "stdin",
+                   "--v4-signing-enabled", "false", "--out", output, source],
+                  input=(password + "\n").encode(), capture_output=True, check=True,
+              )
+          report = subprocess.check_output([apksigner, "verify", "--print-certs", output], text=True)
+          fingerprints = re.findall(r"^Signer #\d+ certificate SHA-256 digest: ([0-9a-fA-F:]+)$", report, re.M)
+          if [value.replace(":", "").lower() for value in fingerprints] != [expected]:
+              raise SystemExit("APK signature does not match the GalScaler release certificate.")
+          PY
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: galscaler-android-signed-${{ needs.plan.outputs.commit }}
+          path: signed/*.apk
           if-no-files-found: error
           retention-days: 14
           compression-level: 0

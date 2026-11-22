@@ -2,12 +2,13 @@
 # shellcheck disable=SC2034,SC2154
 pkgname=misari-git
 pkgver=26.4.0.v1.0.r17.gb9c5c01
+pkgrel=1
+_upstreamver=26.4.0
 if [[ -n ${MISARI_RELEASE_VERSION:-} ]]; then
   pkgname=misari
   pkgver=$MISARI_RELEASE_VERSION
+  _upstreamver=${pkgver%.v*}
 fi
-pkgrel=1
-_upstreamver=26.4.0
 pkgdesc='Personal niri fork with a scrollable tiling Wayland desktop'
 arch=('x86_64')
 url='https://github.com/mengdehong/Misari'
