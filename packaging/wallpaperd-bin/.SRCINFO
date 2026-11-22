@@ -1,6 +1,6 @@
 pkgbase = wallpaperd-bin
 	pkgdesc = Session wallpaper daemon with image, video, shader and Wallpaper Engine backends
-	pkgver = 0.1.0
+	pkgver = 0.2.0
 	pkgrel = 1
 	url = https://github.com/mengdehong/Misari
 	arch = x86_64
@@ -38,14 +38,16 @@ pkgbase = wallpaperd-bin
 	depends = wayland
 	depends = pulse-native-provider
 	depends = ttf-font
+	depends = vulkan-icd-loader
+	depends = xdg-desktop-portal
 	depends = libmpv.so=2-64
 	depends = libEGL.so=1-64
 	depends = libGLESv2.so=2-64
-	provides = wallpaperd=0.1.0
+	provides = wallpaperd=0.2.0
 	conflicts = wallpaperd
 	options = !debug
 	options = !strip
-	source = https://github.com/mengdehong/Misari/releases/download/wallpaperd-v0.1.0/wallpaperd-0.1.0-1-x86_64.pkg.tar.zst
-	sha256sums = 9f5c705e64e7876b1228801630786fe774b0d60da838b1712782075fa850030a
+	source = https://github.com/mengdehong/Misari/releases/download/wallpaperd-v0.2.0/wallpaperd-0.2.0-1-x86_64.pkg.tar.zst
+	sha256sums = 9920fbb45254ac2ddcfb6c98ca9fae50ce1d6971092d153527f05fdb828f797f
 
 pkgname = wallpaperd-bin
